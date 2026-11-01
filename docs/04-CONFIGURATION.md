@@ -13,7 +13,7 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 
 ## Critical env controls
 
-- `APP_MODE=DRY_RUN|PAPER|LIVE` — only startup; restart after any mode change.
+- `APP_MODE=DRY_RUN|PAPER` — only startup; restart after any mode change. `LIVE` is unsupported.
 - `LIVE_TRADING_ENABLED=false` — must be true at process startup for an independently approved live deployment, in addition to other checks.
 - `LIVE_SIGNER_ENDPOINT` — allowed only inside separately deployed live executor; omit from scanner/paper worker.
 - `HELIUS_API_KEY`, `PUMPPORTAL_API_KEY`, `JUPITER_API_KEY` — secrets, redacted.
@@ -24,10 +24,11 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 - `discovery`: source, subscriptions, concurrent analysis cap, supported token programs.
 - `analysis`: creator history page/transaction limits, cache TTL, tracing depth, refresh windows, analysis concurrency and timeout, minimum independent buyers, and minimum validated holder-sample supply coverage.
 - `providers.jupiter`: opt-in quote-only adapter, request timeout/rate/day budgets, and maximum quote age. `JUPITER_API_KEY` is required to activate requests; missing slot/impact evidence still fails closed.
-- `providers.pumpportal`: trade streaming remains schema-locked disabled (`enable_token_trades: false`) until provider payload validation and metered event budgeting are implemented.
+- `providers.pumpportal`: free create/migration feeds; `enable_token_trades` remains schema-locked false until provider payload validation. Observation window is configurable to 30/60/120 seconds.
+- `providers.helius`: `enable_trade_stream` defaults false; if explicitly enabled, `max_active_trade_subscriptions` and `max_trade_events_per_day` cap the read-only logs observer. Coverage remains unverified without reconciliation.
 - `security`: mint authority/extension policy, unknown handling, holder sampling size, snapshot freshness and slot-skew limits.
 - `strategy`: entry timing, opportunity score and scoring weights, min observations.
-- `paper`: initial SOL, latency simulation, quote stale window, fee model, conservative slippage.
+- `paper`: initial virtual SOL, wallet id, latency simulation, quote stale window, fee model, conservative slippage, auto-entry opt-in, stop/take thresholds, monitor cadence, and bounded exit retry delays. The default position monitor cadence is 10 minutes to respect the configured Helius request budget at the maximum position count.
 - `risk`: per-order max SOL, max exposure, position count, daily loss, max drawdown, maximum quote price impact.
 - `observability`: health thresholds, budgets, event logging retention.
 
@@ -51,9 +52,9 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 
 ```bash
 APP_MODE=DRY_RUN pnpm dev:worker
-# PAPER and LIVE are rejected by this runtime.
+# APP_MODE=PAPER selects only the virtual settlement runtime; LIVE is rejected.
 ```
 
-The current runtime accepts `DRY_RUN` only. The API is read-only and cannot arm or change execution mode.
+`paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to false. PAPER mode does not imply automatic entries, and the API is read-only and cannot arm or change execution mode.
 
 ---

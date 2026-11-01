@@ -125,6 +125,7 @@ test("detected launch gets persistent fail-closed reports without Helius credent
     store.ingestEvent(event, 10, false);
     store.saveLaunchTradeObservation({
       id: "test-launch-trade-1",
+      eventIndex: 0,
       mint: event.mint,
       signature: "test-launch-trade-signature",
       slot: 100,
@@ -162,6 +163,21 @@ test("detected launch gets persistent fail-closed reports without Helius credent
       true,
     );
     assert.equal(decision?.status, "QUARANTINE");
+    const latencies = store.getAnalysisLatencySummary();
+    assert.equal(
+      latencies.some(
+        (item) => item.stage === "TOTAL_ANALYSIS" && item.sampleCount === 1,
+      ),
+      true,
+    );
+    assert.equal(
+      latencies.find((item) => item.stage === "TOTAL_ANALYSIS")?.p50Ms !== null,
+      true,
+    );
+    assert.equal(
+      latencies.find((item) => item.stage === "TOTAL_ANALYSIS")?.p95Ms,
+      null,
+    );
   } finally {
     await scheduler.stop();
     store.close();

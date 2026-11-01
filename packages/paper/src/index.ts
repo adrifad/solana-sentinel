@@ -142,6 +142,7 @@ export type PaperPortfolioState = {
     mint: string;
     tokenAmountRaw: string;
     costBasisLamports: string;
+    openedAtUtc: string;
   }>;
   realizedPnl: Array<{ pnlLamports: string; filledAtUtc: string }>;
   latestMark: {
@@ -319,7 +320,10 @@ export class PaperTradingEngine {
     return recovered;
   }
 
-  async refreshPortfolio(walletId: string): Promise<PaperPortfolioReport> {
+  async refreshPortfolio(
+    walletId: string,
+    knownSellQuotes?: ReadonlyMap<string, QuoteResult | null>,
+  ): Promise<PaperPortfolioReport> {
     const state = this.#repository.getPaperPortfolioState(walletId);
     let observedAtUtc = new Date(this.#clock.now()).toISOString();
     let positionValue = 0n;
@@ -328,17 +332,21 @@ export class PaperTradingEngine {
     let unpriceablePositions = 0;
     for (const position of state.positions) {
       costBasis += BigInt(position.costBasisLamports);
-      let quote: QuoteResult | null = null;
-      try {
-        quote = await this.#quotes.quoteAtArrival({
-          mint: position.mint,
-          side: "SELL",
-          exactInputAmountRaw: position.tokenAmountRaw,
-          requestedAtUtc: observedAtUtc,
-          maxAgeMs: this.#config.maxQuoteAgeMs,
-        });
-      } catch {
-        quote = null;
+      let quote = knownSellQuotes?.has(position.mint)
+        ? (knownSellQuotes.get(position.mint) ?? null)
+        : null;
+      if (!knownSellQuotes?.has(position.mint)) {
+        try {
+          quote = await this.#quotes.quoteAtArrival({
+            mint: position.mint,
+            side: "SELL",
+            exactInputAmountRaw: position.tokenAmountRaw,
+            requestedAtUtc: observedAtUtc,
+            maxAgeMs: this.#config.maxQuoteAgeMs,
+          });
+        } catch {
+          quote = null;
+        }
       }
       const quoteReadyAtUtc = new Date(this.#clock.now()).toISOString();
       const parsedQuote = quote ? QuoteResultSchema.safeParse(quote) : null;

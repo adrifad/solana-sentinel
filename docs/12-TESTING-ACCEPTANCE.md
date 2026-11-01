@@ -13,7 +13,7 @@
 - PAPER-only package: quote is requested after simulated arrival latency; exact amount/mint/direction, slot, timestamp, fee mint, freshness, impact and configured slippage are rechecked before atomic fill. Missing/stale/future quote and unavailable sell route produce no fill.
 - Double-entry paper journals balance per asset and ledger rows are immutable; duplicate concurrent intents settle once, pending orders can resume after restart, and partial sells allocate exact raw-unit cost basis.
 - Expired and future-dated persisted intents cannot be filled after recovery; quote timestamps are validated when state loading completes, not before RPC latency elapses.
-- Paper risk tests cover insufficient virtual SOL, open exposure/position caps, daily realized loss, drawdown, unpriceable marks, and fail-closed exit quotes. App configuration still refuses PAPER mode.
+- Paper risk tests cover insufficient virtual SOL, open exposure/position caps, daily realized loss, drawdown, unpriceable marks, and fail-closed exit quotes. PAPER mode is explicit; LIVE remains rejected and automatic entries default off.
 
 ## Integration tests (mock providers + recorded responses)
 
@@ -21,6 +21,8 @@
 - Helius 429/5xx/timeout, pagination, malformed transaction payload.
 - Jupiter quote-only requests omit `taker`, reject transaction-bearing responses, and honor the persistent provider budget before network access.
 - Launch-window look-ahead exclusion, incomplete-window behavior, and wallet token outflow evidence that does not claim a proven sell.
+- Helius standard logsSubscribe subscription lifecycle, event-budget limits, reconnect gaps, Pump SDK 4.1.0 TradeEvent synthetic decoder vectors, and persisted coverage that is never upgraded without reconciliation.
+- PAPER runtime virtual wallet initialization and restart recovery without a quote provider; no virtual fill is generated when quote state is missing.
 - Repeated same-wallet buy/sell activity remains `UNKNOWN` with a possible wash-pattern reason code.
 - Version 6 migration persistence for quote and time-indexed behavior evidence.
 - DEX Screener missing pool data not classified as scam by itself.

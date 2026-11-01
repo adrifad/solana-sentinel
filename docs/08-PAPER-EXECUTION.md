@@ -2,9 +2,11 @@
 
 ## Implemented foundation status
 
-The standalone `@sentinel/paper` package now contains a quote-at-arrival simulator, conservative fill adjustment, persistent order recovery, atomic double-entry settlement, positions, portfolio marks/PnL, risk gates, and an exit-rule evaluator. It uses the validated Pump curve/PumpSwap read-only quote loaders through an injected provider. Unit/integration tests use deterministic quote fixtures. This is not yet an operational PAPER mode: the app config remains `DRY_RUN`, the worker/API do not import the package, and automatic entries stay disabled until the live trade-observation and DRY_RUN end-to-end acceptance gate passes. No simulated trade is a real fill.
+The `@sentinel/paper` package contains a quote-at-arrival simulator, conservative fill adjustment, persistent order recovery, atomic double-entry settlement, positions, portfolio marks/PnL, risk gates, and an exit-rule evaluator. The worker now composes it in `APP_MODE=PAPER`, initializes a virtual wallet, recovers pending intents, and monitors open positions for stop-loss, take-profit, or max-hold exits. Quotes use the read-only Pump curve/PumpSwap loaders through Helius. No simulated trade is a real fill. Automatic entries default off and require complete observation/behavior/security evidence; the current observer cannot establish complete coverage, so it cannot currently submit an entry intent.
 
 The existing `risk.emergency_pause` setting is retained for configuration compatibility and maps to `pauseNewEntries`: it rejects new BUY orders before quote requests and again inside atomic settlement. A valid SELL may reduce held token balance during this pause. SELL proceeds are not compared with the BUY max trade amount; SELL settlement remains bounded by held token balance, a fresh validated quote, liquidity, fees, slippage, and ledger balance checks. Emergency liquidation is not implemented.
+
+Position monitoring persists `OPEN`, `UNPRICEABLE`, and `EXIT_BLOCKED` status with bounded exponential retry timing in migration 009. A missing, stale, or unsupported sell quote does not settle a sell or credit SOL. Runtime startup with no Helius credential still restores the virtual wallet but cannot mark positions with market value or fill orders. The Helius trade stream is explicitly opt-in and incomplete coverage blocks automatic entries.
 
 ## Objective
 

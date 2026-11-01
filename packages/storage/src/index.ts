@@ -96,6 +96,7 @@ export class SentinelStore {
       "006-market-intelligence.sql",
       "007-paper-ledger.sql",
       "008-runtime-hardening.sql",
+      "009-paper-runtime.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -1439,12 +1440,13 @@ export class SentinelStore {
     this.#db
       .prepare(
         `INSERT OR IGNORE INTO launch_trade_observations
-        (id, mint, signature, slot, block_time_utc, received_at_utc, side, trader_wallet,
+        (id, event_index, mint, signature, slot, block_time_utc, received_at_utc, side, trader_wallet,
         token_amount_raw, quote_amount_raw, venue, source, payload_ref)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         observation.id,
+        observation.eventIndex,
         observation.mint,
         observation.signature,
         observation.slot,
@@ -1458,6 +1460,74 @@ export class SentinelStore {
         observation.source,
         observation.payloadRef,
       );
+  }
+
+  requeueLatestAnalysisForMint(mint: string, delayMs = 0): boolean {
+    const nextAttemptAtUtc = new Date(
+      Date.now() + Math.max(0, delayMs),
+    ).toISOString();
+    const changed = this.#db
+      .prepare(
+        `UPDATE analysis_jobs SET status='PENDING', next_attempt_at_utc=?, updated_at_utc=?
+         WHERE event_id=(SELECT id FROM market_events WHERE mint=? AND kind='TOKEN_CREATED'
+         ORDER BY first_seen_at_utc ASC, received_at_utc ASC LIMIT 1) AND status='COMPLETE'`,
+      )
+      .run(nextAttemptAtUtc, utcNow(), mint);
+    return Number(changed.changes) === 1;
+  }
+
+  recordAnalysisStageTiming(input: {
+    eventId: string;
+    mint: string;
+    stage: string;
+    startedAtUtc: string;
+    finishedAtUtc: string;
+    durationMs: number;
+  }): void {
+    if (!Number.isSafeInteger(input.durationMs) || input.durationMs < 0)
+      throw new Error("ANALYSIS_STAGE_DURATION_INVALID");
+    this.#db
+      .prepare(
+        `INSERT INTO analysis_stage_timings
+         (event_id, mint, stage, started_at_utc, finished_at_utc, duration_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.eventId,
+        input.mint,
+        input.stage,
+        input.startedAtUtc,
+        input.finishedAtUtc,
+        input.durationMs,
+      );
+  }
+
+  getAnalysisLatencySummary(): Array<{
+    stage: string;
+    sampleCount: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+    p99Ms: number | null;
+  }> {
+    const groups = this.#db
+      .prepare(
+        "SELECT stage, duration_ms FROM analysis_stage_timings ORDER BY stage, duration_ms",
+      )
+      .all() as SqlRow[];
+    const byStage = new Map<string, number[]>();
+    for (const row of groups) {
+      const stage = String(row["stage"]);
+      const values = byStage.get(stage) ?? [];
+      values.push(Number(row["duration_ms"]));
+      byStage.set(stage, values);
+    }
+    return [...byStage].map(([stage, values]) => ({
+      stage,
+      sampleCount: values.length,
+      p50Ms: percentile(values, 0.5),
+      p95Ms: values.length >= 20 ? percentile(values, 0.95) : null,
+      p99Ms: values.length >= 100 ? percentile(values, 0.99) : null,
+    }));
   }
 
   listLaunchTradeObservations(
@@ -1486,6 +1556,7 @@ export class SentinelStore {
     return rows.map((row) =>
       LaunchTradeObservationSchema.parse({
         id: row["id"],
+        eventIndex: row["event_index"],
         mint: row["mint"],
         signature: row["signature"],
         slot: row["slot"],
@@ -1500,6 +1571,110 @@ export class SentinelStore {
         payloadRef: row["payload_ref"],
       }),
     );
+  }
+
+  recordTradeObservationCoverage(input: {
+    mint: string;
+    source: string;
+    status:
+      "COMPLETE" | "PARTIAL" | "GAP_DETECTED" | "RECONCILING" | "UNVERIFIED";
+    windowStartedAtUtc: string;
+    windowExpiresAtUtc: string;
+    lastEventAtUtc: string | null;
+    reconnectCount: number;
+    reasonCode: string;
+    updatedAtUtc: string;
+  }): void {
+    const id = createHash("sha256")
+      .update(`${input.source}:${input.mint}:${input.windowStartedAtUtc}`)
+      .digest("hex");
+    this.#db
+      .prepare(
+        `INSERT INTO trade_observation_coverage
+        (id, mint, source, status, window_started_at_utc, window_expires_at_utc,
+         last_event_at_utc, reconnect_count, reason_code, updated_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          status = CASE
+            WHEN trade_observation_coverage.status IN ('GAP_DETECTED', 'PARTIAL')
+              AND excluded.status = 'UNVERIFIED'
+            THEN trade_observation_coverage.status
+            ELSE excluded.status
+          END,
+          window_expires_at_utc = MAX(trade_observation_coverage.window_expires_at_utc, excluded.window_expires_at_utc),
+          last_event_at_utc = COALESCE(excluded.last_event_at_utc, trade_observation_coverage.last_event_at_utc),
+          reconnect_count = MAX(trade_observation_coverage.reconnect_count, excluded.reconnect_count),
+          reason_code = CASE
+            WHEN trade_observation_coverage.status IN ('GAP_DETECTED', 'PARTIAL')
+              AND excluded.status = 'UNVERIFIED'
+            THEN trade_observation_coverage.reason_code
+            ELSE excluded.reason_code
+          END,
+          updated_at_utc = excluded.updated_at_utc`,
+      )
+      .run(
+        id,
+        input.mint,
+        input.source,
+        input.status,
+        input.windowStartedAtUtc,
+        input.windowExpiresAtUtc,
+        input.lastEventAtUtc,
+        input.reconnectCount,
+        input.reasonCode,
+        input.updatedAtUtc,
+      );
+  }
+
+  getLatestTradeObservationCoverage(mint: string): {
+    mint: string;
+    source: string;
+    status: string;
+    windowStartedAtUtc: string;
+    windowExpiresAtUtc: string;
+    lastEventAtUtc: string | null;
+    reconnectCount: number;
+    reasonCode: string;
+    updatedAtUtc: string;
+  } | null {
+    const row = this.#db
+      .prepare(
+        `SELECT * FROM trade_observation_coverage WHERE mint = ?
+        ORDER BY updated_at_utc DESC, window_started_at_utc DESC LIMIT 1`,
+      )
+      .get(mint) as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      mint: String(row["mint"]),
+      source: String(row["source"]),
+      status: String(row["status"]),
+      windowStartedAtUtc: String(row["window_started_at_utc"]),
+      windowExpiresAtUtc: String(row["window_expires_at_utc"]),
+      lastEventAtUtc:
+        row["last_event_at_utc"] === null
+          ? null
+          : String(row["last_event_at_utc"]),
+      reconnectCount: Number(row["reconnect_count"]),
+      reasonCode: String(row["reason_code"]),
+      updatedAtUtc: String(row["updated_at_utc"]),
+    };
+  }
+
+  tryConsumeHeliusTradeEvent(maxEventsPerUtcDay: number): boolean {
+    if (!Number.isSafeInteger(maxEventsPerUtcDay) || maxEventsPerUtcDay < 1)
+      return false;
+    const utcDay = utcNow().slice(0, 10);
+    this.#db
+      .prepare(
+        "INSERT OR IGNORE INTO trade_event_budget(provider, utc_day, events_used) VALUES ('helius_logs', ?, 0)",
+      )
+      .run(utcDay);
+    const result = this.#db
+      .prepare(
+        "UPDATE trade_event_budget SET events_used = events_used + 1 WHERE provider = 'helius_logs' AND utc_day = ? AND events_used < ?",
+      )
+      .run(utcDay, maxEventsPerUtcDay);
+    return Number(result.changes) === 1;
   }
 
   saveLaunchBehaviorSnapshot(input: LaunchBehaviorSnapshot): void {
@@ -1790,7 +1965,7 @@ export class SentinelStore {
         this.#sumLedger(walletId, assetMint, "WALLET");
       const position = this.#db
         .prepare(
-          "SELECT token_amount_raw, cost_basis_lamports FROM paper_positions WHERE wallet_id = ? AND mint = ?",
+          "SELECT token_amount_raw, cost_basis_lamports, opened_at_utc FROM paper_positions WHERE wallet_id = ? AND mint = ?",
         )
         .get(walletId, mint) as SqlRow | undefined;
       if (side === "BUY") {
@@ -1902,9 +2077,10 @@ export class SentinelStore {
           networkFee;
         this.#db
           .prepare(
-            `INSERT INTO paper_positions(wallet_id, mint, token_amount_raw, cost_basis_lamports, updated_at_utc)
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(wallet_id, mint) DO UPDATE SET
+            `INSERT INTO paper_positions(wallet_id, mint, token_amount_raw, cost_basis_lamports, opened_at_utc, updated_at_utc)
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(wallet_id, mint) DO UPDATE SET
              token_amount_raw = excluded.token_amount_raw, cost_basis_lamports = excluded.cost_basis_lamports,
+             opened_at_utc = CASE WHEN paper_positions.token_amount_raw = '0' THEN excluded.opened_at_utc ELSE paper_positions.opened_at_utc END,
              updated_at_utc = excluded.updated_at_utc`,
           )
           .run(
@@ -1912,6 +2088,7 @@ export class SentinelStore {
             mint,
             nextTokens.toString(),
             nextCostBasis.toString(),
+            input.filledAtUtc,
             input.filledAtUtc,
           );
       } else {
@@ -1992,6 +2169,7 @@ export class SentinelStore {
       mint: string;
       tokenAmountRaw: string;
       costBasisLamports: string;
+      openedAtUtc: string;
     }>;
     realizedPnl: Array<{ pnlLamports: string; filledAtUtc: string }>;
     latestMark: {
@@ -2004,7 +2182,7 @@ export class SentinelStore {
   } {
     const positions = this.#db
       .prepare(
-        "SELECT mint, token_amount_raw, cost_basis_lamports FROM paper_positions WHERE wallet_id = ? AND token_amount_raw != '0'",
+        "SELECT mint, token_amount_raw, cost_basis_lamports, opened_at_utc FROM paper_positions WHERE wallet_id = ? AND token_amount_raw != '0'",
       )
       .all(walletId) as SqlRow[];
     const realizedPnl = this.#db
@@ -2023,6 +2201,7 @@ export class SentinelStore {
         mint: String(row["mint"]),
         tokenAmountRaw: String(row["token_amount_raw"]),
         costBasisLamports: String(row["cost_basis_lamports"]),
+        openedAtUtc: String(row["opened_at_utc"]),
       })),
       realizedPnl: realizedPnl.map((row) => ({
         pnlLamports: String(row["pnl_lamports"]),
@@ -2038,6 +2217,91 @@ export class SentinelStore {
           }
         : null,
     };
+  }
+
+  getPaperPositionMonitorState(
+    walletId: string,
+    mint: string,
+  ): {
+    status: "OPEN" | "UNPRICEABLE" | "EXIT_BLOCKED" | "EXIT_PENDING" | "CLOSED";
+    reasonCode: string | null;
+    retryCount: number;
+    nextRetryAtUtc: string | null;
+  } | null {
+    const row = this.#db
+      .prepare(
+        "SELECT status, reason_code, retry_count, next_retry_at_utc FROM paper_position_monitor_state WHERE wallet_id = ? AND mint = ?",
+      )
+      .get(walletId, mint) as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      status: String(row["status"]) as
+        "OPEN" | "UNPRICEABLE" | "EXIT_BLOCKED" | "EXIT_PENDING" | "CLOSED",
+      reasonCode:
+        row["reason_code"] === null ? null : String(row["reason_code"]),
+      retryCount: Number(row["retry_count"]),
+      nextRetryAtUtc:
+        row["next_retry_at_utc"] === null
+          ? null
+          : String(row["next_retry_at_utc"]),
+    };
+  }
+
+  listPaperPositionMonitorStates(walletId: string): Array<{
+    mint: string;
+    status: "OPEN" | "UNPRICEABLE" | "EXIT_BLOCKED" | "EXIT_PENDING" | "CLOSED";
+    reasonCode: string | null;
+    retryCount: number;
+    nextRetryAtUtc: string | null;
+  }> {
+    const rows = this.#db
+      .prepare(
+        "SELECT mint, status, reason_code, retry_count, next_retry_at_utc FROM paper_position_monitor_state WHERE wallet_id = ? ORDER BY updated_at_utc, mint",
+      )
+      .all(walletId) as SqlRow[];
+    return rows.map((row) => ({
+      mint: String(row["mint"]),
+      status: String(row["status"]) as
+        "OPEN" | "UNPRICEABLE" | "EXIT_BLOCKED" | "EXIT_PENDING" | "CLOSED",
+      reasonCode:
+        row["reason_code"] === null ? null : String(row["reason_code"]),
+      retryCount: Number(row["retry_count"]),
+      nextRetryAtUtc:
+        row["next_retry_at_utc"] === null
+          ? null
+          : String(row["next_retry_at_utc"]),
+    }));
+  }
+
+  recordPaperPositionMonitorState(input: {
+    walletId: string;
+    mint: string;
+    status: "OPEN" | "UNPRICEABLE" | "EXIT_BLOCKED" | "EXIT_PENDING" | "CLOSED";
+    reasonCode: string | null;
+    retryCount: number;
+    nextRetryAtUtc: string | null;
+    updatedAtUtc: string;
+  }): void {
+    if (!Number.isSafeInteger(input.retryCount) || input.retryCount < 0)
+      throw new Error("PAPER_MONITOR_RETRY_COUNT_INVALID");
+    this.#db
+      .prepare(
+        `INSERT INTO paper_position_monitor_state
+         (wallet_id, mint, status, reason_code, retry_count, next_retry_at_utc, updated_at_utc)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(wallet_id, mint) DO UPDATE SET status=excluded.status,
+         reason_code=excluded.reason_code, retry_count=excluded.retry_count,
+         next_retry_at_utc=excluded.next_retry_at_utc, updated_at_utc=excluded.updated_at_utc`,
+      )
+      .run(
+        input.walletId,
+        input.mint,
+        input.status,
+        input.reasonCode,
+        input.retryCount,
+        input.nextRetryAtUtc,
+        input.updatedAtUtc,
+      );
   }
 
   recordPaperEquityMark(
@@ -2545,6 +2809,15 @@ function mapPaperOrder(row: SqlRow) {
     reasonCode: row["reason_code"] === null ? null : String(row["reason_code"]),
     createdAtUtc: String(row["created_at_utc"]),
   };
+}
+
+function percentile(values: number[], quantile: number): number | null {
+  if (values.length === 0) return null;
+  const index = Math.max(
+    0,
+    Math.min(values.length - 1, Math.ceil(values.length * quantile) - 1),
+  );
+  return values[index] ?? null;
 }
 
 export function payloadReference(payload: string): string {

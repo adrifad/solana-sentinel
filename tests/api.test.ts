@@ -14,6 +14,9 @@ test("read-only API serves health and token list, rejects writes and unknown pat
     store,
     mode: "DRY_RUN",
     staleFeedSeconds: 30,
+    tradeStreamEnabled: false,
+    automaticEntriesEnabled: false,
+    paperWalletId: "test-paper",
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();

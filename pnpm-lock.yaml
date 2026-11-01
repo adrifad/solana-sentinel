@@ -80,6 +80,9 @@ importers:
       '@sentinel/intelligence':
         specifier: workspace:*
         version: link:../../packages/intelligence
+      '@sentinel/paper':
+        specifier: workspace:*
+        version: link:../../packages/paper
       '@sentinel/providers':
         specifier: workspace:*
         version: link:../../packages/providers

@@ -16,8 +16,12 @@ test("loads safe DRY_RUN defaults without wallet credentials", async () => {
   assert.match(loaded.configVersion, /^[a-f0-9]{64}$/);
 });
 
-test("rejects PAPER/LIVE modes and malformed configuration", async () => {
-  await assert.rejects(() => loadConfig({ APP_MODE: "LIVE" }), /DRY_RUN only/);
+test("accepts explicit PAPER mode, rejects LIVE, and validates configuration", async () => {
+  assert.equal((await loadConfig({ APP_MODE: "PAPER" })).config.mode, "PAPER");
+  await assert.rejects(
+    () => loadConfig({ APP_MODE: "LIVE" }),
+    /LIVE is unsupported/,
+  );
   const path = await mkdtemp(join(tmpdir(), "sentinel-config-"));
   const file = join(path, "bad.yaml");
   const baseline = await readFile("config/default.yaml", "utf8");

@@ -1,15 +1,19 @@
+import { createHash } from "node:crypto";
 import { loadConfig } from "@sentinel/config";
 import { utcNow } from "@sentinel/domain";
 import type { ProviderHealth } from "@sentinel/domain";
 import {
+  HeliusTradeStream,
   HeliusRpcClient,
   JupiterQuoteClient,
   PumpPortalClient,
   pumpPortalHealth,
 } from "@sentinel/providers";
+import { decodePumpTradeEvents } from "@sentinel/intelligence";
 import { SentinelStore } from "@sentinel/storage";
 import { EnrichmentScheduler } from "./enrichment.ts";
 import { TokenAnalysisScheduler } from "./analysis.ts";
+import { PaperRuntime } from "./paper-runtime.ts";
 import { log } from "./logger.ts";
 
 async function main(): Promise<void> {
@@ -123,6 +127,128 @@ async function main(): Promise<void> {
   });
   analysis.start();
 
+  const paper =
+    loaded.config.mode === "PAPER"
+      ? new PaperRuntime({
+          store,
+          config: loaded.config,
+          configVersion: loaded.configVersion,
+          ...(helius ? { helius } : {}),
+        })
+      : undefined;
+  if (paper) await paper.start();
+
+  const tradeStream =
+    loaded.config.providers.helius.enable_trade_stream &&
+    heliusApiKeyPresent(loaded.heliusApiKey)
+      ? new HeliusTradeStream({
+          apiKey: loaded.heliusApiKey!,
+          maxActiveSubscriptions:
+            loaded.config.providers.helius.max_active_trade_subscriptions,
+          subscriptionDurationSeconds:
+            loaded.config.providers.pumpportal.observation_window_seconds,
+          consumeEventBudget: () =>
+            store.tryConsumeHeliusTradeEvent(
+              loaded.config.providers.helius.max_trade_events_per_day,
+            ),
+          onCoverage(input) {
+            store.recordTradeObservationCoverage({
+              mint: input.mint,
+              source: "helius_logs:pump-sdk-4.1.0",
+              status: input.status,
+              windowStartedAtUtc: input.windowStartedAtUtc,
+              windowExpiresAtUtc: input.windowExpiresAtUtc,
+              lastEventAtUtc: null,
+              reconnectCount: input.reconnectCount,
+              reasonCode: input.reasonCode,
+              updatedAtUtc: input.observedAtUtc,
+            });
+            if (
+              input.reasonCode === "OBSERVATION_WINDOW_EXPIRED" &&
+              store.requeueLatestAnalysisForMint(input.mint)
+            )
+              analysis.wake();
+          },
+          onHealth(state, errorCode, reconnectCount) {
+            store.setProviderHealth({
+              provider: "helius",
+              state,
+              checkedAtUtc: utcNow(),
+              lastEventAtUtc: null,
+              reconnectCount,
+              errorCode,
+            });
+            if (errorCode) store.recordProviderIssue("helius", errorCode);
+          },
+          onLogs(input) {
+            const decoded = decodePumpTradeEvents(input.logs).filter(
+              (event) => event.mint === input.mint,
+            );
+            const token = store.getToken(input.mint);
+            const venue =
+              token?.marketPhase === "MIGRATED_PUMPSWAP"
+                ? "UNKNOWN"
+                : "PUMP_BONDING_CURVE";
+            for (const event of decoded) {
+              const eventBlockTimeMs = Number(event.timestampSeconds) * 1000;
+              const blockTimeUtc =
+                Number.isSafeInteger(eventBlockTimeMs) && eventBlockTimeMs > 0
+                  ? new Date(eventBlockTimeMs).toISOString()
+                  : null;
+              const id = createHash("sha256")
+                .update(`${input.signature}:${event.eventIndex}:${event.mint}`)
+                .digest("hex");
+              store.saveLaunchTradeObservation({
+                id,
+                eventIndex: event.eventIndex,
+                mint: event.mint,
+                signature: input.signature,
+                slot: input.slot,
+                blockTimeUtc,
+                receivedAtUtc: input.observedAtUtc,
+                side: event.side,
+                traderWallet: event.traderWallet,
+                tokenAmountRaw: event.tokenAmountRaw,
+                quoteAmountRaw: event.quoteAmountRaw,
+                venue,
+                source: "helius_logs:pump-sdk-4.1.0",
+                payloadRef: input.payloadRef,
+              });
+            }
+            store.recordTradeObservationCoverage({
+              mint: input.mint,
+              source: "helius_logs:pump-sdk-4.1.0",
+              status: "UNVERIFIED",
+              windowStartedAtUtc: input.windowStartedAtUtc,
+              windowExpiresAtUtc: input.windowExpiresAtUtc,
+              lastEventAtUtc: input.observedAtUtc,
+              reconnectCount: input.reconnectCount,
+              reasonCode:
+                decoded.length > 0
+                  ? "TRADE_EVENT_OBSERVED_BUT_WINDOW_NOT_RECONCILED"
+                  : "NO_SUPPORTED_PUMP_TRADE_EVENT_DECODED",
+              updatedAtUtc: input.observedAtUtc,
+            });
+            if (decoded.length > 0) analysis.wake();
+          },
+        })
+      : undefined;
+  tradeStream?.start();
+  if (tradeStream) {
+    const observationWindowMs =
+      loaded.config.providers.pumpportal.observation_window_seconds * 1000;
+    for (const token of store.listTokens(200)) {
+      const tokenAgeMs = Date.now() - Date.parse(token.firstSeenAtUtc);
+      if (
+        token.monitoringEligible &&
+        Number.isFinite(tokenAgeMs) &&
+        tokenAgeMs >= 0 &&
+        tokenAgeMs < observationWindowMs
+      )
+        tradeStream.subscribeMint(token.mint);
+    }
+  }
+
   const pump = new PumpPortalClient({
     apiKey: loaded.pumpPortalApiKey,
     enableNewTokens: loaded.config.providers.pumpportal.enable_new_tokens,
@@ -189,6 +315,12 @@ async function main(): Promise<void> {
           ingestionLatencyMs: outcome.ingestionLatencyMs,
         },
       );
+      if (
+        event.kind === "TOKEN_CREATED" &&
+        outcome.monitoringEligible &&
+        tradeStream
+      )
+        tradeStream.subscribeMint(event.mint);
     },
     async onEvent() {
       enrichment?.wake();
@@ -209,6 +341,8 @@ async function main(): Promise<void> {
         }
         await enrichment.stop();
         await analysis.stop();
+        await paper?.stop();
+        await tradeStream?.stop();
         if (pumpStopError) throw pumpStopError;
       } finally {
         store.close();
@@ -229,6 +363,10 @@ async function main(): Promise<void> {
   } finally {
     await shutdown();
   }
+}
+
+function heliusApiKeyPresent(value: string | undefined): value is string {
+  return Boolean(value && value.trim());
 }
 
 main().catch((error: unknown) => {

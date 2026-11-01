@@ -4,8 +4,10 @@ import type {
   LaunchTradeObservation,
 } from "@sentinel/domain";
 import type { WalletTransaction } from "@sentinel/providers";
+import { PUMP_PROGRAM_ID } from "./pump-constants.ts";
+export { PUMP_PROGRAM_ID } from "./pump-constants.ts";
+export { decodePumpTradeEvents } from "./pump-trades.ts";
 
-export const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const CREATE_EVENT_DISCRIMINATOR = Buffer.from([
   27, 114, 169, 77, 222, 235, 99, 118,
 ]);

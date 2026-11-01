@@ -1,6 +1,6 @@
 # Solana Sentinel — Early Launch Intelligence & Trading Bot
 
-**Status:** Read-only discovery, creator-intelligence, token-security, and explainable `DRY_RUN` analysis foundation; no trading execution.
+**Status:** Read-only discovery and analysis plus an isolated, virtual `PAPER` runtime. Automatic entries remain disabled by default and live trade coverage is unverified.
 **Language:** TypeScript, Node.js, SQLite; optional React dashboard.  
 **Network:** Solana **mainnet** data for all modes; no live trading until separately armed.  
 **Initial focus:** Pump.fun new-token detection, creator intelligence, anti-scam, test-token classification, and shadow trading.
@@ -47,7 +47,7 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The initial checkout was a documentation-only blueprint. The current runtime provides validated `DRY_RUN` configuration, SQLite event persistence and migrations, PumpPortal launch/migration discovery, bounded Helius reads, creator intelligence, token security, quote-only Jupiter routing, and Helius-backed Pump bonding-curve/PumpSwap state loaders with exact-input SDK quotes. Migration events now have a durable signature-recovery job: only a successful matching Helius transaction can set the migration slot, and migration-first candidates receive a fail-closed analysis record. PumpPortal provider errors and control frames are classified and retained as bounded sanitized diagnostics. A signer-free PAPER engine foundation provides quote-at-arrival simulation, atomic ledger fills, positions, and PnL calculations, but it is not attached to the worker or enabled as an application mode. The configured `emergency_pause` now pauses new BUY entries while allowing validated SELL exits. PumpPortal metered trade subscriptions remain unavailable, so the worker cannot claim complete real-time launch behavior or Milestone A. LIVE execution and the dashboard remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for evidence and remaining gates.
+The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Default automatic entries and the Helius trade observation stream are disabled. The optional Helius `logsSubscribe` path decodes the pinned Pump SDK 4.1.0 trade event layout, but no real trade payload has been validated in this change and it never upgrades observed coverage to `COMPLETE`. The PAPER entry gate therefore remains closed until verified complete behavior evidence exists. PAPER has no signer or transaction submission path; LIVE, the dashboard, and profitability claims remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for evidence and remaining gates.
 
 ## Local implementation commands
 
@@ -63,7 +63,7 @@ pnpm typecheck
 pnpm lint
 ```
 
-Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables on-chain creator history and security analysis. The worker accepts only `DRY_RUN`; it never signs or submits transactions. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
+Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables on-chain creator history, security analysis, and read-only quotes. `APP_MODE=PAPER` starts the virtual PAPER runtime; `LIVE` is rejected. `paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to `false`. Enabling the stream does not establish complete coverage or enable paid PumpPortal feeds. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
 
 ## Non-negotiable invariants
 
@@ -77,4 +77,4 @@ Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_
 
 ## Definition of MVP
 
-The current runtime delivers realtime token discovery and persisted creator/security `DRY_RUN` decisions with optional read-only quote evidence. The PAPER package is a separately testable foundation only: runtime mode stays `DRY_RUN` until live trade observations and the full decision path pass Milestone A. No automatic entries, LIVE execution, wallet secret, signing, or transaction submission are available.
+The runtime delivers real-time token discovery and persisted creator/security `DRY_RUN` decisions, and supports a strictly virtual PAPER wallet and position monitor. Automatic PAPER entries remain disabled by default and require a `BUY_ELIGIBLE` decision plus complete trade coverage, complete behavior, supported security state, matching config version, and a fresh signal. Current Helius log coverage is deliberately unverified, so no live automatic entry or live fill is claimed. No private wallet secret, signing, transaction submission, or LIVE mode is available.

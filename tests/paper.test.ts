@@ -176,7 +176,7 @@ test("paper buy uses a quote after arrival, applies costs, and deduplicates fill
     assert.equal(result.fill?.["venueFeeRaw"], "10000");
     assert.equal(quoteProvider.calls[0]?.at, "2026-11-01T00:00:00.250Z");
     const state = store.getPaperPortfolioState("paper-wallet");
-    assert.equal(store.listAppliedMigrations().at(-1)?.version, 8);
+    assert.equal(store.listAppliedMigrations().at(-1)?.version, 9);
     assert.equal(state.solBalanceRaw, "999990000");
     assert.equal(state.positions[0]?.tokenAmountRaw, "99500");
     const quoteCount = quoteProvider.calls.length;
@@ -711,13 +711,14 @@ test("daily realized loss limit blocks new exposure after a losing close", async
   });
 });
 
-test("PAPER library remains unavailable through active application mode", async () => {
+test("PAPER mode is explicit and PAPER library remains isolated from signing", async () => {
   const loaded = await loadConfig({});
   assert.equal(loaded.config.mode, "DRY_RUN");
   const paperConfig = paperExecutionConfigFromAppConfig(loaded.config);
   assert.equal(paperConfig.risk.maxTradeInputRaw, "50000000");
   assert.equal(paperInitialBalanceLamports(loaded.config), "10000000000");
-  await assert.rejects(loadConfig({ APP_MODE: "PAPER" }));
+  assert.equal((await loadConfig({ APP_MODE: "PAPER" })).config.mode, "PAPER");
+  await assert.rejects(loadConfig({ APP_MODE: "LIVE" }), /LIVE is unsupported/);
   const paperSource = await readFile("packages/paper/src/index.ts", "utf8");
   assert.doesNotMatch(
     paperSource,

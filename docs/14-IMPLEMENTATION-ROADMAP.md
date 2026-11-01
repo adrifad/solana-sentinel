@@ -37,11 +37,13 @@ Read-only Helius mainnet health, historical transaction, and account-state calls
 - [x] Virtual SOL wallet, immutable double-entry ledger, positions and no phantom sells in the standalone PAPER package.
 - [x] Configured execution latency/slippage, persistent order recovery, risk limits, and PnL/drawdown reporting with deterministic tests.
 - [x] Partial exits and time/stop/take-profit exit evaluation.
-- [ ] Integrate the package into an operational PAPER worker with live normalized trade observations, end-to-end mode isolation tests, and controlled quote budgets.
+- [x] Integrate the package into an explicit PAPER worker mode with wallet initialization, pending-order recovery, and bounded position monitoring/exits; keep default entries disabled and require complete evidence.
+- [x] Add virtual-only mode config, persisted event/position monitor state, bounded Helius log observation, and distinct health/readiness fields.
+- [ ] Demonstrate real trade payloads and continuous coverage, quote-at-arrival fills, and full discovery-to-exit using mainnet observations.
 
 **Done when:** 100 fixture scenarios pass; no paper trade changes chain balances.
 
-**Current status:** PAPER foundation tests exist, but application mode and automatic entries remain disabled. Milestone A has not passed because live PumpPortal trade observations and continuous stream coverage are unavailable. The isolated package is not yet readiness for live PAPER operation.
+**Current status:** PAPER mode and position monitoring are wired; automatic entries default off and remain fail-closed because trade coverage cannot yet be reconciled to `COMPLETE`. No real trade observation or operational fill has been verified. Milestone A and PAPER_READY remain open.
 
 ## Sprint 3.1 — Runtime hardening and migration recovery
 
@@ -49,9 +51,9 @@ Read-only Helius mainnet health, historical transaction, and account-state calls
 - [x] Recover interrupted migration jobs after restart and produce a fail-closed report for migration-first discovery without inventing creator identity.
 - [x] Dispatch PumpPortal token events, provider errors, known controls, unsupported frames, and malformed frames separately; persist bounded sanitized diagnostics.
 - [x] Permit valid risk-reducing PAPER SELLs while new entries are paused; apply max trade size to BUY entries and enforce held-balance and quote checks atomically.
-- [x] Re-run local integration and CI-equivalent checks; live PumpPortal trade coverage remains blocked and PAPER mode stays disabled.
+- [x] Re-run local integration and CI-equivalent checks; live trade coverage remains unverified. PAPER is now an explicit virtual runtime; LIVE remains disabled.
 
-**Status:** Safety defects are corrected and regression tests are added. Operational PAPER readiness remains blocked on Milestone A live trade observations and complete decision evidence.
+**Status:** Safety defects are corrected and regression tests are added. Automatic PAPER readiness remains blocked on Milestone A live trade observations and complete decision evidence.
 
 ## Sprint 2.5 — Intelligence and quote foundation (partial)
 
@@ -59,7 +61,8 @@ Read-only Helius mainnet health, historical transaction, and account-state calls
 - [x] Add normalized launch behavior contracts/analyzer with as-of filtering, independent buyer estimates, explicit completeness and unknown outcomes.
 - [x] Add exact-in quote contracts, persistent quote records, a quote-only Jupiter adapter with request pacing/budgets, Helius-backed Pump curve and canonical PumpSwap state loaders, and official SDK quote calculations validated against recorded mainnet state snapshots.
 - [x] Add explicit validated-holder-sample coverage policy while keeping exhaustive holder completeness false.
-- [ ] Validate PumpPortal trade message schema and wire the metered stream manager, expiry, budget and reconnection lifecycle.
+- [x] Add a read-only Helius logs observer with bounded subscription lifecycle, event budget, reconnect-gap tracking, synthetic Pump SDK 4.1.0 log decoder tests, and persistent normalized observations. Live payload validation remains open.
+- [ ] Validate PumpPortal trade message schema and any metered feed lifecycle; no PumpPortal trade payload was received.
 - [ ] Validate the actual PumpPortal trade payload contract and implement metered subscribe/unsubscribe lifecycle, expiry, event budgets, reconnection coverage, and persistence. The configured key's subscription attempt was denied at the linked-wallet funding gate on 2026-11-01.
 - [ ] Run a complete token-to-behavior-to-buy/sell-quote pipeline with live normalized trade observations and fresh live state. Helius and PumpPortal free-feed access plus one Pump curve and one PumpSwap state were verified on 2026-11-01; migration was not observed, trade streaming was denied, and Jupiter credentials are absent.
 

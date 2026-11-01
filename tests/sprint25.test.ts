@@ -32,6 +32,7 @@ function trade(
 ): LaunchTradeObservation {
   return {
     id: input.id ?? "trade-1",
+    eventIndex: input.eventIndex ?? 0,
     mint,
     signature: input.signature ?? "sig-1",
     slot: input.slot ?? 100,
@@ -522,7 +523,7 @@ test("wallet outflow evidence is an indicator and does not assert a sell", () =>
   assert.equal(outflows[0]?.afterAmountRaw, "400");
 });
 
-test("migration 006 persists quotes and behavior snapshots and reopens cleanly", async () => {
+test("migration 009 persists quotes and behavior snapshots and reopens cleanly", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sentinel-sprint25-"));
   const path = join(dir, "state.db");
   const store = new SentinelStore(path);
@@ -576,7 +577,7 @@ test("migration 006 persists quotes and behavior snapshots and reopens cleanly",
       migrations.some((item) => item.version === 6),
       true,
     );
-    assert.equal(migrations.at(-1)?.version, 8);
+    assert.equal(migrations.at(-1)?.version, 9);
     assert.equal(store.tryConsumeJupiterRequest(1), true);
     assert.equal(store.tryConsumeJupiterRequest(1), false);
   } finally {

@@ -9,6 +9,9 @@ const server = createApiServer({
   store,
   mode: config.config.mode,
   staleFeedSeconds: config.config.observability.health_stale_feed_seconds,
+  tradeStreamEnabled: config.config.providers.helius.enable_trade_stream,
+  automaticEntriesEnabled: config.config.paper.automatic_entries_enabled,
+  paperWalletId: config.config.paper.wallet_id,
 });
 server.listen(config.apiPort, config.apiHost, () => {
   process.stdout.write(

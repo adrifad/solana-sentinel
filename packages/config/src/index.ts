@@ -22,7 +22,7 @@ export const AppConfigSchema = z
   .object({
     version: z.literal(1),
     network: z.literal("mainnet-beta"),
-    mode: z.literal("DRY_RUN"),
+    mode: z.enum(["DRY_RUN", "PAPER"]),
     providers: z
       .object({
         helius: z
@@ -31,6 +31,9 @@ export const AppConfigSchema = z
             max_requests_per_second: z.number().int().min(1).max(1000),
             max_requests_per_utc_day: positiveInt,
             max_concurrent_enrichments: z.number().int().min(1).max(32),
+            enable_trade_stream: z.boolean(),
+            max_active_trade_subscriptions: z.number().int().min(1).max(5000),
+            max_trade_events_per_day: positiveInt,
           })
           .strict(),
         pumpportal: z
@@ -131,6 +134,14 @@ export const AppConfigSchema = z
         modeled_network_fee_lamports: z.string().regex(/^\d+$/),
         mark_to_sell_quote: z.boolean(),
         reject_when_sell_quote_missing: z.boolean(),
+        wallet_id: z.string().min(1).max(80),
+        automatic_entries_enabled: z.boolean(),
+        order_size_sol: z.string().regex(/^\d+(\.\d+)?$/),
+        stop_loss_bps: z.number().int().min(1).max(10000),
+        take_profit_bps: z.number().int().positive(),
+        position_monitor_interval_ms: z.number().int().min(250).max(900000),
+        exit_retry_base_ms: z.number().int().min(1000).max(300000),
+        exit_retry_max_ms: z.number().int().min(1000).max(3600000),
       })
       .strict(),
     observability: z
@@ -143,7 +154,30 @@ export const AppConfigSchema = z
       })
       .strict(),
   })
-  .strict();
+  .strict()
+  .superRefine((config, context) => {
+    const orderSize = solAmountLamports(config.paper.order_size_sol);
+    const maxTrade = solAmountLamports(config.risk.max_trade_sol);
+    if (orderSize <= 0n || orderSize > maxTrade)
+      context.addIssue({
+        code: "custom",
+        path: ["paper", "order_size_sol"],
+        message:
+          "paper order size must be positive and no greater than max_trade_sol",
+      });
+    if (solAmountLamports(config.paper.initial_sol) <= 0n)
+      context.addIssue({
+        code: "custom",
+        path: ["paper", "initial_sol"],
+        message: "paper initial balance must be positive",
+      });
+    if (config.paper.exit_retry_max_ms < config.paper.exit_retry_base_ms)
+      context.addIssue({
+        code: "custom",
+        path: ["paper", "exit_retry_max_ms"],
+        message: "exit retry maximum must be at least the base delay",
+      });
+  });
 
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 export type RuntimeEnvironment = {
@@ -169,26 +203,41 @@ export type LoadedConfig = {
   apiPort: number;
 };
 
+function solAmountLamports(value: string): bigint {
+  const [whole = "0", fraction = ""] = value.split(".");
+  return (
+    BigInt(whole) * 1_000_000_000n + BigInt(fraction.padEnd(9, "0") || "0")
+  );
+}
+
 export async function loadConfig(
   env: RuntimeEnvironment = process.env,
 ): Promise<LoadedConfig> {
   const configPath = env.APP_CONFIG_PATH ?? "config/default.yaml";
   const parsedYaml: unknown = parse(await readFile(configPath, "utf8"));
   const config = AppConfigSchema.parse(parsedYaml);
-  if (env.APP_MODE !== undefined && env.APP_MODE !== "DRY_RUN") {
+  if (
+    env.APP_MODE !== undefined &&
+    !["DRY_RUN", "PAPER"].includes(env.APP_MODE)
+  ) {
     throw new Error(
-      "APP_MODE supports DRY_RUN only; paper and live execution are not implemented",
+      "APP_MODE supports DRY_RUN and PAPER only; LIVE is unsupported",
     );
   }
+  const effectiveMode = env.APP_MODE ?? config.mode;
+  const effectiveConfig = AppConfigSchema.parse({
+    ...config,
+    mode: effectiveMode,
+  });
   const port = env.API_PORT === undefined ? 8787 : Number(env.API_PORT);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error("API_PORT must be an integer from 1 to 65535");
   const dbPath = env.DB_PATH ?? "./data/sentinel.db";
   return {
-    config,
     configVersion: createHash("sha256")
-      .update(JSON.stringify(config))
+      .update(JSON.stringify(effectiveConfig))
       .digest("hex"),
+    config: effectiveConfig,
     configPath,
     dbPath,
     pumpPortalApiKey: env.PUMPPORTAL_API_KEY || undefined,

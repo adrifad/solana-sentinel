@@ -157,6 +157,13 @@ export class TokenAnalysisScheduler {
       this.#store.finishAnalysisJob(job.eventId);
       return;
     }
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "QUEUE_WAIT",
+      Date.parse(event.receivedAtUtc),
+      startedAt,
+    );
     const evidence: AnalysisEvidence = {
       txBySignature: new Map(),
       verifiedCreateEvents: [],
@@ -172,6 +179,7 @@ export class TokenAnalysisScheduler {
       errors: new Set(),
     };
 
+    const creatorStartedAt = this.#now();
     if (event.kind === "TOKEN_MIGRATED") {
       if (event.migrationRecoveryStatus === "COMPLETE") {
         evidence.evidenceRefs.add(`migration_recovery:${job.eventId}`);
@@ -227,7 +235,15 @@ export class TokenAnalysisScheduler {
     } else {
       evidence.errors.add("HELIUS_CREDENTIAL_MISSING");
     }
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "CREATOR_ANALYSIS",
+      creatorStartedAt,
+      this.#now(),
+    );
 
+    const securityStartedAt = this.#now();
     const security = event.monitoringEligible
       ? await this.#securityReport(
           job.mint,
@@ -258,6 +274,13 @@ export class TokenAnalysisScheduler {
           ]),
           evidence,
         );
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "SECURITY_ANALYSIS",
+      securityStartedAt,
+      this.#now(),
+    );
     this.#store.saveTokenRiskReport(security);
 
     const primaryWallet =
@@ -269,12 +292,20 @@ export class TokenAnalysisScheduler {
           evidence.asOfSlot ?? undefined,
         )
       : null;
+    const quoteStartedAt = this.#now();
     const quotes =
       (this.#helius || this.#jupiter) &&
       event.monitoringEligible &&
       security.status === "SUPPORTED"
         ? await this.#quoteExit(job.mint, token.marketPhase)
         : { buy: null, sell: null };
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "MARKET_QUOTE",
+      quoteStartedAt,
+      this.#now(),
+    );
     const exitValidation = validateExitQuotes({
       ...quotes,
       maximumAgeMs: this.#config.providers.jupiter.max_quote_age_ms,
@@ -285,6 +316,7 @@ export class TokenAnalysisScheduler {
       evidence.evidenceRefs.add(`market_quote:${reference}`);
     for (const reason of exitValidation.reasonCodes)
       evidence.errors.add(reason);
+    const behaviorStartedAt = this.#now();
     const launchBehavior = this.#buildLaunchBehavior(
       job.mint,
       token.firstSeenAtUtc,
@@ -297,6 +329,14 @@ export class TokenAnalysisScheduler {
       this.#store.saveLaunchBehaviorSnapshot(launchBehavior);
       evidence.evidenceRefs.add(`launch_behavior:${launchBehavior.id}`);
     }
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "LAUNCH_BEHAVIOR",
+      behaviorStartedAt,
+      this.#now(),
+    );
+    const decisionStartedAt = this.#now();
     const decision = evaluateRiskDecision({
       mint: job.mint,
       configVersion: this.#configVersion,
@@ -313,6 +353,13 @@ export class TokenAnalysisScheduler {
       minimumIndependentBuyers: this.#config.analysis.min_independent_buyers,
       launchBehavior,
     });
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "DECISION_COMPUTATION",
+      decisionStartedAt,
+      this.#now(),
+    );
     this.#store.saveRiskDecision(decision);
     if (decision.status === "BUY_ELIGIBLE") {
       this.#store.saveDryRunTradeIntent({
@@ -333,6 +380,13 @@ export class TokenAnalysisScheduler {
       ? Math.min(3_600_000, 30_000 * 2 ** Math.min(job.attempts - 1, 7))
       : 0;
     this.#store.finishAnalysisJob(job.eventId, retryDelayMs);
+    this.#recordStage(
+      job.eventId,
+      job.mint,
+      "TOTAL_ANALYSIS",
+      startedAt,
+      this.#now(),
+    );
     log("info", "analysis.report.persisted", {
       mint: job.mint,
       eventId: job.eventId,
@@ -340,6 +394,24 @@ export class TokenAnalysisScheduler {
       securityStatus: security.status,
       evidenceCount: evidence.evidenceRefs.size,
       latencyMs: decision.latencyMs,
+    });
+  }
+
+  #recordStage(
+    eventId: string,
+    mint: string,
+    stage: string,
+    startedAt: number,
+    finishedAt: number,
+  ): void {
+    if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) return;
+    this.#store.recordAnalysisStageTiming({
+      eventId,
+      mint,
+      stage,
+      startedAtUtc: new Date(startedAt).toISOString(),
+      finishedAtUtc: new Date(finishedAt).toISOString(),
+      durationMs: Math.max(0, Math.trunc(finishedAt - startedAt)),
     });
   }
 

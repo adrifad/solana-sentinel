@@ -16,13 +16,14 @@
 ```http
 GET    /api/health
 GET    /api/completeness
+GET    /api/metrics/latency
 GET    /ready
 GET    /api/tokens?limit=50
 GET    /api/tokens/:mint
 GET    /api/creators/:pubkey
 ```
 
-The implemented API is read-only: token detail includes role evidence, latest security report, decisions, analysis job outcomes, and migration transaction-recovery status; health includes provider health, completeness, and recent sanitized provider-frame diagnostics. Creator detail includes reputation, historical launches, and wallet-link evidence. Portfolio, orders, config mutation, authentication, and push event streaming remain unimplemented. No endpoint can change mode or arm trading.
+The implemented API is read-only: token detail includes role evidence, latest security report, decisions, analysis job outcomes, and migration transaction-recovery status; health includes provider health, completeness, separate provider/analysis/trade/PAPER readiness, and recent sanitized provider-frame diagnostics. `/api/metrics/latency` reports persisted analysis-stage p50 and sample count, with p95 after 20 samples and p99 after 100. Creator detail includes reputation, historical launches, and wallet-link evidence. Portfolio, orders, config mutation, authentication, and push event streaming remain unimplemented. No endpoint can change mode or arm trading.
 
 ## Security / UX rules
 

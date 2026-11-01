@@ -297,6 +297,7 @@ export type LaunchBehaviorSnapshot = z.infer<
 
 export const LaunchTradeObservationSchema = z.object({
   id: z.string().min(1),
+  eventIndex: z.number().int().nonnegative().default(0),
   mint: PubkeySchema,
   signature: z.string().min(1),
   slot: z.number().int().nonnegative().safe().nullable(),

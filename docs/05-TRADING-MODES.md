@@ -2,7 +2,7 @@
 
 ## Current implementation boundary
 
-The application currently validates `DRY_RUN` only. A signer-free `@sentinel/paper` library and SQLite ledger foundation are available for deterministic testing, but neither `APP_MODE=PAPER` nor worker entry execution is enabled. Do not select PAPER for operations until the live observation-to-decision Milestone A is demonstrated and the remaining execution safeguards are integrated.
+The application accepts `DRY_RUN` and `PAPER`; `LIVE` remains unsupported. The worker PAPER adapter initializes and recovers only virtual account/order state, obtains read-only quotes, and monitors exits. Default automatic entries are disabled. The optional Helius logs trade observer is also disabled by default and records `UNVERIFIED`/`GAP_DETECTED` coverage only; no real Pump trade payload or continuous window was verified in this change. PAPER execution is therefore available for controlled manual/library validation, but automatic-entry readiness is blocked until Milestone A is demonstrated.
 
 ## Safety matrix
 
@@ -30,6 +30,8 @@ Use **mainnet data**, virtual SOL and token balances; reconstruct executable quo
 - `REPLAY_PAPER`: same engine, deterministic recorded events and historical market snapshots. These are not interchangeable: never query current quote while replaying historical trades.
 - Mark equity-to-market using **exit quotes** for position size, not last trade price alone.
 - When sell cannot be quoted or liquidity vanishes, status `EXIT_UNAVAILABLE` and exposure remains.
+- Runtime configuration: `paper.automatic_entries_enabled` defaults to `false`; `providers.helius.enable_trade_stream` defaults to `false`. Entries require a current-config `BUY_ELIGIBLE` decision, supported security report, complete launch behavior, `COMPLETE` observation coverage, and a fresh signal. The current Helius observer cannot produce `COMPLETE`, so this gate remains fail-closed.
+- The worker can run PAPER without Helius, but then all quote requests fail unavailable and no fills occur. Position state is retained and marked unpriceable rather than valued from a stale trade.
 
 ## LIVE
 
