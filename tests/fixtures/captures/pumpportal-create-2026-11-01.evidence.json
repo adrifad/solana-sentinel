@@ -1,0 +1,22 @@
+{
+  "captureSource": "PumpPortal live Data API WebSocket on Solana mainnet",
+  "captureTimeUtc": "2026-11-01T07:07:29.041Z",
+  "captureSanitization": "API credentials and local runtime details are excluded. Public token event fields and public chain identifiers are retained.",
+  "providerPayloadSlot": null,
+  "heliusVerification": {
+    "network": "mainnet-beta",
+    "genesisHash": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+    "signature": "4D9enpXMdPadBP599d8Pp3vKnSeH26tWPSBL3nu8TopNUjmwqi3VycLr395qso5jLsBM6gdKsAtwUrEe7gdZtqvB",
+    "transactionSucceeded": true,
+    "slot": 464002088,
+    "feePayer": "Eri3jmrXet5F1oV4mKegginGWWDiukjuUAfsFUzyTrAf",
+    "pumpCreateEventDecoded": true,
+    "createEventMint": "EoyXSdCtEQg42vjwPeqpoadYvdEp1qTaoB685wVwpump",
+    "createEventUser": "Eri3jmrXet5F1oV4mKegginGWWDiukjuUAfsFUzyTrAf",
+    "createEventCreator": "Eri3jmrXet5F1oV4mKegginGWWDiukjuUAfsFUzyTrAf",
+    "mintAccountOwner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "bondingCurveAccountOwner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "accountBatchContextSlot": 464002260
+  },
+  "interpretation": "This single launch confirms the captured traderPublicKey matched the transaction fee payer and Pump CreateEvent user/creator. It does not establish wallet-role semantics for every Pump instruction version."
+}

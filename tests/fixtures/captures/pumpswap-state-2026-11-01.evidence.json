@@ -1,0 +1,36 @@
+{
+  "captureSource": "Helius mainnet-beta confirmed getMultipleAccounts",
+  "captureTimeUtc": "2026-11-01T07:15:59.626Z",
+  "tokenMint": "7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump",
+  "canonicalPool": "GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J",
+  "poolLayoutSource": "Pump official public docs and @pump-fun/pump-swap-sdk 2.1.0",
+  "snapshotSlot": 464004463,
+  "slotSkewBetweenPoolAndVaultReads": 0,
+  "accountValidation": "Pool/global config/Pump fee config/mint/base vault/quote vault owners and vault mint/authority relationships passed; quote mint is wrapped SOL.",
+  "quoteValidation": {
+    "sdk": "@pump-fun/pump-swap-sdk 2.1.0",
+    "inputAmountLamports": "50000000",
+    "buyOutputRaw": "271345233855",
+    "buyFeeRaw": "617286",
+    "buyFeeBreakdownRaw": {
+      "protocol": "459260",
+      "creator": "148149",
+      "liquidityProvider": "9877",
+      "unallocated": "0"
+    },
+    "sellInputRaw": "271345233855",
+    "sellOutputLamports": "48726222",
+    "sellFeeRaw": "616790",
+    "sellFeeBreakdownRaw": {
+      "protocol": "458891",
+      "creator": "148030",
+      "liquidityProvider": "9869",
+      "unallocated": "0"
+    },
+    "buyPriceImpactBps": 127,
+    "sellPriceImpactBps": 128,
+    "availableQuoteLiquidityRaw": "122752236748",
+    "virtualQuoteReservesRaw": "-692519"
+  },
+  "limitations": "This is a read-only quote calculated from one captured live snapshot. No transaction was submitted, so executable fills and post-trade outcomes were not validated."
+}

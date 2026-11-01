@@ -12,6 +12,7 @@ import type {
 } from "@sentinel/domain";
 import { z } from "zod";
 import {
+  computeFeesBps,
   getBuyV3TokenAmountFromQuoteAmount,
   getSellSolAmountFromTokenAmount,
 } from "@pump-fun/pump-sdk";
@@ -93,8 +94,14 @@ export class PumpCurveQuoteEngine {
     );
     const mintSupply = bn(
       state.bondingCurve.virtualTokenReserves,
-      state.mintSupplyRaw,
+      state.bondingCurve.isMayhemMode
+        ? state.mintSupplyRaw
+        : "1000000000000000",
     );
+    let feeAmounts =
+      request.direction === "BUY"
+        ? exactInputFeeAmounts(request.exactInputAmountRaw, state, mintSupply)
+        : undefined;
     let output: string;
     let idealOutput: bigint;
     if (request.direction === "BUY") {
@@ -118,6 +125,17 @@ export class PumpCurveQuoteEngine {
         bondingCurve: state.bondingCurve,
         amount,
       }).toString();
+      const inputRaw = BigInt(request.exactInputAmountRaw);
+      const grossQuote = (
+        (inputRaw *
+          BigInt(state.bondingCurve.virtualQuoteReserves.toString())) /
+        (BigInt(state.bondingCurve.virtualTokenReserves.toString()) + inputRaw)
+      ).toString();
+      const sellFees = exactFeeAmounts(grossQuote, state, mintSupply);
+      feeAmounts = {
+        ...sellFees,
+        unallocated: "0",
+      };
       idealOutput =
         (BigInt(request.exactInputAmountRaw) *
           BigInt(state.bondingCurve.virtualQuoteReserves.toString())) /
@@ -137,10 +155,13 @@ export class PumpCurveQuoteEngine {
     return QuoteResultSchema.parse({
       ...base,
       expectedOutputAmountRaw: output,
-      feeAmountRaw: null,
+      feeAmountRaw: (
+        BigInt(feeAmounts?.protocol ?? "0") + BigInt(feeAmounts?.creator ?? "0")
+      ).toString(),
+      feeBreakdownRaw: feeAmounts,
       feeMint:
         request.direction === "BUY" ? request.inputMint : request.outputMint,
-      feeModel: "PUMP_OFFICIAL_SDK_V3_INCLUDED_FEE_SCHEDULE_NOT_DECOMPOSED",
+      feeModel: "PUMP_OFFICIAL_SDK_V3_PROTOCOL_CREATOR_FEES_DECOMPOSED",
       priceImpactBps,
       liquidityQuoteRaw: state.bondingCurve.realQuoteReserves.toString(),
       validationStatus: "PASS",
@@ -153,6 +174,80 @@ export class PumpCurveQuoteEngine {
       },
     });
   }
+}
+
+function exactInputFeeAmounts(
+  exactInputRaw: string,
+  state: PumpCurveQuoteState,
+  mintSupply: { constructor: unknown },
+) {
+  const rates = curveFeeRates(state, mintSupply);
+  const totalBps = rates.protocolBps + rates.creatorBps;
+  const gross = BigInt(exactInputRaw);
+  let net = totalBps === 0n ? gross : (gross * 10000n) / (10000n + totalBps);
+  let protocol = ceilBps(net, rates.protocolBps);
+  let creator = ceilBps(net, rates.creatorBps);
+  const excess = net + protocol + creator - gross;
+  if (excess > 0n) {
+    net -= excess;
+    protocol = ceilBps(net, rates.protocolBps);
+    creator = ceilBps(net, rates.creatorBps);
+  }
+  return {
+    protocol: protocol.toString(),
+    creator: creator.toString(),
+    liquidityProvider: "0",
+    unallocated: (gross - net - protocol - creator).toString(),
+  };
+}
+
+function exactFeeAmounts(
+  grossQuoteRaw: string,
+  state: PumpCurveQuoteState,
+  mintSupply: { constructor: unknown },
+) {
+  const rates = curveFeeRates(state, mintSupply);
+  const gross = BigInt(grossQuoteRaw);
+  const protocol = ceilBps(gross, rates.protocolBps);
+  const creator = ceilBps(gross, rates.creatorBps);
+  return {
+    protocol: protocol.toString(),
+    creator: creator.toString(),
+    liquidityProvider: "0",
+    unallocated: "0",
+  };
+}
+
+function curveFeeRates(
+  state: PumpCurveQuoteState,
+  mintSupplyTemplate: { constructor: unknown },
+) {
+  const supply = bn(
+    mintSupplyTemplate,
+    state.bondingCurve.isMayhemMode ? state.mintSupplyRaw : "1000000000000000",
+  );
+  const fees = computeFeesBps({
+    global: state.global,
+    feeConfig: state.feeConfig,
+    mintSupply: supply,
+    virtualQuoteReserves: state.bondingCurve.virtualQuoteReserves,
+    virtualTokenReserves: state.bondingCurve.virtualTokenReserves,
+    quoteMint: state.bondingCurve.quoteMint,
+    creatorFeeBps: state.bondingCurve.creatorFeeBps,
+  });
+  return {
+    protocolBps: BigInt(fees.protocolFeeBps.toString()),
+    creatorBps:
+      state.bondingCurve.creator.toBase58() ===
+      "11111111111111111111111111111111"
+        ? 0n
+        : BigInt(fees.creatorFeeBps.toString()),
+  };
+}
+
+function ceilBps(amount: bigint, bps: bigint): bigint {
+  if (bps === 0n || amount === 0n) return 0n;
+  return (amount * bps + 9999n) / 10000n;
 }
 
 export type JupiterQuoteOptions = {

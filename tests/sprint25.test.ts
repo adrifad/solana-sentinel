@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,9 @@ import {
 import {
   JupiterQuoteClient,
   PumpCurveQuoteEngine,
+  PumpCurveStateLoader,
+  PumpSwapQuoteEngine,
+  PumpSwapStateLoader,
   type PumpCurveQuoteState,
   type WalletTransaction,
 } from "@sentinel/providers";
@@ -175,6 +178,230 @@ test("Pump curve quote engine rejects migrated venue and stale snapshots", () =>
   } as unknown as PumpCurveQuoteState);
   assert.equal(stale.failureReason, "STALE_SNAPSHOT");
   assert.equal(stale.validationStatus, "FAIL");
+});
+
+test("Helius captured Pump curve state produces deterministic SDK buy and sell quotes", async () => {
+  const capture = JSON.parse(
+    await readFile(
+      "tests/fixtures/captures/pump-curve-state-2026-11-01.json",
+      "utf8",
+    ),
+  ) as {
+    mint: string;
+    slot: number;
+    capturedAtUtc: string;
+    accounts: Array<{
+      address: string;
+      owner: string;
+      dataBase64: string;
+      executable: boolean;
+    } | null>;
+  };
+  const fakeHelius = {
+    async getMultipleAccounts(addresses: string[]) {
+      return {
+        slot: capture.slot,
+        accounts: addresses.map(
+          (address) =>
+            capture.accounts.find((account) => account?.address === address) ??
+            null,
+        ),
+      };
+    },
+  };
+  const capturedAtMs = Date.parse(capture.capturedAtUtc);
+  const loaded = await new PumpCurveStateLoader({
+    helius: fakeHelius as never,
+    now: () => capturedAtMs,
+  }).load(capture.mint);
+  assert.equal(loaded.status, "SUPPORTED");
+  if (loaded.status !== "SUPPORTED") return;
+  assert.equal(loaded.state.snapshot.slot, 464003571);
+  assert.equal(
+    loaded.mintProgramId,
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  );
+
+  const engine = new PumpCurveQuoteEngine();
+  const requestedAtUtc = new Date(capturedAtMs).toISOString();
+  const quoteBase = {
+    mint: capture.mint,
+    inputMint: mint,
+    outputMint: capture.mint,
+    maxAgeMs: 0,
+    requestedAtUtc,
+  };
+  const buy = engine.quote(
+    {
+      ...quoteBase,
+      direction: "BUY",
+      exactInputAmountRaw: "50000000",
+    },
+    loaded.state,
+  );
+  assert.equal(buy.validationStatus, "PASS");
+  assert.equal(buy.expectedOutputAmountRaw, "735339457766082");
+  assert.equal(buy.feeAmountRaw, "617285");
+  assert.deepEqual(buy.feeBreakdownRaw, {
+    protocol: "469136",
+    creator: "148149",
+    liquidityProvider: "0",
+    unallocated: "0",
+  });
+  assert.equal(buy.priceImpactBps, 5682);
+  assert.equal(buy.snapshotSlot, 464003571);
+
+  const sell = engine.quote(
+    {
+      ...quoteBase,
+      direction: "SELL",
+      exactInputAmountRaw: buy.expectedOutputAmountRaw!,
+      inputMint: capture.mint,
+      outputMint: mint,
+    },
+    loaded.state,
+  );
+  assert.equal(sell.validationStatus, "PASS");
+  assert.equal(sell.expectedOutputAmountRaw, "13639617");
+  assert.equal(sell.feeAmountRaw, "172654");
+  assert.deepEqual(sell.feeBreakdownRaw, {
+    protocol: "131217",
+    creator: "41437",
+    liquidityProvider: "0",
+    unallocated: "0",
+  });
+  assert.equal(sell.snapshotSlot, 464003571);
+
+  const stale = engine.quote(
+    {
+      ...quoteBase,
+      direction: "BUY",
+      exactInputAmountRaw: "50000000",
+      requestedAtUtc: new Date(capturedAtMs + 1).toISOString(),
+      maxAgeMs: 0,
+    },
+    loaded.state,
+  );
+  assert.equal(stale.failureReason, "STALE_SNAPSHOT");
+  assert.equal(stale.validationStatus, "FAIL");
+});
+
+test("Helius captured PumpSwap state produces exact-input buy and sell SDK quotes", async () => {
+  const capture = JSON.parse(
+    await readFile(
+      "tests/fixtures/captures/pumpswap-state-2026-11-01.json",
+      "utf8",
+    ),
+  ) as {
+    mint: string;
+    poolAddress: string;
+    slot: number;
+    capturedAtUtc: string;
+    accounts: Array<{
+      address: string;
+      owner: string;
+      dataBase64: string;
+      executable: boolean;
+    } | null>;
+  };
+  const fakeHelius = {
+    async getMultipleAccounts(addresses: string[]) {
+      return {
+        slot: capture.slot,
+        accounts: addresses.map(
+          (address) =>
+            capture.accounts.find((account) => account?.address === address) ??
+            null,
+        ),
+      };
+    },
+  };
+  const capturedAtMs = Date.parse(capture.capturedAtUtc);
+  const loaded = await new PumpSwapStateLoader({
+    helius: fakeHelius as never,
+    now: () => capturedAtMs,
+  }).load(capture.mint);
+  assert.equal(loaded.status, "SUPPORTED");
+  if (loaded.status !== "SUPPORTED") return;
+  assert.equal(loaded.poolAddress, capture.poolAddress);
+  assert.equal(loaded.slotSkew, 0);
+  assert.equal(loaded.state.snapshot.slot, 464004463);
+  assert.equal(loaded.state.pool.virtualQuoteReserves.toString(), "-692519");
+  assert.equal(loaded.state.snapshot.quoteReserveRaw, "122752236748");
+  assert.equal(loaded.state.snapshot.liquidityQuoteRaw, "122752236748");
+
+  const engine = new PumpSwapQuoteEngine();
+  const requestedAtUtc = new Date(capturedAtMs).toISOString();
+  const quoteBase = {
+    mint: capture.mint,
+    inputMint: mint,
+    outputMint: capture.mint,
+    maxAgeMs: 0,
+    requestedAtUtc,
+  };
+  const buy = engine.quote(
+    {
+      ...quoteBase,
+      direction: "BUY",
+      exactInputAmountRaw: "50000000",
+    },
+    loaded.state,
+  );
+  assert.equal(buy.validationStatus, "PASS");
+  assert.equal(buy.expectedOutputAmountRaw, "271345233855");
+  assert.equal(buy.feeAmountRaw, "617286");
+  assert.deepEqual(buy.feeBreakdownRaw, {
+    protocol: "459260",
+    creator: "148149",
+    liquidityProvider: "9877",
+    unallocated: "0",
+  });
+  assert.equal(buy.priceImpactBps, 127);
+
+  const sell = engine.quote(
+    {
+      ...quoteBase,
+      direction: "SELL",
+      exactInputAmountRaw: buy.expectedOutputAmountRaw!,
+      inputMint: capture.mint,
+      outputMint: mint,
+    },
+    loaded.state,
+  );
+  assert.equal(sell.validationStatus, "PASS");
+  assert.equal(sell.expectedOutputAmountRaw, "48726222");
+  assert.equal(sell.feeAmountRaw, "616790");
+  assert.deepEqual(sell.feeBreakdownRaw, {
+    protocol: "458891",
+    creator: "148030",
+    liquidityProvider: "9869",
+    unallocated: "0",
+  });
+  assert.equal(sell.priceImpactBps, 128);
+
+  const stale = engine.quote(
+    {
+      ...quoteBase,
+      direction: "BUY",
+      exactInputAmountRaw: "50000000",
+      requestedAtUtc: new Date(capturedAtMs + 1).toISOString(),
+      maxAgeMs: 0,
+    },
+    loaded.state,
+  );
+  assert.equal(stale.failureReason, "STALE_SNAPSHOT");
+  const impossibleSell = engine.quote(
+    {
+      ...quoteBase,
+      direction: "SELL",
+      exactInputAmountRaw: "1000000000000000000",
+      inputMint: capture.mint,
+      outputMint: mint,
+    },
+    loaded.state,
+  );
+  assert.equal(impossibleSell.validationStatus, "FAIL");
+  assert.equal(impossibleSell.failureReason, "INSUFFICIENT_LIQUIDITY");
 });
 
 test("launch behavior excludes trades observed after the decision timestamp", () => {

@@ -5,7 +5,10 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.99.0",
     "@pump-fun/pump-sdk": "4.1.0",
+    "@pump-fun/pump-swap-sdk": "2.1.0",
     "@pump-fun/pump-swap-sdk": "2.1.0",
     "@sentinel/domain": "workspace:*",
     "ws": "^8.18.3",

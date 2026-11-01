@@ -47,11 +47,13 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The initial checkout was a documentation-only blueprint. The current implementation provides validated `DRY_RUN` configuration, SQLite event persistence and migrations, PumpPortal launch/migration discovery, bounded Helius read adapters, creator-intelligence and token-security reports, quote-only Jupiter routing, an official Pump bonding-curve quote calculator for verified SDK state, time-indexed launch behavior contracts, explainable fail-closed decisions, and read-only APIs. Live Pump quotes, PumpSwap state decoding, PumpPortal trade subscriptions, PAPER execution, LIVE execution, and the dashboard remain unimplemented or disabled. Jupiter results without chain slot and price-impact evidence cannot pass exit validation. See [implementation status](docs/IMPLEMENTATION-STATUS.md).
+The initial checkout was a documentation-only blueprint. The current implementation provides validated `DRY_RUN` configuration, SQLite event persistence and migrations, PumpPortal launch/migration discovery, bounded Helius read adapters, creator-intelligence and token-security reports, quote-only Jupiter routing, and Helius-backed Pump bonding-curve and canonical PumpSwap state loaders with exact-input SDK quotes. Time-indexed launch behavior contracts, explainable fail-closed decisions, and read-only APIs are also present. PumpPortal metered trade subscriptions are disabled because live activation was denied by the provider's linked-wallet funding requirement; the worker therefore cannot claim a complete real-time launch behavior window. PAPER execution, LIVE execution, and the dashboard remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for captured-state quote vectors and remaining acceptance gates.
 
 ## Local implementation commands
 
 With Node.js 24 or 26 and pnpm 11 installed:
+
+Provider validation is available with `pnpm validate:providers --seconds=45`. The default live check makes at most four Helius RPC requests, listens only to free PumpPortal create/migration feeds, and never enables metered trade subscriptions. Optional state-capture flags run additional bounded Helius account requests for Pump curve or PumpSwap snapshots. Sanitized public evidence can be written under `tests/fixtures/captures`; see `--help` in the script for the supported capture flags.
 
 ```bash
 pnpm install

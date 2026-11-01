@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,6 +94,21 @@ test("detected launch gets persistent fail-closed reports without Helius credent
   try {
     const event = parsePumpPortalMessage(fixture, Date.now());
     store.ingestEvent(event, 10, false);
+    store.saveLaunchTradeObservation({
+      id: "test-launch-trade-1",
+      mint: event.mint,
+      signature: "test-launch-trade-signature",
+      slot: 100,
+      blockTimeUtc: event.firstSeenAtUtc,
+      receivedAtUtc: event.firstSeenAtUtc,
+      side: "BUY",
+      traderWallet: event.launchInitiator ?? null,
+      tokenAmountRaw: "100",
+      quoteAmountRaw: "5000",
+      venue: "PUMP_BONDING_CURVE",
+      source: "sanitized-test-observation",
+      payloadRef: `sha256:${createHash("sha256").update("trade").digest("hex")}`,
+    });
     scheduler.start();
     await waitForDecision(store, event.mint);
     const report = store.getLatestTokenRiskReport(event.mint);
@@ -107,6 +123,16 @@ test("detected launch gets persistent fail-closed reports without Helius credent
       decision?.evidenceRefs.some((ref) => ref.startsWith("market_event:")),
       true,
     );
+    const behavior = store.listLaunchBehaviorSnapshots(event.mint)[0];
+    assert.ok(behavior);
+    assert.equal(behavior.complete, false);
+    assert.equal(behavior.gapReason, "TRADE_STREAM_COMPLETENESS_UNVERIFIED");
+    assert.equal(behavior.buyCount, 1);
+    assert.equal(
+      decision?.evidenceRefs.includes(`launch_behavior:${behavior.id}`),
+      true,
+    );
+    assert.equal(decision?.status, "QUARANTINE");
   } finally {
     await scheduler.stop();
     store.close();

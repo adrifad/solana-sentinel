@@ -6,7 +6,7 @@
 - Subscribe: `subscribeNewToken`, `subscribeMigration`, `subscribeTokenTrade`, `subscribeAccountTrade`.
 - **One socket** and dynamically update subscriptions; do not open a connection per mint.
 - Creation/migration streaming is listed as free; trade/account streams are metered and may require linked wallet funding. Check provider pricing and enforce monthly event budgets.
-- Official provider guidance currently prices trade streams at 0.01 SOL per 10,000 received events and says the linked wallet must have at least 0.02 SOL. This runtime keeps `enable_token_trades: false`; it has no validated trade-payload adapter, metered subscription lifecycle, or raw event budget enforcement yet.
+- Official provider guidance currently prices trade streams at 0.01 SOL per 10,000 received events and says the linked wallet must have at least 0.02 SOL. A live `subscribeTokenTrade` request was denied because the configured linked wallet did not meet that minimum. This runtime keeps `enable_token_trades: false`; it has no validated trade-payload adapter, metered subscription lifecycle, or raw event budget enforcement yet.
 - Security note: PumpPortal **Lightning API key may control its linked wallet**. Even for read-only data, treat it as a signing-capable secret; never fund that wallet with trading capital for MVP.
 - Parse and validate event signatures, blockchain slot, mint, creator, tx type and amounts. Store unknown fields in redacted raw record for forward compatibility.
 - On reconnect: use jittered exponential backoff and restore subscriptions. Each interruption is persisted as an unreconciled gap; a Helius missed-launch reconciler is not yet implemented. At-most-once receipt is not guaranteed.
@@ -38,8 +38,8 @@
 
 ## Pump.fun and PumpSwap official SDKs
 
-- Pinned read-only quote calculation dependency: `@pump-fun/pump-sdk@4.1.0`. `PumpCurveQuoteEngine` uses its current v3 exact-input buy and sell math when supplied a validated, slot-stamped curve/global/fee snapshot. State acquisition is not yet wired to Helius, and completed curves are explicitly unsupported.
-- `@pump-fun/pump-swap-sdk@2.1.0` is pinned for current protocol documentation alignment, but PumpSwap account/vault state decoding and quote calculation are not yet wired. Migrated tokens remain unsupported by the worker.
+- Pinned read-only quote calculation dependency: `@pump-fun/pump-sdk@4.1.0`. `PumpCurveStateLoader` uses bounded Helius account batches and validates mint, curve, global/fee configuration, token program, and associated fee accounts before the quote engine calls current exact-input buy/sell SDK math. Completed/migrated curves are explicitly unsupported.
+- `@pump-fun/pump-swap-sdk@2.1.0` supports the canonical WSOL PumpSwap pool. `PumpSwapStateLoader` validates pool/global/fee/mint/vault ownership and slot coherence; the quote engine calls current SDK exact-input math and checks real sell-side quote liquidity. Custom quote mints or pool layouts remain unsupported. Live state captures verify account decoding and SDK calculations for those snapshots, not transaction execution.
 - Pin versions only after checking official latest docs/IDL against supported programs; do not copy old constant-product formulas blindly. Pump protocol introduced v3 trades and v2 PumpSwap, multi-hop and negative virtual reserve handling in 2026.
 - Treat migration as a state transition and invalidate old quote snapshots. Quote output includes fee assumptions and provenance; avoid double-charging fees.
 
@@ -55,6 +55,8 @@
 | Discord/X/website unavailable | Social status `UNVERIFIED`, never invent endorsement                        |
 
 ## Provider cost controls
+
+Live validation on 2026-11-01 confirmed the configured PumpPortal key can connect to free create/migration feeds and produced a sanitized create capture verified against finalized Helius transaction and account evidence. The official reference documents subscribe/unsubscribe methods and the charge model, but does not define trade message fields. A bounded trade subscription attempt was rejected because the linked wallet did not meet the documented 0.02 SOL minimum. No trade payload was received or normalized, and the worker does not activate that metered feed. One Pump curve state and one canonical PumpSwap state were captured through Helius and decoded with pinned official SDKs; quote vectors are recorded in the implementation status.
 
 Set `max_monitored_tokens`, per-provider request rates and UTC-day caps. The metered PumpPortal token-trade feature remains hard-disabled in schema until event decoding, subscription lifecycle, and persistent event-budget enforcement are available.
 

@@ -232,6 +232,14 @@ export const QuoteResultSchema = z.object({
   snapshotSlot: z.number().int().nonnegative().safe().nullable(),
   snapshotAtUtc: IsoUtcSchema.nullable(),
   feeAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  feeBreakdownRaw: z
+    .object({
+      protocol: z.string().regex(/^\d+$/),
+      creator: z.string().regex(/^\d+$/),
+      liquidityProvider: z.string().regex(/^\d+$/),
+      unallocated: z.string().regex(/^\d+$/),
+    })
+    .optional(),
   feeMint: PubkeySchema.nullable(),
   feeModel: z.string().min(1),
   priceImpactBps: z.number().int().nonnegative().nullable(),

@@ -1,5 +1,7 @@
 # 14 — Implementation Roadmap / Work Breakdown
 
+Read-only Helius mainnet health, historical transaction, and account-state calls, plus a PumpPortal live create event, were verified on 2026-11-01. No migration event arrived during the bounded free-feed session. Trade subscription was denied by the provider's linked-wallet minimum and no trade payload was captured. See `docs/IMPLEMENTATION-STATUS.md` for evidence and remaining gates.
+
 ## Sprint 0 — Foundation
 
 - [ ] pnpm workspace, TypeScript strict, config Zod parser, SQLite WAL migrations and structured logger.
@@ -42,13 +44,13 @@
 
 - [x] Persist queried-wallet token balance outflows and identify repeated patterns without claiming fraud.
 - [x] Add normalized launch behavior contracts/analyzer with as-of filtering, independent buyer estimates, explicit completeness and unknown outcomes.
-- [x] Add exact-in quote contracts, persistent quote records, a quote-only Jupiter adapter with request pacing/budgets, and Pump official SDK bonding-curve calculations for caller-supplied verified state.
+- [x] Add exact-in quote contracts, persistent quote records, a quote-only Jupiter adapter with request pacing/budgets, Helius-backed Pump curve and canonical PumpSwap state loaders, and official SDK quote calculations validated against recorded mainnet state snapshots.
 - [x] Add explicit validated-holder-sample coverage policy while keeping exhaustive holder completeness false.
 - [ ] Validate PumpPortal trade message schema and wire the metered stream manager, expiry, budget and reconnection lifecycle.
-- [ ] Wire a budgeted Helius state loader for Pump bonding curves, implement PumpSwap pool/vault state quotes, and validate both against on-chain snapshots.
-- [ ] Run a complete token-to-behavior-to-buy/sell-quote pipeline with fresh live provider snapshots; current environment has no Helius, PumpPortal, or Jupiter credentials.
+- [ ] Validate the actual PumpPortal trade payload contract and implement metered subscribe/unsubscribe lifecycle, expiry, event budgets, reconnection coverage, and persistence. The configured key's subscription attempt was denied at the linked-wallet funding gate on 2026-11-01.
+- [ ] Run a complete token-to-behavior-to-buy/sell-quote pipeline with live normalized trade observations and fresh live state. Helius and PumpPortal free-feed access plus one Pump curve and one PumpSwap state were verified on 2026-11-01; migration was not observed, trade streaming was denied, and Jupiter credentials are absent.
 
-**Status:** foundation contracts and isolated quote calculations are implemented, but acceptance is not met; no live quote or `BUY_ELIGIBLE` result is claimed. Do not start PAPER until the remaining quote/state and streaming items pass.
+**Status:** discovery-to-state-backed-quote components are implemented and quote vectors from recorded mainnet state pass. Acceptance is not met: the worker has no real normalized trade observations or complete launch behavior window, migration capture is missing, and no end-to-end live evidence-backed decision or `BUY_ELIGIBLE` result is claimed. Do not start PAPER until these gates pass.
 
 ## Sprint 4 — Dashboard + operations
 

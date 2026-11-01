@@ -1,0 +1,21 @@
+[
+  {
+    "captureSource": "LIVE_PUMPPORTAL_WEBSOCKET",
+    "providerContract": "observed-live-message",
+    "capturedAtUtc": "2026-11-01T07:07:29.041Z",
+    "event": {
+      "provider": "pumpportal",
+      "kind": "TOKEN_CREATED",
+      "mint": "EoyXSdCtEQg42vjwPeqpoadYvdEp1qTaoB685wVwpump",
+      "txSignature": "4D9enpXMdPadBP599d8Pp3vKnSeH26tWPSBL3nu8TopNUjmwqi3VycLr395qso5jLsBM6gdKsAtwUrEe7gdZtqvB",
+      "slot": null,
+      "receivedAtUtc": "2026-11-01T07:07:29.036Z",
+      "creator": null,
+      "launchInitiator": "Eri3jmrXet5F1oV4mKegginGWWDiukjuUAfsFUzyTrAf",
+      "name": "ABC",
+      "symbol": "ABC",
+      "rawPayloadRef": "sha256:2ce66dd5749ce627cf8b1f5002a3dddc4c9523244b8ac2eac0c3695521d54059",
+      "sanitizedPayload": "{\"signature\":\"4D9enpXMdPadBP599d8Pp3vKnSeH26tWPSBL3nu8TopNUjmwqi3VycLr395qso5jLsBM6gdKsAtwUrEe7gdZtqvB\",\"mint\":\"EoyXSdCtEQg42vjwPeqpoadYvdEp1qTaoB685wVwpump\",\"traderPublicKey\":\"Eri3jmrXet5F1oV4mKegginGWWDiukjuUAfsFUzyTrAf\",\"txType\":\"create\",\"initialBuy\":2115327.702796,\"solAmount\":0.059259258,\"bondingCurveKey\":\"7apyCpzugGUycUe6nhRmeGMtBU8p8WxH6bNpbLiFmSWg\",\"vTokensInBondingCurve\":1070884672.297204,\"vSolInBondingCurve\":30.059259257999976,\"marketCapSol\":28.069557848389476,\"name\":\"ABC\",\"symbol\":\"ABC\",\"uri\":\"https://ipfs.io/ipfs/bafkreif2ydx7ydaqahkj7qwbohtafoivtkgtpkbzmoqsepbyl7gywkfesy\",\"is_mayhem_mode\":true,\"pool\":\"pump\"}"
+    }
+  }
+]

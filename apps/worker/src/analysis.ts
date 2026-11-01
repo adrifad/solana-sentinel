@@ -13,6 +13,7 @@ import type {
   WalletRoleEvidence,
 } from "@sentinel/domain";
 import {
+  analyzeLaunchBehavior,
   decodePumpCreateEvents,
   extractDirectFundingTransfers,
   detectWalletTokenOutflows,
@@ -22,6 +23,10 @@ import {
 import type { PumpCreateEvent } from "@sentinel/intelligence";
 import {
   ProviderFailure,
+  PumpCurveQuoteEngine,
+  PumpCurveStateLoader,
+  PumpSwapQuoteEngine,
+  PumpSwapStateLoader,
   type HeliusRpcClient,
   type WalletTransaction,
 } from "@sentinel/providers";
@@ -64,6 +69,10 @@ export class TokenAnalysisScheduler {
   readonly #store: SentinelStore;
   readonly #helius: HeliusRpcClient | undefined;
   readonly #jupiter: JupiterQuoteClient | undefined;
+  readonly #pumpCurveState: PumpCurveStateLoader | undefined;
+  readonly #pumpSwapState: PumpSwapStateLoader | undefined;
+  readonly #pumpCurveQuotes = new PumpCurveQuoteEngine();
+  readonly #pumpSwapQuotes = new PumpSwapQuoteEngine();
   readonly #config: AppConfig;
   readonly #configVersion: string;
   readonly #concurrency: number;
@@ -77,6 +86,18 @@ export class TokenAnalysisScheduler {
     this.#store = options.store;
     this.#helius = options.helius;
     this.#jupiter = options.jupiter;
+    this.#pumpCurveState = options.helius
+      ? new PumpCurveStateLoader({
+          helius: options.helius,
+          ...(options.now ? { now: options.now } : {}),
+        })
+      : undefined;
+    this.#pumpSwapState = options.helius
+      ? new PumpSwapStateLoader({
+          helius: options.helius,
+          ...(options.now ? { now: options.now } : {}),
+        })
+      : undefined;
     this.#config = options.config;
     this.#configVersion = options.configVersion;
     this.#concurrency = options.concurrency;
@@ -221,10 +242,10 @@ export class TokenAnalysisScheduler {
         )
       : null;
     const quotes =
-      this.#jupiter &&
+      (this.#helius || this.#jupiter) &&
       event.monitoringEligible &&
       security.status === "SUPPORTED"
-        ? await this.#quoteExit(job.mint)
+        ? await this.#quoteExit(job.mint, token.marketPhase)
         : { buy: null, sell: null };
     const exitValidation = validateExitQuotes({
       ...quotes,
@@ -236,6 +257,18 @@ export class TokenAnalysisScheduler {
       evidence.evidenceRefs.add(`market_quote:${reference}`);
     for (const reason of exitValidation.reasonCodes)
       evidence.errors.add(reason);
+    const launchBehavior = this.#buildLaunchBehavior(
+      job.mint,
+      token.firstSeenAtUtc,
+      evidence,
+      token.name,
+      token.symbol,
+      token.uri,
+    );
+    if (launchBehavior) {
+      this.#store.saveLaunchBehaviorSnapshot(launchBehavior);
+      evidence.evidenceRefs.add(`launch_behavior:${launchBehavior.id}`);
+    }
     const decision = evaluateRiskDecision({
       mint: job.mint,
       configVersion: this.#configVersion,
@@ -250,7 +283,7 @@ export class TokenAnalysisScheduler {
       minimumHolderSampleCoverageBps:
         this.#config.analysis.min_holder_sample_coverage_bps,
       minimumIndependentBuyers: this.#config.analysis.min_independent_buyers,
-      launchBehavior: null,
+      launchBehavior,
     });
     this.#store.saveRiskDecision(decision);
     if (decision.status === "BUY_ELIGIBLE") {
@@ -282,12 +315,144 @@ export class TokenAnalysisScheduler {
     });
   }
 
-  async #quoteExit(mint: string): Promise<{
+  #buildLaunchBehavior(
+    mint: string,
+    firstSeenAtUtc: string,
+    evidence: AnalysisEvidence,
+    name: string | null,
+    symbol: string | null,
+    uri: string | null,
+  ) {
+    const nowMs = this.#now();
+    const observedAtUtc = new Date(nowMs).toISOString();
+    const windowSeconds =
+      this.#config.providers.pumpportal.observation_window_seconds;
+    const windowEndMs = Date.parse(firstSeenAtUtc) + windowSeconds * 1000;
+    const effectiveEndUtc = new Date(
+      Math.min(nowMs, windowEndMs),
+    ).toISOString();
+    const observations = this.#store.listLaunchTradeObservations(
+      mint,
+      firstSeenAtUtc,
+      effectiveEndUtc,
+      evidence.asOfSlot,
+    );
+    if (observations.length === 0) return null;
+
+    const verifiedCreators = evidence.verifiedCreateEvents
+      .filter((item) => item.mint === mint)
+      .flatMap((item) => [item.creator, item.user]);
+    const metadataLikelyTest =
+      assessTestTokenMetadata({
+        name,
+        symbol,
+        uri,
+      }).classification === "LIKELY_TEST";
+    return analyzeLaunchBehavior({
+      mint,
+      observations,
+      creatorWallets: unique(verifiedCreators),
+      linkedWallets: [...evidence.clusterWallets],
+      windowStartedAtUtc: firstSeenAtUtc,
+      observedAtUtc,
+      windowSeconds,
+      throughSlot: evidence.asOfSlot,
+      // Stored trades do not prove uninterrupted subscription coverage. Keep
+      // the snapshot incomplete until a provider coverage record exists.
+      complete: false,
+      gapReason: "TRADE_STREAM_COMPLETENESS_UNVERIFIED",
+      minIndependentBuyers: this.#config.analysis.min_independent_buyers,
+      metadataLikelyTest,
+    });
+  }
+
+  async #quoteExit(
+    mint: string,
+    marketPhase: string,
+  ): Promise<{
     buy: QuoteResult | null;
     sell: QuoteResult | null;
   }> {
     const inputAmountRaw = solToLamports(this.#config.risk.max_trade_sol);
     const requestedAtUtc = new Date(this.#now()).toISOString();
+    if (marketPhase === "MIGRATED_PUMPSWAP" && this.#pumpSwapState) {
+      const loaded = await this.#pumpSwapState.load(mint);
+      if (loaded.status !== "SUPPORTED") {
+        log("warn", "analysis.pumpswap_state_unavailable", {
+          mint,
+          errorCode: loaded.reasonCode,
+        });
+        return { buy: null, sell: null };
+      }
+      const buy = this.#pumpSwapQuotes.quote(
+        {
+          mint,
+          direction: "BUY",
+          exactInputAmountRaw: inputAmountRaw,
+          inputMint: "So11111111111111111111111111111111111111112",
+          outputMint: mint,
+          maxAgeMs: this.#config.security.max_snapshot_age_ms,
+          requestedAtUtc,
+        },
+        loaded.state,
+      );
+      this.#store.saveQuoteResult(buy);
+      if (buy.validationStatus !== "PASS" || !buy.expectedOutputAmountRaw)
+        return { buy, sell: null };
+      const sell = this.#pumpSwapQuotes.quote(
+        {
+          mint,
+          direction: "SELL",
+          exactInputAmountRaw: buy.expectedOutputAmountRaw,
+          inputMint: mint,
+          outputMint: "So11111111111111111111111111111111111111112",
+          maxAgeMs: this.#config.security.max_snapshot_age_ms,
+          requestedAtUtc: new Date(this.#now()).toISOString(),
+        },
+        loaded.state,
+      );
+      this.#store.saveQuoteResult(sell);
+      return { buy, sell };
+    }
+    if (marketPhase === "PUMP_CURVE" && this.#pumpCurveState) {
+      const loaded = await this.#pumpCurveState.load(mint);
+      if (loaded.status !== "SUPPORTED") {
+        log("warn", "analysis.pump_curve_state_unavailable", {
+          mint,
+          errorCode: loaded.reasonCode,
+        });
+        return { buy: null, sell: null };
+      }
+      const buy = this.#pumpCurveQuotes.quote(
+        {
+          mint,
+          direction: "BUY",
+          exactInputAmountRaw: inputAmountRaw,
+          inputMint: "So11111111111111111111111111111111111111112",
+          outputMint: mint,
+          maxAgeMs: this.#config.security.max_snapshot_age_ms,
+          requestedAtUtc,
+        },
+        loaded.state,
+      );
+      this.#store.saveQuoteResult(buy);
+      if (buy.validationStatus !== "PASS" || !buy.expectedOutputAmountRaw)
+        return { buy, sell: null };
+      const sell = this.#pumpCurveQuotes.quote(
+        {
+          mint,
+          direction: "SELL",
+          exactInputAmountRaw: buy.expectedOutputAmountRaw,
+          inputMint: mint,
+          outputMint: "So11111111111111111111111111111111111111112",
+          maxAgeMs: this.#config.security.max_snapshot_age_ms,
+          requestedAtUtc: new Date(this.#now()).toISOString(),
+        },
+        loaded.state,
+      );
+      this.#store.saveQuoteResult(sell);
+      return { buy, sell };
+    }
     try {
       const buy = await this.#jupiter!.quote({
         mint,
