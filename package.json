@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
+    "lint": "eslint apps packages tests scripts eslint.config.js",
     "format:check": "prettier --check .",
     "docs:check": "node scripts/check-doc-links.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.ts",

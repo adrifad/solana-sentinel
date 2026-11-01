@@ -3,19 +3,27 @@ import { z } from "zod";
 
 const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-export function isSolanaPubkey(value: string): boolean {
-  if (value.length < 32 || value.length > 44) return false;
+export function base58DecodedLength(value: string): number | null {
+  if (!value) return 0;
   let decoded = 0n;
   for (const character of value) {
     const digit = BASE58.indexOf(character);
-    if (digit < 0) return false;
+    if (digit < 0) return null;
     decoded = decoded * 58n + BigInt(digit);
   }
   let byteLength = 0;
   for (let remainder = decoded; remainder > 0n; remainder >>= 8n)
     byteLength += 1;
   const leadingZeroBytes = value.match(/^1+/)?.[0].length ?? 0;
-  return leadingZeroBytes + byteLength === 32;
+  return leadingZeroBytes + byteLength;
+}
+
+export function isSolanaPubkey(value: string): boolean {
+  return (
+    value.length >= 32 &&
+    value.length <= 44 &&
+    base58DecodedLength(value) === 32
+  );
 }
 
 export const PubkeySchema = z.string().refine(isSolanaPubkey, {
@@ -31,7 +39,8 @@ export const MarketEventSchema = z
     mint: PubkeySchema,
     txSignature: z
       .string()
-      .regex(/^[1-9A-HJ-NP-Za-km-z]{64,128}$/)
+      .regex(/^[1-9A-HJ-NP-Za-km-z]{64,88}$/)
+      .refine((value) => base58DecodedLength(value) === 64)
       .optional(),
     slot: z.number().int().nonnegative().safe().optional(),
     observedAtUtc: IsoUtcSchema.optional(),
@@ -72,6 +81,7 @@ export function eventIdempotencyKey(input: {
   mint: string;
   signature?: string;
   slot?: number;
+  payloadDigest?: string;
   creator?: string;
   launchInitiator?: string;
   name?: string;
@@ -83,15 +93,17 @@ export function eventIdempotencyKey(input: {
         mint: input.mint,
         signature: input.signature,
       })
-    : JSON.stringify({
-        kind: input.kind,
-        mint: input.mint,
-        slot: input.slot ?? null,
-        creator: input.creator ?? null,
-        launchInitiator: input.launchInitiator ?? null,
-        name: input.name ?? null,
-        symbol: input.symbol ?? null,
-      });
+    : input.slot !== undefined
+      ? JSON.stringify({ kind: input.kind, mint: input.mint, slot: input.slot })
+      : JSON.stringify({
+          kind: input.kind,
+          mint: input.mint,
+          payloadDigest: input.payloadDigest ?? null,
+          creator: input.creator ?? null,
+          launchInitiator: input.launchInitiator ?? null,
+          name: input.name ?? null,
+          symbol: input.symbol ?? null,
+        });
   return createHash("sha256").update(normalized).digest("hex");
 }
 

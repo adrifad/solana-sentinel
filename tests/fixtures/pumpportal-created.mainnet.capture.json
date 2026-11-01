@@ -1,0 +1,11 @@
+{
+  "txType": "create",
+  "mint": "5XJ77H59Ws9SpEiMj2BjX7fFEcbbGzPowyJBi8ar7i62",
+  "signature": "5TKad77QinBX7wpSJABiiH2w7FnSgseEHdjTzTHgT9bcYJAa9xrKyTTfVHifoXXqHZdy1wBfbFHmrVCebBBsfev2",
+  "traderPublicKey": "3QH76KPoo47vrwVWecWFYg6q2Pmg2dN4TG3ugDT23UHg",
+  "bondingCurveKey": "4A3nTFQ3n81tN3mhSy8uzhZoBzUiEsKi11m8JbnwSqGS",
+  "initialBuy": 79481481.481481,
+  "marketCapSol": 32.6113699906803,
+  "vSolInBondingCurve": 32.399999999999984,
+  "vTokensInBondingCurve": 993518518.518519
+}

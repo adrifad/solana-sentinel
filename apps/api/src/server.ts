@@ -31,6 +31,7 @@ async function handleRequest(
       ok: true,
       mode: options.mode,
       checkedAtUtc: utcNow(),
+      completeness: options.store.getStreamCompleteness(),
     });
   }
   if (url.pathname === "/ready") {
@@ -49,9 +50,12 @@ async function handleRequest(
       ready,
       mode: options.mode,
       providers,
+      completeness: options.store.getStreamCompleteness(),
       checkedAtUtc: utcNow(),
     });
   }
+  if (url.pathname === "/api/completeness")
+    return send(response, 200, options.store.getStreamCompleteness());
   if (url.pathname === "/api/tokens") {
     const limit = Number(url.searchParams.get("limit") ?? "50");
     if (!Number.isInteger(limit) || limit < 1 || limit > 200)

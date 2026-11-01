@@ -10,6 +10,8 @@ type SqlRow = Record<
   string,
   null | number | bigint | string | NodeJS.NonSharedUint8Array
 >;
+type JobChainTimeStatus =
+  "UNKNOWN" | "RESOLVED" | "UNAVAILABLE" | "PROVIDER_ERROR";
 
 export type StoredToken = {
   mint: string;
@@ -53,6 +55,7 @@ export class SentinelStore {
       "001-initial.sql",
       "002-mint-state-and-provenance.sql",
       "003-discovery-hardening.sql",
+      "004-enrichment-and-completeness.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -94,10 +97,11 @@ export class SentinelStore {
     try {
       const existing = this.#db
         .prepare(
-          "SELECT 1 FROM market_events WHERE provider = ? AND idempotency_key = ?",
+          "SELECT id, slot, sanitized_payload FROM market_events WHERE provider = ? AND idempotency_key = ?",
         )
-        .get(event.provider, event.idempotencyKey);
+        .get(event.provider, event.idempotencyKey) as SqlRow | undefined;
       if (existing) {
+        this.#recordEventConflict(existing, event);
         const token = this.#db
           .prepare("SELECT monitoring_eligible FROM tokens WHERE mint = ?")
           .get(event.mint) as SqlRow | undefined;
@@ -241,9 +245,46 @@ export class SentinelStore {
   recordObservedTimestamp(eventId: string, observedAtUtc: string): void {
     this.#db
       .prepare(
-        `UPDATE market_events SET observed_at_utc = ?, observed_time_source = 'helius:getBlockTime' WHERE id = ?`,
+        `UPDATE market_events SET observed_at_utc = ?, observed_time_source = 'helius:getBlockTime',
+        chain_time_status = 'RESOLVED', chain_time_error_code = NULL WHERE id = ?`,
       )
       .run(observedAtUtc, eventId);
+  }
+
+  recordUnavailableTimestamp(eventId: string): void {
+    this.#db
+      .prepare(
+        `UPDATE market_events SET chain_time_status = 'UNAVAILABLE', chain_time_error_code = NULL WHERE id = ?`,
+      )
+      .run(eventId);
+  }
+
+  recordTimestampError(eventId: string, errorCode: string): void {
+    this.#db
+      .prepare(
+        `UPDATE market_events SET chain_time_status = 'PROVIDER_ERROR', chain_time_error_code = ? WHERE id = ?`,
+      )
+      .run(errorCode, eventId);
+  }
+
+  getEventTimestampStatus(eventId: string): {
+    status: JobChainTimeStatus;
+    errorCode: string | null;
+  } | null {
+    const row = this.#db
+      .prepare(
+        "SELECT chain_time_status, chain_time_error_code FROM market_events WHERE id = ?",
+      )
+      .get(eventId) as SqlRow | undefined;
+    return row
+      ? {
+          status: row["chain_time_status"] as JobChainTimeStatus,
+          errorCode:
+            row["chain_time_error_code"] === null
+              ? null
+              : String(row["chain_time_error_code"]),
+        }
+      : null;
   }
 
   recordMintAccount(
@@ -289,6 +330,7 @@ export class SentinelStore {
     mint: string;
     kind: MarketEvent["kind"];
     slot: number | null;
+    chainTimeStatus: "UNKNOWN" | "RESOLVED" | "UNAVAILABLE" | "PROVIDER_ERROR";
     attempts: number;
   } | null {
     this.#db.exec("BEGIN IMMEDIATE");
@@ -296,7 +338,7 @@ export class SentinelStore {
       const now = utcNow();
       const row = this.#db
         .prepare(
-          `SELECT j.event_id, j.mint, j.attempts, e.kind, e.slot
+          `SELECT j.event_id, j.mint, j.attempts, e.kind, e.slot, e.chain_time_status
           FROM enrichment_jobs j JOIN market_events e ON e.id = j.event_id
           WHERE j.status = 'PENDING' AND j.next_attempt_at_utc <= ?
           ORDER BY j.created_at_utc LIMIT 1`,
@@ -319,6 +361,7 @@ export class SentinelStore {
             mint: String(row["mint"]),
             kind: row["kind"] as MarketEvent["kind"],
             slot: row["slot"] === null ? null : Number(row["slot"]),
+            chainTimeStatus: row["chain_time_status"] as JobChainTimeStatus,
             attempts: Number(row["attempts"]) + 1,
           }
         : null;
@@ -349,6 +392,13 @@ export class SentinelStore {
       );
   }
 
+  getEnrichmentJobStatus(eventId: string): string | null {
+    const row = this.#db
+      .prepare("SELECT status FROM enrichment_jobs WHERE event_id = ?")
+      .get(eventId) as SqlRow | undefined;
+    return row ? String(row["status"]) : null;
+  }
+
   recoverInterruptedEnrichmentJobs(): number {
     const result = this.#db
       .prepare(
@@ -376,6 +426,113 @@ export class SentinelStore {
         WHERE provider = 'pumpportal' AND reconciliation_state = 'OPEN'`,
       )
       .run(utcNow());
+  }
+
+  recordProviderIssue(provider: string, errorCode: string): void {
+    const now = utcNow();
+    this.#db
+      .prepare(
+        `INSERT INTO provider_issue_counters
+        (provider, error_code, first_seen_at_utc, last_seen_at_utc, occurrences)
+        VALUES (?, ?, ?, ?, 1) ON CONFLICT(provider, error_code) DO UPDATE SET
+        last_seen_at_utc = excluded.last_seen_at_utc, occurrences = occurrences + 1`,
+      )
+      .run(provider, errorCode, now, now);
+  }
+
+  getStreamCompleteness(): {
+    coverageStatus:
+      | "UNKNOWN"
+      | "OBSERVED_WITHOUT_KNOWN_GAP"
+      | "GAPS_UNRECONCILED"
+      | "PROVIDER_ISSUES";
+    historyComplete: false;
+    unreconciledGapCount: number;
+    providerIssueOccurrences: number;
+    checkpoint: ReturnType<SentinelStore["getDiscoveryCheckpoint"]>;
+  } {
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM stream_gaps
+        WHERE provider = 'pumpportal' AND reconciliation_state IN ('OPEN', 'UNRECOVERED')`,
+      )
+      .get() as SqlRow;
+    const unreconciledGapCount = Number(row["count"] ?? 0);
+    const issues = this.#db
+      .prepare(
+        `SELECT COALESCE(SUM(occurrences), 0) AS count FROM provider_issue_counters
+        WHERE provider = 'pumpportal'`,
+      )
+      .get() as SqlRow;
+    const providerIssueOccurrences = Number(issues["count"] ?? 0);
+    const checkpoint = this.getDiscoveryCheckpoint();
+    return {
+      coverageStatus:
+        unreconciledGapCount > 0
+          ? "GAPS_UNRECONCILED"
+          : providerIssueOccurrences > 0
+            ? "PROVIDER_ISSUES"
+            : checkpoint
+              ? "OBSERVED_WITHOUT_KNOWN_GAP"
+              : "UNKNOWN",
+      historyComplete: false,
+      unreconciledGapCount,
+      providerIssueOccurrences,
+      checkpoint,
+    };
+  }
+
+  eventConflictCount(): number {
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS count FROM provider_event_conflicts")
+      .get() as SqlRow;
+    return Number(row["count"] ?? 0);
+  }
+
+  #recordEventConflict(existing: SqlRow, incoming: MarketEvent): void {
+    const existingSlot = existing["slot"];
+    const reasons: string[] = [];
+    if (
+      existingSlot !== null &&
+      incoming.slot !== undefined &&
+      Number(existingSlot) !== incoming.slot
+    )
+      reasons.push("SLOT_MISMATCH");
+    let previous: Record<string, unknown> = {};
+    try {
+      const value: unknown = JSON.parse(String(existing["sanitized_payload"]));
+      if (value && typeof value === "object" && !Array.isArray(value))
+        previous = value as Record<string, unknown>;
+    } catch {
+      reasons.push("STORED_PAYLOAD_INVALID");
+    }
+    let next: Record<string, unknown> = {};
+    try {
+      const value: unknown = JSON.parse(incoming.sanitizedPayload);
+      if (value && typeof value === "object" && !Array.isArray(value))
+        next = value as Record<string, unknown>;
+    } catch {
+      reasons.push("INCOMING_PAYLOAD_INVALID");
+    }
+    for (const field of ["name", "symbol", "uri", "creator", "traderPublicKey"])
+      if (
+        typeof previous[field] === "string" &&
+        typeof next[field] === "string" &&
+        previous[field] !== next[field]
+      )
+        reasons.push(`${field.toUpperCase()}_MISMATCH`);
+    if (reasons.length === 0) return;
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO provider_event_conflicts
+        (event_id, incoming_payload_ref, reason_codes, detected_at_utc) VALUES (?, ?, ?, ?)`,
+      )
+      .run(
+        String(existing["id"]),
+        incoming.rawPayloadRef,
+        JSON.stringify([...new Set(reasons)].sort()),
+        utcNow(),
+      );
   }
 
   setProviderHealth(health: ProviderHealth): void {

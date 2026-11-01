@@ -34,4 +34,14 @@ test("rejects unsupported settings and bad ports", async () => {
   await writeFile(file, `${baseline}\nwallet_private_key: "secret"\n`);
   await assert.rejects(() => loadConfig({ APP_CONFIG_PATH: file }));
   await rm(path, { recursive: true, force: true });
+
+  const capacityPath = await mkdtemp(join(tmpdir(), "sentinel-capacity-"));
+  const capacityFile = join(capacityPath, "bad-capacity.yaml");
+  const valid = await readFile("config/default.yaml", "utf8");
+  await writeFile(
+    capacityFile,
+    valid.replace("max_pending_events: 128", "max_pending_events: 0"),
+  );
+  await assert.rejects(() => loadConfig({ APP_CONFIG_PATH: capacityFile }));
+  await rm(capacityPath, { recursive: true, force: true });
 });

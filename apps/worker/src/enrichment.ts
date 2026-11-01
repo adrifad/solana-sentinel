@@ -69,27 +69,57 @@ export class EnrichmentScheduler {
 
   async #process(job: Job): Promise<void> {
     try {
+      let failureCode: string | null = null;
       if (job.kind === "TOKEN_CREATED") {
         const current = this.#store.getToken(job.mint);
         if (
           current?.mintStateStatus === "UNKNOWN" ||
           current?.mintStateStatus === "PROVIDER_ERROR"
         ) {
-          const account = await this.#helius.getAccountInfo(job.mint);
-          this.#store.recordMintAccount(
-            job.mint,
-            account.account ? "PRESENT" : "NOT_FOUND",
-            account.slot,
-            account.account?.owner ?? null,
-            null,
-          );
+          try {
+            const account = await this.#helius.getAccountInfo(job.mint);
+            this.#store.recordMintAccount(
+              job.mint,
+              account.account ? "PRESENT" : "NOT_FOUND",
+              account.slot,
+              account.account?.owner ?? null,
+              null,
+            );
+          } catch (error) {
+            failureCode =
+              error instanceof ProviderFailure
+                ? error.code
+                : "PROVIDER_UNAVAILABLE";
+            this.#store.recordMintAccount(
+              job.mint,
+              "PROVIDER_ERROR",
+              null,
+              null,
+              failureCode,
+            );
+          }
         }
       }
-      if (job.slot !== null) {
-        const observedAtUtc = await this.#helius.getBlockTime(job.slot);
-        if (observedAtUtc)
-          this.#store.recordObservedTimestamp(job.eventId, observedAtUtc);
+      if (
+        job.slot !== null &&
+        (job.chainTimeStatus === "UNKNOWN" ||
+          job.chainTimeStatus === "PROVIDER_ERROR")
+      ) {
+        try {
+          const observedAtUtc = await this.#helius.getBlockTime(job.slot);
+          if (observedAtUtc)
+            this.#store.recordObservedTimestamp(job.eventId, observedAtUtc);
+          else this.#store.recordUnavailableTimestamp(job.eventId);
+        } catch (error) {
+          const code =
+            error instanceof ProviderFailure
+              ? error.code
+              : "PROVIDER_UNAVAILABLE";
+          this.#store.recordTimestampError(job.eventId, code);
+          failureCode ??= code;
+        }
       }
+      if (failureCode) throw new ProviderFailure(failureCode);
       this.#store.finishEnrichmentJob(job.eventId, "COMPLETE");
       this.#store.setProviderHealth({
         provider: "helius",
@@ -116,14 +146,6 @@ export class EnrichmentScheduler {
             ? 0
             : 500 * 2 ** (job.attempts - 1),
       );
-      if (job.kind === "TOKEN_CREATED")
-        this.#store.recordMintAccount(
-          job.mint,
-          "PROVIDER_ERROR",
-          null,
-          null,
-          errorCode,
-        );
       this.#store.setProviderHealth({
         provider: "helius",
         state: "DEGRADED",

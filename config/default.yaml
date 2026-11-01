@@ -15,6 +15,8 @@ providers:
     enable_token_trades: false
     max_monitored_tokens: 20
     max_trade_events_per_day: 5000
+    event_processing_concurrency: 4
+    max_pending_events: 128
   dexscreener:
     enabled: false # no adapter is active in this implementation slice
     requests_per_second: 2

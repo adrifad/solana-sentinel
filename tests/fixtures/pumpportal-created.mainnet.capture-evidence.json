@@ -1,0 +1,18 @@
+{
+  "captureSource": "https://pkg.go.dev/github.com/codingsandmore/pumpfun-portal",
+  "captureType": "third-party PumpPortal WebSocket console output; sanitized of local runtime details",
+  "providerCaptureDate": "2024-05-30",
+  "onChainVerification": {
+    "rpc": "https://api.mainnet-beta.solana.com",
+    "commitment": "finalized",
+    "signature": "5TKad77QinBX7wpSJABiiH2w7FnSgseEHdjTzTHgT9bcYJAa9xrKyTTfVHifoXXqHZdy1wBfbFHmrVCebBBsfev2",
+    "slot": 265662712,
+    "transactionSucceeded": true,
+    "pumpProgramId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "mint": "5XJ77H59Ws9SpEiMj2BjX7fFEcbbGzPowyJBi8ar7i62",
+    "pumpCreateInstructionUser": "3QH76KPoo47vrwVWecWFYg6q2Pmg2dN4TG3ugDT23UHg",
+    "createEventUser": "3QH76KPoo47vrwVWecWFYg6q2Pmg2dN4TG3ugDT23UHg",
+    "traderPublicKeyIsTransactionSigner": true,
+    "interpretation": "This event identifies the launch transaction user/initiator. It does not prove that user is the token creator in all Pump flows."
+  }
+}

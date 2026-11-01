@@ -11,6 +11,7 @@ export type PumpPortalOptions = {
   apiKey: string;
   enableNewTokens: boolean;
   enableMigrations: boolean;
+  persistEvent?: (event: MarketEvent) => void;
   onEvent: (event: MarketEvent) => Promise<void>;
   onHealth: (
     state: "STARTING" | "HEALTHY" | "DEGRADED" | "STOPPED",
@@ -28,6 +29,7 @@ export type PumpPortalOptions = {
   heartbeatMs?: number;
   maxMessageBytes?: number;
   maxPendingEvents?: number;
+  eventProcessingConcurrency?: number;
 };
 
 const SECRET_FIELD =
@@ -81,7 +83,7 @@ export function parsePumpPortalMessage(
   if (
     signature !== undefined &&
     (typeof signature !== "string" ||
-      !/^[1-9A-HJ-NP-Za-km-z]{64,128}$/.test(signature))
+      !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(signature))
   )
     throw new Error("MALFORMED_EVENT");
   if (
@@ -99,6 +101,7 @@ export function parsePumpPortalMessage(
   const safeSymbol = optionalString(symbol, 32, "symbol");
   const safeUri = optionalString(uri, 2048, "uri");
   const canonical = JSON.stringify(sanitizePayload(record));
+  const payloadDigest = createHash("sha256").update(canonical).digest("hex");
   const payload =
     canonical.length <= 4096
       ? canonical
@@ -111,6 +114,7 @@ export function parsePumpPortalMessage(
     mint,
     ...(typeof signature === "string" ? { signature } : {}),
     ...(typeof slot === "number" ? { slot } : {}),
+    payloadDigest,
     ...(safeCreator ? { creator: safeCreator } : {}),
     ...(safeLaunchInitiator ? { launchInitiator: safeLaunchInitiator } : {}),
     ...(safeName ? { name: safeName } : {}),
@@ -182,6 +186,7 @@ export class PumpPortalClient {
       | "heartbeatMs"
       | "maxMessageBytes"
       | "maxPendingEvents"
+      | "eventProcessingConcurrency"
       | "random"
       | "now"
     >
@@ -197,6 +202,7 @@ export class PumpPortalClient {
   #sleepTimer: ReturnType<typeof setTimeout> | undefined;
   #wakeSleep: (() => void) | undefined;
   readonly #eventHandlers = new Set<Promise<void>>();
+  readonly #eventQueue: MarketEvent[] = [];
 
   constructor(options: PumpPortalOptions) {
     if (!options.apiKey.trim())
@@ -212,6 +218,7 @@ export class PumpPortalClient {
       heartbeatMs: options.heartbeatMs ?? 15000,
       maxMessageBytes: options.maxMessageBytes ?? 65536,
       maxPendingEvents: options.maxPendingEvents ?? 128,
+      eventProcessingConcurrency: options.eventProcessingConcurrency ?? 4,
       random: options.random ?? Math.random,
       now: options.now ?? Date.now,
     };
@@ -238,12 +245,6 @@ export class PumpPortalClient {
     this.#running = false;
     if (this.#sleepTimer) clearTimeout(this.#sleepTimer);
     this.#wakeSleep?.();
-    this.#opts.onHealth(
-      "STOPPED",
-      this.#reconnectCount,
-      null,
-      this.#lastEventAtUtc,
-    );
     this.#current?.close(1000, "shutdown");
     let loopError: unknown;
     try {
@@ -253,7 +254,20 @@ export class PumpPortalClient {
     } finally {
       while (this.#eventHandlers.size > 0)
         await Promise.allSettled([...this.#eventHandlers]);
+      while (this.#eventQueue.length > 0 || this.#eventHandlers.size > 0) {
+        this.#drainEventQueue();
+        if (this.#eventHandlers.size > 0)
+          await Promise.allSettled([...this.#eventHandlers]);
+      }
       this.#loop = undefined;
+      this.#opts.onHealth(
+        "STOPPED",
+        this.#reconnectCount,
+        null,
+        this.#lastEventAtUtc,
+        this.#queueDepth,
+        this.#lastProcessedAtUtc,
+      );
     }
     if (loopError) throw loopError;
   }
@@ -394,48 +408,36 @@ export class PumpPortalClient {
         try {
           const event = parsePumpPortalMessage(parsed, receivedAt);
           this.#lastEventAtUtc = event.receivedAtUtc;
-          if (this.#eventHandlers.size >= this.#opts.maxPendingEvents) {
+          try {
+            this.#opts.persistEvent?.(event);
+          } catch {
+            this.#disconnectErrorCode = "EVENT_PERSIST_FAILED";
+            this.#opts.onHealth(
+              "DEGRADED",
+              this.#reconnectCount,
+              "EVENT_PERSIST_FAILED",
+              this.#lastEventAtUtc,
+              this.#queueDepth,
+              this.#lastProcessedAtUtc,
+            );
+            socket.terminate();
+            return;
+          }
+          if (this.#eventQueue.length >= this.#opts.maxPendingEvents) {
             this.#disconnectErrorCode = "EVENT_BACKPRESSURE";
             this.#opts.onHealth(
               "DEGRADED",
               this.#reconnectCount,
               "EVENT_BACKPRESSURE",
               this.#lastEventAtUtc,
-              this.#eventHandlers.size,
+              this.#queueDepth,
               this.#lastProcessedAtUtc,
             );
             socket.terminate();
             return;
           }
-          let eventPromise: Promise<void>;
-          try {
-            eventPromise = Promise.resolve(this.#opts.onEvent(event));
-          } catch (error) {
-            eventPromise = Promise.reject(error);
-          }
-          const handler = eventPromise
-            .then(() => {
-              this.#opts.onHealth(
-                "HEALTHY",
-                this.#reconnectCount,
-                null,
-                this.#lastEventAtUtc,
-                this.#eventHandlers.size,
-                (this.#lastProcessedAtUtc = utcNow()),
-              );
-            })
-            .catch(() =>
-              this.#opts.onHealth(
-                "DEGRADED",
-                this.#reconnectCount,
-                "EVENT_PERSIST_FAILED",
-                this.#lastEventAtUtc,
-                this.#eventHandlers.size,
-                this.#lastProcessedAtUtc,
-              ),
-            );
-          this.#eventHandlers.add(handler);
-          void handler.finally(() => this.#eventHandlers.delete(handler));
+          this.#eventQueue.push(event);
+          this.#drainEventQueue();
         } catch (error) {
           const code =
             error instanceof Error &&
@@ -464,6 +466,50 @@ export class PumpPortalClient {
       socket.on("close", finish);
     });
   }
+
+  get #queueDepth(): number {
+    return this.#eventQueue.length + this.#eventHandlers.size;
+  }
+
+  #drainEventQueue(): void {
+    while (
+      this.#eventHandlers.size < this.#opts.eventProcessingConcurrency &&
+      this.#eventQueue.length > 0
+    ) {
+      const event = this.#eventQueue.shift();
+      if (!event) return;
+      const handler = Promise.resolve()
+        .then(() => this.#opts.onEvent(event))
+        .then(() => {
+          this.#lastProcessedAtUtc = utcNow();
+          if (this.#running)
+            this.#opts.onHealth(
+              "HEALTHY",
+              this.#reconnectCount,
+              null,
+              this.#lastEventAtUtc,
+              this.#queueDepth,
+              this.#lastProcessedAtUtc,
+            );
+        })
+        .catch(() => {
+          if (this.#running)
+            this.#opts.onHealth(
+              "DEGRADED",
+              this.#reconnectCount,
+              "EVENT_PROCESSING_FAILED",
+              this.#lastEventAtUtc,
+              this.#queueDepth,
+              this.#lastProcessedAtUtc,
+            );
+        });
+      this.#eventHandlers.add(handler);
+      void handler.finally(() => {
+        this.#eventHandlers.delete(handler);
+        this.#drainEventQueue();
+      });
+    }
+  }
 }
 
 export function pumpPortalHealth(
@@ -478,6 +524,7 @@ export function pumpPortalHealth(
     "SOCKET_DISCONNECTED",
     "SOCKET_ERROR",
     "EVENT_BACKPRESSURE",
+    "EVENT_PERSIST_FAILED",
     "CONNECT_TIMEOUT",
     "HEARTBEAT_TIMEOUT",
   ]);

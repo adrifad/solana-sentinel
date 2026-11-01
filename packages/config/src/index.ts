@@ -40,6 +40,8 @@ export const AppConfigSchema = z
             enable_token_trades: z.literal(false),
             max_monitored_tokens: positiveInt,
             max_trade_events_per_day: positiveInt,
+            event_processing_concurrency: z.number().int().min(1).max(32),
+            max_pending_events: z.number().int().min(1).max(10000),
           })
           .strict(),
         dexscreener: z

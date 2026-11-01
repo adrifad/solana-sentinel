@@ -99,6 +99,9 @@ async function main(): Promise<void> {
     apiKey: loaded.pumpPortalApiKey,
     enableNewTokens: loaded.config.providers.pumpportal.enable_new_tokens,
     enableMigrations: loaded.config.providers.pumpportal.enable_migrations,
+    eventProcessingConcurrency:
+      loaded.config.providers.pumpportal.event_processing_concurrency,
+    maxPendingEvents: loaded.config.providers.pumpportal.max_pending_events,
     onHealth(
       state,
       reconnectCount,
@@ -116,6 +119,8 @@ async function main(): Promise<void> {
         lastProcessedAtUtc ?? null,
       );
       store.setProviderHealth(health);
+      if (state === "DEGRADED" && errorCode)
+        store.recordProviderIssue("pumpportal", errorCode);
       if (health.connectionState === "DISCONNECTED")
         store.recordStreamDisconnect(errorCode ?? "SOCKET_DISCONNECTED");
       if (state === "HEALTHY" && reconnectCount > 0)
@@ -126,14 +131,12 @@ async function main(): Promise<void> {
         errorCode,
       });
     },
-    async onEvent(event) {
+    persistEvent(event) {
       const outcome = store.ingestEvent(
         event,
         loaded.config.providers.pumpportal.max_monitored_tokens,
         Boolean(helius),
       );
-      if (outcome.inserted && outcome.monitoringEligible && helius)
-        enrichment?.wake();
       log(
         "info",
         outcome.inserted ? "token.event.persisted" : "token.event.duplicate",
@@ -145,6 +148,9 @@ async function main(): Promise<void> {
           ingestionLatencyMs: outcome.ingestionLatencyMs,
         },
       );
+    },
+    async onEvent() {
+      enrichment?.wake();
     },
   });
 

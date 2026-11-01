@@ -16,6 +16,95 @@ const created = JSON.parse(
 const migration = JSON.parse(
   await readFile("tests/fixtures/pumpportal-migration.synthetic.json", "utf8"),
 ) as unknown;
+const mainnetCapture = JSON.parse(
+  await readFile(
+    "tests/fixtures/pumpportal-created.mainnet.capture.json",
+    "utf8",
+  ),
+) as unknown;
+
+test("public PumpPortal launch capture agrees with its finalized mainnet transaction", () => {
+  const event = parsePumpPortalMessage(mainnetCapture, 1793500000000);
+  assert.equal(event.kind, "TOKEN_CREATED");
+  assert.equal(
+    event.txSignature,
+    "5TKad77QinBX7wpSJABiiH2w7FnSgseEHdjTzTHgT9bcYJAa9xrKyTTfVHifoXXqHZdy1wBfbFHmrVCebBBsfev2",
+  );
+  assert.equal(event.mint, "5XJ77H59Ws9SpEiMj2BjX7fFEcbbGzPowyJBi8ar7i62");
+  assert.equal(
+    event.launchInitiator,
+    "3QH76KPoo47vrwVWecWFYg6q2Pmg2dN4TG3ugDT23UHg",
+  );
+  assert.equal(event.slot, undefined); // The captured provider message omitted slot.
+});
+
+test("idempotency uses signature, then slot, then stable sanitized-payload identity", () => {
+  const captured = mainnetCapture as Record<string, unknown>;
+  const signatureIdentity = parsePumpPortalMessage(captured);
+  const changedMetadataWithSameSignature = parsePumpPortalMessage({
+    ...captured,
+    name: "Conflicting provider metadata",
+    slot: 1,
+  });
+  assert.equal(
+    signatureIdentity.idempotencyKey,
+    changedMetadataWithSameSignature.idempotencyKey,
+  );
+
+  const withoutSignature = { ...captured };
+  delete withoutSignature["signature"];
+  const slotIdentity = parsePumpPortalMessage({
+    ...withoutSignature,
+    slot: 100,
+  });
+  const changedMetadataAtSameSlot = parsePumpPortalMessage({
+    ...withoutSignature,
+    slot: 100,
+    name: "Conflicting name",
+  });
+  assert.equal(
+    slotIdentity.idempotencyKey,
+    changedMetadataAtSameSlot.idempotencyKey,
+  );
+
+  const withoutSlot = { ...withoutSignature };
+  delete withoutSlot["slot"];
+  const payloadIdentity = parsePumpPortalMessage(withoutSlot);
+  assert.equal(
+    payloadIdentity.idempotencyKey,
+    parsePumpPortalMessage(withoutSlot).idempotencyKey,
+  );
+  assert.notEqual(
+    payloadIdentity.idempotencyKey,
+    parsePumpPortalMessage({ ...withoutSlot, vSolInBondingCurve: 123 })
+      .idempotencyKey,
+  );
+});
+
+test("same-signature metadata contradictions are retained as audit conflicts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-event-conflict-"));
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  try {
+    const original = parsePumpPortalMessage({
+      ...(mainnetCapture as Record<string, unknown>),
+      slot: 265662712,
+      name: "Observed name",
+    });
+    const conflicting = parsePumpPortalMessage({
+      ...(mainnetCapture as Record<string, unknown>),
+      slot: 265662713,
+      name: "Different name",
+    });
+    assert.equal(store.ingestEvent(original, 10).inserted, true);
+    assert.equal(store.ingestEvent(conflicting, 10).inserted, false);
+    assert.equal(store.eventCount(), 1);
+    assert.equal(store.eventConflictCount(), 1);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("normalizes launch and migration fixtures with deterministic UTC identity", () => {
   const first = parsePumpPortalMessage(created, 1793500000000);

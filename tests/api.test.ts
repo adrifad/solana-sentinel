@@ -24,6 +24,14 @@ test("read-only API serves health and token list, rejects writes and unknown pat
     assert.equal(health.status, 200);
     assert.equal(((await health.json()) as { mode: string }).mode, "DRY_RUN");
     assert.equal((await fetch(`${baseUrl}/api/tokens`)).status, 200);
+    const completenessResponse = await fetch(`${baseUrl}/api/completeness`);
+    assert.equal(completenessResponse.status, 200);
+    const completeness = (await completenessResponse.json()) as {
+      historyComplete: boolean;
+      coverageStatus: string;
+    };
+    assert.equal(completeness.historyComplete, false);
+    assert.equal(completeness.coverageStatus, "UNKNOWN");
     assert.equal((await fetch(`${baseUrl}/ready`)).status, 503);
     store.setProviderHealth({
       provider: "pumpportal",
