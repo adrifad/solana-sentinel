@@ -14,17 +14,17 @@
 
 **Files:** `packages/providers/src/pumpportal.ts`, `tests/hardening.test.ts`
 
-- [ ] Bind queued events and callback status updates to the socket session that received them.
-- [ ] Reject healthy transitions from a closed or superseded session.
-- [ ] Add promise-based socket-open synchronization and preserve persisted-overflow/gap assertions.
-- [ ] Run hardening tests repeatedly and the full suite.
+- [x] Bind queued events and callback status updates to the socket session that received them.
+- [x] Reject healthy transitions from a closed or superseded session.
+- [x] Add promise-based socket-open synchronization and preserve persisted-overflow/gap assertions.
+- [x] Run hardening tests repeatedly and the full suite.
 
 ### Task 2: Validate trade contract and subscription lifecycle
 
 **Files:** `packages/providers/src/pumpportal.ts`, `packages/config/src/index.ts`, `config/default.yaml`, `packages/storage/migrations/007-*`, `packages/storage/src/index.ts`, worker analysis, tests and provider docs.
 
-- [ ] Establish whether an actual sanitized trade capture and provider credentials exist.
-- [ ] If available, decode only the captured schema; otherwise keep live subscription disabled and document the exact blocker.
+- [x] Establish whether an actual sanitized trade capture and provider credentials exist; neither is available here.
+- [x] Keep live subscription disabled and document the missing payload-contract blocker.
 - [ ] Preserve single socket, bounded subscription count, active duration, daily event budget, unsubscribe and reconnect state.
 - [ ] Persist only validated normalized trade observations and recompute launch behavior as-of decision time.
 
@@ -42,5 +42,5 @@
 **Files:** worker analysis, strategy/storage tests, README and `docs/IMPLEMENTATION-STATUS.md` / roadmap.
 
 - [ ] Connect only complete behavior and fresh buy/sell evidence to DRY_RUN risk decisions.
-- [ ] Run install, typecheck, tests, lint, format, docs, and fresh migration checks.
-- [ ] Push the fix and verify the resulting GitHub Actions run; report remaining blockers without overstating integration evidence.
+- [x] Run install, typecheck, tests, lint, format, docs, and fresh migration checks.
+- [x] Push the fix and verify GitHub Actions run 41281546428; remaining provider and quote work is not complete.
