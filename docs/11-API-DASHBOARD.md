@@ -21,9 +21,16 @@ GET    /ready
 GET    /api/tokens?limit=50
 GET    /api/tokens/:mint
 GET    /api/creators/:pubkey
+GET    /api/paper/status
+POST   /api/paper/entry
+POST   /api/paper/exit
 ```
 
-The implemented API is read-only: token detail includes role evidence, latest security report, decisions, analysis job outcomes, and migration transaction-recovery status; health includes provider health, completeness, separate provider/analysis/trade/PAPER readiness, and recent sanitized provider-frame diagnostics. `/api/metrics/latency` reports persisted analysis-stage p50 and sample count, with p95 after 20 samples and p99 after 100. Creator detail includes reputation, historical launches, and wallet-link evidence. Portfolio, orders, config mutation, authentication, and push event streaming remain unimplemented. No endpoint can change mode or arm trading.
+`GET /api/paper/status` is available only in PAPER mode and reports virtual balances, positions and fresh marks, realized PnL, fills, manual request lifecycle, and readiness blockers. The two manual POST routes only enqueue durable requests; the worker owns eligibility, quote-at-arrival, and virtual settlement. Both require a bearer token from `PAPER_OPERATOR_TOKEN`, a unique `Idempotency-Key`, strict JSON bodies, and are rate limited. Missing operator token fails closed. Entry requests are bounded by configured `risk.max_trade_sol`; all other financial limits remain enforced by the worker and atomic ledger.
+
+Manual entry has one narrow coverage exception: the current risk decision must be quarantined only for `LAUNCH_BEHAVIOR_INCOMPLETE`, and verified observations must independently satisfy the existing buyer and suspicious-activity policy. Security, creator history, holder coverage, current quotes, exit route, exposure, wallet, drawdown, daily loss, and entry-pause checks are not bypassed. The request audit retains coverage state/reason and the exception; the original risk decision remains unchanged. Manual SELL resolves a stable position ID against the configured PAPER wallet and remains available during entry pause when the fresh exit quote and held balance validate.
+
+The API binds to loopback by default and Compose publishes `127.0.0.1:8787`. Do not expose the manual write routes publicly without authenticated TLS. No route can select LIVE mode, sign, or submit a transaction. Token detail includes role evidence, security reports, decisions, analysis jobs, and migration recovery; health includes provider health, completeness, readiness, and sanitized provider diagnostics. `/api/metrics/latency` reports persisted analysis-stage percentiles when sample counts permit. Creator detail includes reputation, historical launches, and wallet-link evidence. Config mutation and push event streaming remain unimplemented.
 
 ## Security / UX rules
 

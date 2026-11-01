@@ -16,7 +16,7 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 - `APP_MODE=DRY_RUN|PAPER` — only startup; restart after any mode change. `LIVE` is unsupported.
 - `LIVE_TRADING_ENABLED=false` — must be true at process startup for an independently approved live deployment, in addition to other checks.
 - `LIVE_SIGNER_ENDPOINT` — allowed only inside separately deployed live executor; omit from scanner/paper worker.
-- `HELIUS_API_KEY`, `PUMPPORTAL_API_KEY`, `JUPITER_API_KEY` — secrets, redacted.
+- `HELIUS_API_KEY`, `PUMPPORTAL_API_KEY`, `JUPITER_API_KEY`, `PAPER_OPERATOR_TOKEN` — secrets, redacted. `PAPER_OPERATOR_TOKEN` must have at least 32 characters and is required by manual PAPER write routes.
 - `APP_CONFIG_PATH=config/default.yaml`, `DB_PATH=./data/sentinel.db`.
 
 ## Config domains
@@ -55,6 +55,6 @@ APP_MODE=DRY_RUN pnpm dev:worker
 # APP_MODE=PAPER selects only the virtual settlement runtime; LIVE is rejected.
 ```
 
-`paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to false. PAPER mode does not imply automatic entries, and the API is read-only and cannot arm or change execution mode.
+`paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to false. PAPER mode does not imply automatic entries. Authenticated manual requests may enqueue virtual orders; the worker still validates every risk and evidence gate. Compose applies the same `APP_MODE` to API and worker, defaulting to `DRY_RUN`, and publishes the API on loopback.
 
 ---

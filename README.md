@@ -9,11 +9,11 @@
 
 ## Modes
 
-| Mode      | Mainnet market data | Virtual order fills               | Real signing/sending                                      |
-| --------- | ------------------- | --------------------------------- | --------------------------------------------------------- |
-| `DRY_RUN` | Yes                 | No                                | Never                                                     |
-| `PAPER`   | Yes                 | Yes, with conservative fill model | Never                                                     |
-| `LIVE`    | Yes                 | No                                | Only from isolated signer process after explicit approval |
+| Mode      | Mainnet market data | Virtual order fills               | Real signing/sending |
+| --------- | ------------------- | --------------------------------- | -------------------- |
+| `DRY_RUN` | Yes                 | No                                | Never                |
+| `PAPER`   | Yes                 | Yes, with conservative fill model | Never                |
+| `LIVE`    | Unsupported         | No                                | Not implemented      |
 
 `REPLAY` is a **data source** for repeatable historical tests, not a live trading mode. Do not describe offline replay as realtime paper trading.
 
@@ -47,7 +47,7 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Default automatic entries and Helius trade observation are disabled. Optional Pump and PumpSwap `logsSubscribe` decoders validate event structure against pinned SDK IDLs and correlate finalized transactions, but automated coverage is synthetic; the bounded live validation attempt was blocked by `PROVIDER_UNAVAILABLE`. No stream window is upgraded to `COMPLETE`, so the PAPER entry gate remains closed. PAPER has no signer or transaction submission path; LIVE, the dashboard, and profitability claims remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) and the [Sprint 3.2 validation report](SPRINT32_VALIDATION_REPORT.md) for current evidence and gates.
+The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Operators can enqueue authenticated manual PAPER BUY/SELL requests; the worker revalidates evidence and settles only virtual balances. Automatic entries and Helius trade observation remain disabled by default. Optional Pump and PumpSwap `logsSubscribe` decoders are fixture tested, but the bounded live validation attempt was blocked by `PROVIDER_UNAVAILABLE`; no stream window is upgraded to `COMPLETE`, so automatic entries remain blocked. Manual entry may accept unverified stream coverage only under its narrow, evidence-backed rule; it cannot bypass other safety checks. PAPER has no signer or transaction submission path; LIVE, the dashboard, and profitability claims remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) and the [Sprint 3.2 validation report](SPRINT32_VALIDATION_REPORT.md) for current evidence and gates.
 
 ## Local implementation commands
 
@@ -65,7 +65,7 @@ pnpm typecheck
 pnpm lint
 ```
 
-Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables on-chain creator history, security analysis, and read-only quotes. `APP_MODE=PAPER` starts the virtual PAPER runtime; `LIVE` is rejected. `paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to `false`. Enabling the stream does not establish complete coverage or enable paid PumpPortal feeds. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
+Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables on-chain creator history, security analysis, and read-only quotes. `APP_MODE=PAPER` starts the virtual PAPER runtime; `LIVE` is rejected. `PAPER_OPERATOR_TOKEN` (minimum 32 characters) is required for manual entry/exit API writes. Compose passes the same `APP_MODE` to API and worker, defaults it to `DRY_RUN`, and publishes the API on loopback. `paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to `false`. Enabling the stream does not establish complete coverage or enable paid PumpPortal feeds. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
 
 ## Non-negotiable invariants
 
@@ -74,7 +74,7 @@ Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_
 3. Not enough liquidity for exit => never pretend to have sold in paper mode.
 4. Historical decisions can only use data known by their decision timestamp/slot.
 5. Every decision saves snapshot references, reason codes, config/version, timestamps, provider provenance.
-6. `LIVE` must be an isolated deployment, separately authorized and protected by hard limits.
+6. `LIVE` is unsupported and rejected by runtime configuration.
 7. Dashboard can change safe settings, but **cannot arm live trading**.
 
 ## Definition of MVP

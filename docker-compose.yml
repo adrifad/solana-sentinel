@@ -6,7 +6,7 @@ services:
     environment:
       APP_CONFIG_PATH: config/default.yaml
       DB_PATH: /app/data/sentinel.db
-      APP_MODE: DRY_RUN
+      APP_MODE: ${APP_MODE:-DRY_RUN}
     volumes:
       - sentinel-data:/app/data
     read_only: true
@@ -21,6 +21,7 @@ services:
     environment:
       APP_CONFIG_PATH: config/default.yaml
       DB_PATH: /app/data/sentinel.db
+      APP_MODE: ${APP_MODE:-DRY_RUN}
       API_HOST: 0.0.0.0
       API_PORT: 8787
     volumes:

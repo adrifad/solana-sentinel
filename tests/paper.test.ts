@@ -176,7 +176,7 @@ test("paper buy uses a quote after arrival, applies costs, and deduplicates fill
     assert.equal(result.fill?.["venueFeeRaw"], "10000");
     assert.equal(quoteProvider.calls[0]?.at, "2026-11-01T00:00:00.250Z");
     const state = store.getPaperPortfolioState("paper-wallet");
-    assert.equal(store.listAppliedMigrations().at(-1)?.version, 10);
+    assert.equal(store.listAppliedMigrations().at(-1)?.version, 11);
     assert.equal(state.solBalanceRaw, "999990000");
     assert.equal(state.positions[0]?.tokenAmountRaw, "99500");
     const quoteCount = quoteProvider.calls.length;
@@ -617,7 +617,7 @@ test("drawdown and daily realized loss gate new buys while exit policy uses curr
   await withStore(async (store) => {
     const clock = new TestClock();
     const quotes = new TestQuotes();
-    quotes.sellOutput = 1n;
+    quotes.sellOutput = 10_001n;
     const engine = new PaperTradingEngine({
       repository: store,
       quotes,

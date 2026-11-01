@@ -37,6 +37,28 @@ type SqlRow = Record<
 type JobChainTimeStatus =
   "UNKNOWN" | "RESOLVED" | "UNAVAILABLE" | "PROVIDER_ERROR";
 
+export type ManualPaperRequest = {
+  id: string;
+  idempotencyKey: string;
+  requestType: "ENTRY" | "EXIT";
+  walletId: string;
+  mint: string;
+  positionId: string | null;
+  requestedAmountRaw: string;
+  requestedSizeSol: string | null;
+  entrySource: "MANUAL";
+  status: "PENDING" | "PROCESSING" | "FILLED" | "REJECTED" | "UNFILLABLE";
+  reasonCode: string | null;
+  originalCoverageStatus: string | null;
+  coverageExceptionReason: string | null;
+  evidence: Record<string, unknown>;
+  executionOrderId: string | null;
+  attempts: number;
+  createdAtUtc: string;
+  updatedAtUtc: string;
+  completedAtUtc: string | null;
+};
+
 export type StoredToken = {
   mint: string;
   firstSeenAtUtc: string;
@@ -98,6 +120,7 @@ export class SentinelStore {
       "008-runtime-hardening.sql",
       "009-paper-runtime.sql",
       "010-trade-evidence.sql",
+      "011-manual-paper-requests.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -1755,7 +1778,12 @@ export class SentinelStore {
     walletId: string,
     initialSolLamports: string,
     createdAtUtc: string,
-  ): { walletId: string; initialSolLamports: string; createdAtUtc: string } {
+  ): {
+    walletId: string;
+    initialSolLamports: string;
+    createdAtUtc: string;
+    configuredInitialBalanceMatches: boolean;
+  } {
     if (!/^\d+$/.test(initialSolLamports) || BigInt(initialSolLamports) <= 0n)
       throw new Error("PAPER_INITIAL_BALANCE_INVALID");
     this.#db.exec("BEGIN IMMEDIATE");
@@ -1769,6 +1797,8 @@ export class SentinelStore {
           walletId,
           initialSolLamports: String(prior["initial_sol_lamports"]),
           createdAtUtc: String(prior["created_at_utc"]),
+          configuredInitialBalanceMatches:
+            String(prior["initial_sol_lamports"]) === initialSolLamports,
         };
       }
       this.#db
@@ -1794,11 +1824,32 @@ export class SentinelStore {
         createdAtUtc,
       });
       this.#db.exec("COMMIT");
-      return { walletId, initialSolLamports, createdAtUtc };
+      return {
+        walletId,
+        initialSolLamports,
+        createdAtUtc,
+        configuredInitialBalanceMatches: true,
+      };
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  getPaperAccountInitialization(
+    walletId: string,
+  ): { initialSolLamports: string; createdAtUtc: string } | null {
+    const row = this.#db
+      .prepare(
+        "SELECT initial_sol_lamports, created_at_utc FROM paper_accounts WHERE wallet_id = ?",
+      )
+      .get(walletId) as SqlRow | undefined;
+    return row
+      ? {
+          initialSolLamports: String(row["initial_sol_lamports"]),
+          createdAtUtc: String(row["created_at_utc"]),
+        }
+      : null;
   }
 
   createPaperOrder(intentInput: PaperOrderIntent): {
@@ -1812,13 +1863,14 @@ export class SentinelStore {
       "PENDING" | "SIMULATED_FILLED" | "REJECTED" | "UNFILLABLE" | "EXPIRED";
     reasonCode: string | null;
     createdAtUtc: string;
+    entrySource: "AUTOMATIC" | "MANUAL";
   } {
     const intent = PaperOrderIntentSchema.parse(intentInput);
     this.#db
       .prepare(
         `INSERT OR IGNORE INTO paper_orders
-         (id, wallet_id, idempotency_key, mint, side, input_amount_raw, intent_json, status, created_at_utc)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)`,
+         (id, wallet_id, idempotency_key, mint, side, input_amount_raw, intent_json, status, created_at_utc, entry_source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`,
       )
       .run(
         intent.id,
@@ -1829,6 +1881,7 @@ export class SentinelStore {
         intent.exactInputAmountRaw,
         JSON.stringify(intent),
         intent.createdAtUtc,
+        intent.entrySource ?? "AUTOMATIC",
       );
     const row = this.#db
       .prepare("SELECT * FROM paper_orders WHERE idempotency_key = ?")
@@ -1845,16 +1898,190 @@ export class SentinelStore {
     return row ? mapPaperOrder(row) : null;
   }
 
-  listPendingPaperOrderIntents(limit = 100): PaperOrderIntent[] {
+  listPendingPaperOrderIntents(
+    limit = 100,
+    excludeManual = false,
+  ): PaperOrderIntent[] {
     const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
     const rows = this.#db
       .prepare(
-        "SELECT intent_json FROM paper_orders WHERE status = 'PENDING' ORDER BY created_at_utc, id LIMIT ?",
+        "SELECT intent_json FROM paper_orders WHERE status = 'PENDING' AND (? = 0 OR entry_source != 'MANUAL') ORDER BY created_at_utc, id LIMIT ?",
       )
-      .all(safeLimit) as SqlRow[];
+      .all(excludeManual ? 1 : 0, safeLimit) as SqlRow[];
     return rows.map((row) =>
       PaperOrderIntentSchema.parse(JSON.parse(String(row["intent_json"]))),
     );
+  }
+
+  createManualPaperRequest(input: {
+    id: string;
+    idempotencyKey: string;
+    requestType: "ENTRY" | "EXIT";
+    walletId: string;
+    mint: string;
+    positionId?: string | null;
+    requestedAmountRaw: string;
+    requestedSizeSol?: string | null;
+    originalCoverageStatus?: string | null;
+    coverageExceptionReason?: string | null;
+    evidence?: Record<string, unknown>;
+    createdAtUtc: string;
+  }): ManualPaperRequest {
+    if (
+      !/^\d+$/.test(input.requestedAmountRaw) ||
+      BigInt(input.requestedAmountRaw) <= 0n
+    )
+      throw new Error("MANUAL_PAPER_AMOUNT_INVALID");
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO manual_paper_requests
+        (id, idempotency_key, request_type, wallet_id, mint, position_id,
+         requested_amount_raw, requested_size_sol, status, original_coverage_status,
+         coverage_exception_reason, evidence_json, created_at_utc, updated_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.idempotencyKey,
+        input.requestType,
+        input.walletId,
+        input.mint,
+        input.positionId ?? null,
+        input.requestedAmountRaw,
+        input.requestedSizeSol ?? null,
+        input.originalCoverageStatus ?? null,
+        input.coverageExceptionReason ?? null,
+        JSON.stringify(input.evidence ?? {}),
+        input.createdAtUtc,
+        input.createdAtUtc,
+      );
+    const row = this.#db
+      .prepare("SELECT * FROM manual_paper_requests WHERE idempotency_key = ?")
+      .get(input.idempotencyKey) as SqlRow | undefined;
+    if (!row) throw new Error("MANUAL_PAPER_REQUEST_CONFLICT");
+    const request = mapManualPaperRequest(row);
+    if (
+      request.requestType !== input.requestType ||
+      request.walletId !== input.walletId ||
+      request.mint !== input.mint ||
+      request.positionId !== (input.positionId ?? null) ||
+      request.requestedAmountRaw !== input.requestedAmountRaw
+    )
+      throw new Error("MANUAL_PAPER_IDEMPOTENCY_CONFLICT");
+    return request;
+  }
+
+  getManualPaperRequest(id: string): ManualPaperRequest | null {
+    const row = this.#db
+      .prepare("SELECT * FROM manual_paper_requests WHERE id = ?")
+      .get(id) as SqlRow | undefined;
+    return row ? mapManualPaperRequest(row) : null;
+  }
+
+  getManualPaperRequestByIdempotencyKey(
+    key: string,
+  ): ManualPaperRequest | null {
+    const row = this.#db
+      .prepare("SELECT * FROM manual_paper_requests WHERE idempotency_key = ?")
+      .get(key) as SqlRow | undefined;
+    return row ? mapManualPaperRequest(row) : null;
+  }
+
+  listManualPaperRequests(walletId: string, limit = 50): ManualPaperRequest[] {
+    const rows = this.#db
+      .prepare(
+        "SELECT * FROM manual_paper_requests WHERE wallet_id = ? ORDER BY created_at_utc DESC LIMIT ?",
+      )
+      .all(walletId, Math.max(1, Math.min(200, Math.trunc(limit)))) as SqlRow[];
+    return rows.map(mapManualPaperRequest);
+  }
+
+  claimManualPaperRequest(
+    walletId: string,
+    nowUtc: string,
+  ): ManualPaperRequest | null {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db
+        .prepare(
+          `SELECT * FROM manual_paper_requests WHERE wallet_id = ? AND status = 'PENDING'
+           AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= ?)
+           ORDER BY created_at_utc, id LIMIT 1`,
+        )
+        .get(walletId, nowUtc) as SqlRow | undefined;
+      if (!row) {
+        this.#db.exec("COMMIT");
+        return null;
+      }
+      this.#db
+        .prepare(
+          `UPDATE manual_paper_requests SET status = 'PROCESSING', attempts = attempts + 1,
+           claimed_at_utc = ?, updated_at_utc = ? WHERE id = ? AND status = 'PENDING'`,
+        )
+        .run(nowUtc, nowUtc, String(row["id"]));
+      const claimed = this.#db
+        .prepare("SELECT * FROM manual_paper_requests WHERE id = ?")
+        .get(String(row["id"])) as SqlRow;
+      this.#db.exec("COMMIT");
+      return mapManualPaperRequest(claimed);
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishManualPaperRequest(input: {
+    id: string;
+    status: "PENDING" | "FILLED" | "REJECTED" | "UNFILLABLE";
+    reasonCode: string | null;
+    executionOrderId?: string | null;
+    evidence?: Record<string, unknown>;
+    coverageExceptionReason?: string | null;
+    nextAttemptAtUtc?: string | null;
+    completedAtUtc?: string | null;
+    resetExecutionOrder?: boolean;
+  }): void {
+    this.#db
+      .prepare(
+        `UPDATE manual_paper_requests SET status = ?, reason_code = ?,
+         execution_order_id = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(?, execution_order_id) END,
+         coverage_exception_reason = COALESCE(?, coverage_exception_reason),
+         evidence_json = CASE WHEN ? IS NULL THEN evidence_json ELSE ? END,
+         next_attempt_at_utc = ?, updated_at_utc = ?, completed_at_utc = ?
+         WHERE id = ? AND status = 'PROCESSING'`,
+      )
+      .run(
+        input.status,
+        input.reasonCode,
+        input.resetExecutionOrder ? 1 : 0,
+        input.executionOrderId ?? null,
+        input.coverageExceptionReason ?? null,
+        input.evidence === undefined ? null : JSON.stringify(input.evidence),
+        input.evidence === undefined ? null : JSON.stringify(input.evidence),
+        input.nextAttemptAtUtc ?? null,
+        input.completedAtUtc ?? utcNow(),
+        input.completedAtUtc ?? null,
+        input.id,
+      );
+  }
+
+  setManualPaperExecutionOrder(id: string, orderId: string): void {
+    this.#db
+      .prepare(
+        `UPDATE manual_paper_requests SET execution_order_id = ?, updated_at_utc = ?
+       WHERE id = ? AND status = 'PROCESSING'`,
+      )
+      .run(orderId, utcNow(), id);
+  }
+
+  recoverInterruptedManualPaperRequests(nowUtc: string): number {
+    const result = this.#db
+      .prepare(
+        `UPDATE manual_paper_requests SET status = 'PENDING', updated_at_utc = ?,
+         next_attempt_at_utc = NULL WHERE status = 'PROCESSING'`,
+      )
+      .run(nowUtc);
+    return Number(result.changes);
   }
 
   rejectPaperOrder(
@@ -2187,6 +2414,13 @@ export class SentinelStore {
       tokenAmountRaw: string;
       costBasisLamports: string;
       openedAtUtc: string;
+      latestMark: {
+        markedAtUtc: string;
+        sellQuoteId: string;
+        sellValueLamports: string;
+        unrealizedPnlLamports: string;
+        snapshotSlot: number;
+      } | null;
     }>;
     realizedPnl: Array<{ pnlLamports: string; filledAtUtc: string }>;
     latestMark: {
@@ -2219,6 +2453,10 @@ export class SentinelStore {
         tokenAmountRaw: String(row["token_amount_raw"]),
         costBasisLamports: String(row["cost_basis_lamports"]),
         openedAtUtc: String(row["opened_at_utc"]),
+        latestMark: this.getLatestPaperPositionMark(
+          walletId,
+          String(row["mint"]),
+        ),
       })),
       realizedPnl: realizedPnl.map((row) => ({
         pnlLamports: String(row["pnl_lamports"]),
@@ -2234,6 +2472,79 @@ export class SentinelStore {
           }
         : null,
     };
+  }
+
+  recordPaperPositionMark(input: {
+    walletId: string;
+    mint: string;
+    markedAtUtc: string;
+    sellQuoteId: string;
+    sellValueLamports: string;
+    unrealizedPnlLamports: string;
+    snapshotSlot: number;
+  }): void {
+    if (
+      !/^\d+$/.test(input.sellValueLamports) ||
+      !Number.isSafeInteger(input.snapshotSlot) ||
+      input.snapshotSlot < 0
+    )
+      throw new Error("PAPER_POSITION_MARK_INVALID");
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO paper_position_marks
+       (wallet_id, mint, marked_at_utc, sell_quote_id, sell_value_lamports, unrealized_pnl_lamports, snapshot_slot)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.walletId,
+        input.mint,
+        input.markedAtUtc,
+        input.sellQuoteId,
+        input.sellValueLamports,
+        input.unrealizedPnlLamports,
+        input.snapshotSlot,
+      );
+  }
+
+  getLatestPaperPositionMark(
+    walletId: string,
+    mint: string,
+  ): {
+    markedAtUtc: string;
+    sellQuoteId: string;
+    sellValueLamports: string;
+    unrealizedPnlLamports: string;
+    snapshotSlot: number;
+  } | null {
+    const row = this.#db
+      .prepare(
+        `SELECT * FROM paper_position_marks WHERE wallet_id = ? AND mint = ? ORDER BY marked_at_utc DESC LIMIT 1`,
+      )
+      .get(walletId, mint) as SqlRow | undefined;
+    return row
+      ? {
+          markedAtUtc: String(row["marked_at_utc"]),
+          sellQuoteId: String(row["sell_quote_id"]),
+          sellValueLamports: String(row["sell_value_lamports"]),
+          unrealizedPnlLamports: String(row["unrealized_pnl_lamports"]),
+          snapshotSlot: Number(row["snapshot_slot"]),
+        }
+      : null;
+  }
+
+  listPaperFills(
+    walletId: string,
+    limit = 50,
+  ): Array<Record<string, string | number>> {
+    const rows = this.#db
+      .prepare(
+        `SELECT order_id FROM paper_fills WHERE wallet_id = ? ORDER BY filled_at_utc DESC LIMIT ?`,
+      )
+      .all(walletId, Math.max(1, Math.min(200, Math.trunc(limit)))) as SqlRow[];
+    return rows.flatMap((row) => {
+      const fill = this.getPaperFill(String(row["order_id"]));
+      return fill ? [fill] : [];
+    });
   }
 
   getPaperPositionMonitorState(
@@ -2371,7 +2682,9 @@ export class SentinelStore {
 
   getPaperFill(orderId: string): Record<string, string | number> | null {
     const row = this.#db
-      .prepare("SELECT * FROM paper_fills WHERE order_id = ?")
+      .prepare(
+        "SELECT f.*, o.entry_source FROM paper_fills f JOIN paper_orders o ON o.id = f.order_id WHERE f.order_id = ?",
+      )
       .get(orderId) as SqlRow | undefined;
     if (!row) return null;
     return {
@@ -2390,6 +2703,7 @@ export class SentinelStore {
       snapshotAtUtc: String(row["snapshot_at_utc"]),
       arrivalAtUtc: String(row["arrival_at_utc"]),
       filledAtUtc: String(row["filled_at_utc"]),
+      entrySource: String(row["entry_source"] ?? "AUTOMATIC"),
     };
   }
 
@@ -2825,6 +3139,48 @@ function mapPaperOrder(row: SqlRow) {
       "PENDING" | "SIMULATED_FILLED" | "REJECTED" | "UNFILLABLE" | "EXPIRED",
     reasonCode: row["reason_code"] === null ? null : String(row["reason_code"]),
     createdAtUtc: String(row["created_at_utc"]),
+    entrySource: String(row["entry_source"] ?? "AUTOMATIC") as
+      "AUTOMATIC" | "MANUAL",
+  };
+}
+
+function mapManualPaperRequest(row: SqlRow): ManualPaperRequest {
+  return {
+    id: String(row["id"]),
+    idempotencyKey: String(row["idempotency_key"]),
+    requestType: String(row["request_type"]) as "ENTRY" | "EXIT",
+    walletId: String(row["wallet_id"]),
+    mint: String(row["mint"]),
+    positionId: row["position_id"] === null ? null : String(row["position_id"]),
+    requestedAmountRaw: String(row["requested_amount_raw"]),
+    requestedSizeSol:
+      row["requested_size_sol"] === null
+        ? null
+        : String(row["requested_size_sol"]),
+    entrySource: "MANUAL",
+    status: String(row["status"]) as ManualPaperRequest["status"],
+    reasonCode: row["reason_code"] === null ? null : String(row["reason_code"]),
+    originalCoverageStatus:
+      row["original_coverage_status"] === null
+        ? null
+        : String(row["original_coverage_status"]),
+    coverageExceptionReason:
+      row["coverage_exception_reason"] === null
+        ? null
+        : String(row["coverage_exception_reason"]),
+    evidence: JSON.parse(String(row["evidence_json"])) as Record<
+      string,
+      unknown
+    >,
+    executionOrderId:
+      row["execution_order_id"] === null
+        ? null
+        : String(row["execution_order_id"]),
+    attempts: Number(row["attempts"]),
+    createdAtUtc: String(row["created_at_utc"]),
+    updatedAtUtc: String(row["updated_at_utc"]),
+    completedAtUtc:
+      row["completed_at_utc"] === null ? null : String(row["completed_at_utc"]),
   };
 }
 

@@ -7,6 +7,7 @@
   "dependencies": {
     "@sentinel/config": "workspace:*",
     "@sentinel/domain": "workspace:*",
-    "@sentinel/storage": "workspace:*"
+    "@sentinel/storage": "workspace:*",
+    "zod": "^4.1.12"
   }
 }

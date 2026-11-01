@@ -8,7 +8,6 @@ import type { QuoteResult } from "@sentinel/domain";
 import {
   PaperTradingEngine,
   paperExecutionConfigFromAppConfig,
-  paperInitialBalanceLamports,
 } from "@sentinel/paper";
 import { SentinelStore } from "@sentinel/storage";
 import { PaperRuntime } from "../apps/worker/src/paper-runtime.ts";
@@ -27,7 +26,7 @@ test("PAPER runtime initializes and recovers only virtual wallet state without q
   try {
     await firstRuntime.start();
     const state = firstStore.getPaperPortfolioState(config.paper.wallet_id);
-    assert.equal(state.solBalanceRaw, "10000000000000000000");
+    assert.equal(state.solBalanceRaw, "10000000000");
     assert.equal(firstRuntime.readiness().automaticEntriesEnabled, false);
     assert.equal(firstRuntime.readiness().openPositions, 0);
     await firstRuntime.stop();
@@ -48,7 +47,7 @@ test("PAPER runtime initializes and recovers only virtual wallet state without q
     assert.equal(
       restartedStore.getPaperPortfolioState(config.paper.wallet_id)
         .solBalanceRaw,
-      "10000000000000000000",
+      "10000000000",
     );
     assert.equal(
       restartedStore.listPaperLedgerEntries(config.paper.wallet_id).length,
@@ -116,7 +115,7 @@ test("PAPER runtime monitors a fixture-backed position and settles a virtual tak
     quotes: provider,
     config: paperExecutionConfigFromAppConfig(config),
   });
-  seeder.initializeWallet(walletId, paperInitialBalanceLamports(config));
+  seeder.initializeWallet(walletId, config.paper.initial_sol);
   const createdAtUtc = new Date().toISOString();
   const buy = await seeder.execute({
     id: "synthetic-runtime-entry",

@@ -12,6 +12,12 @@ const server = createApiServer({
   tradeStreamEnabled: config.config.providers.helius.enable_trade_stream,
   automaticEntriesEnabled: config.config.paper.automatic_entries_enabled,
   paperWalletId: config.config.paper.wallet_id,
+  ...(config.paperOperatorToken
+    ? { operatorToken: config.paperOperatorToken }
+    : {}),
+  maxTradeSol: config.config.risk.max_trade_sol,
+  maxQuoteAgeMs: config.config.paper.max_quote_age_ms,
+  initialSol: config.config.paper.initial_sol,
 });
 server.listen(config.apiPort, config.apiHost, () => {
   process.stdout.write(

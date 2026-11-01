@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { parse } from "yaml";
 
-test("compose defines an isolated read-only DRY_RUN stack with persistent storage", async () => {
+test("compose defaults both services to DRY_RUN, persists storage, and publishes the API on loopback", async () => {
   const compose = parse(await readFile("docker-compose.yml", "utf8")) as {
     services?: Record<
       string,
@@ -20,7 +20,11 @@ test("compose defines an isolated read-only DRY_RUN stack with persistent storag
   assert.ok(compose.services?.["api"]);
   assert.equal(
     compose.services?.["worker"].environment?.["APP_MODE"],
-    "DRY_RUN",
+    "${APP_MODE:-DRY_RUN}",
+  );
+  assert.equal(
+    compose.services?.["api"].environment?.["APP_MODE"],
+    "${APP_MODE:-DRY_RUN}",
   );
   assert.equal(compose.services?.["worker"].read_only, true);
   assert.equal(compose.services?.["api"].ports?.[0], "127.0.0.1:8787:8787");

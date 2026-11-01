@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { utcNow } from "@sentinel/domain";
+import { paperPositionId, utcNow } from "@sentinel/domain";
 import type { QuoteResult } from "@sentinel/domain";
 import type { AppConfig } from "@sentinel/config";
 import {
@@ -8,12 +8,13 @@ import {
   PaperTradingEngine,
   PumpVenuePaperQuoteProvider,
   paperExecutionConfigFromAppConfig,
-  paperInitialBalanceLamports,
   solToLamports,
 } from "@sentinel/paper";
 import type { PaperQuoteProvider } from "@sentinel/paper";
 import type { HeliusRpcClient } from "@sentinel/providers";
 import type { SentinelStore } from "@sentinel/storage";
+import type { ManualPaperRequest } from "@sentinel/storage";
+import { analyzeLaunchBehavior } from "@sentinel/intelligence";
 import { log } from "./logger.ts";
 
 /** Runtime adapter for virtual settlement only. This package has no signer or send path. */
@@ -27,8 +28,11 @@ export class PaperRuntime {
   readonly #exit = new PaperExitStrategy();
   readonly #risk = new PaperRiskManager();
   #timer: ReturnType<typeof setInterval> | undefined;
+  #manualTimer: ReturnType<typeof setInterval> | undefined;
   #busy = false;
+  #manualBusy = false;
   #stopping = false;
+  #initialBalanceMatches = true;
 
   constructor(input: {
     store: SentinelStore;
@@ -58,11 +62,20 @@ export class PaperRuntime {
   }
 
   async start(): Promise<void> {
-    this.#engine.initializeWallet(
+    const wallet = this.#engine.initializeWallet(
       this.#walletId,
-      paperInitialBalanceLamports(this.#config),
+      this.#config.paper.initial_sol,
     );
-    const recovered = await this.#engine.recoverPendingOrders();
+    this.#initialBalanceMatches = wallet.configuredInitialBalanceMatches;
+    if (!this.#initialBalanceMatches)
+      log("error", "paper.wallet.initial_balance_mismatch", {
+        walletId: this.#walletId,
+        configuredInitialSol: this.#config.paper.initial_sol,
+        persistedInitialLamports: wallet.initialSolLamports,
+        errorCode: "PAPER_INITIAL_BALANCE_CONFIG_MISMATCH",
+      });
+    this.#store.recoverInterruptedManualPaperRequests(utcNow());
+    const recovered = await this.#engine.recoverPendingOrders(100, true);
     this.#syncRecoveredOrders(recovered);
     log("info", "paper.orders.recovered", { count: recovered.length });
     const activePositions = new Set(
@@ -92,20 +105,28 @@ export class PaperRuntime {
       () => void this.tick(),
       this.#config.paper.position_monitor_interval_ms,
     );
+    this.#manualTimer = setInterval(
+      () => void this.#processManualRequest(),
+      250,
+    );
   }
 
   async stop(): Promise<void> {
     this.#stopping = true;
     if (this.#timer) clearInterval(this.#timer);
-    while (this.#busy) await new Promise((resolve) => setTimeout(resolve, 10));
+    if (this.#manualTimer) clearInterval(this.#manualTimer);
+    while (this.#busy || this.#manualBusy)
+      await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
   async tick(): Promise<void> {
     if (this.#busy || this.#stopping) return;
     this.#busy = true;
     try {
-      if (this.#store.listPendingPaperOrderIntents(1).length > 0)
-        this.#syncRecoveredOrders(await this.#engine.recoverPendingOrders());
+      if (this.#store.listPendingPaperOrderIntents(1, true).length > 0)
+        this.#syncRecoveredOrders(
+          await this.#engine.recoverPendingOrders(100, true),
+        );
       await this.#monitorPositions();
       if (this.#config.paper.automatic_entries_enabled)
         await this.#considerEntries();
@@ -130,6 +151,8 @@ export class PaperRuntime {
       : ["AUTOMATIC_ENTRIES_DISABLED"];
     if (portfolio.latestMark?.unpriceablePositions)
       blockers.push("PAPER_POSITION_UNPRICEABLE");
+    if (!this.#initialBalanceMatches)
+      blockers.push("PAPER_INITIAL_BALANCE_CONFIG_MISMATCH");
     return {
       automaticEntriesEnabled: this.#config.paper.automatic_entries_enabled,
       openPositions: portfolio.positions.length,
@@ -251,6 +274,7 @@ export class PaperRuntime {
   }
 
   async #considerEntries(): Promise<void> {
+    if (!this.#initialBalanceMatches) return;
     const portfolio = await this.#engine.refreshPortfolio(this.#walletId);
     const canEnter = this.#risk.canOpenRisk({
       report: portfolio,
@@ -323,6 +347,648 @@ export class PaperRuntime {
     }
   }
 
+  async #processManualRequest(): Promise<void> {
+    if (this.#manualBusy || this.#stopping) return;
+    this.#manualBusy = true;
+    let request: ManualPaperRequest | null = null;
+    try {
+      request = this.#store.claimManualPaperRequest(this.#walletId, utcNow());
+      if (!request) return;
+      if (!this.#initialBalanceMatches && request.requestType === "ENTRY") {
+        this.#finishManual(
+          request,
+          "REJECTED",
+          "PAPER_INITIAL_BALANCE_CONFIG_MISMATCH",
+        );
+        return;
+      }
+      const recoveredOrder = request.executionOrderId
+        ? this.#store.getPaperOrder(request.executionOrderId)
+        : null;
+      if (recoveredOrder && recoveredOrder.status !== "PENDING") {
+        const status =
+          recoveredOrder.status === "SIMULATED_FILLED"
+            ? "FILLED"
+            : recoveredOrder.status === "UNFILLABLE"
+              ? "UNFILLABLE"
+              : "REJECTED";
+        if (request.requestType === "EXIT" && status === "FILLED")
+          this.#saveMonitor(request.mint, "CLOSED", null, 0, null);
+        this.#finishManual(
+          request,
+          status,
+          recoveredOrder.reasonCode,
+          { recoveredOrderId: recoveredOrder.id },
+          recoveredOrder.id,
+        );
+        return;
+      }
+      if (request.requestType === "ENTRY") await this.#manualEntry(request);
+      else await this.#manualExit(request);
+    } catch (error) {
+      if (request) {
+        const currentRequest = this.#store.getManualPaperRequest(request.id);
+        const executionOrderId = currentRequest?.executionOrderId;
+        const order = executionOrderId
+          ? this.#store.getPaperOrder(executionOrderId)
+          : null;
+        if (order?.status === "PENDING")
+          this.#store.rejectPaperOrder(
+            order.id,
+            "REJECTED",
+            "MANUAL_REQUEST_PROCESSING_FAILED",
+            utcNow(),
+          );
+        this.#finishManual(
+          request,
+          "REJECTED",
+          error instanceof Error
+            ? safeReasonCode(error.message)
+            : "MANUAL_REQUEST_FAILED",
+        );
+      }
+      log("error", "paper.manual_request.failed", {
+        requestId: request?.id ?? null,
+        errorCode:
+          error instanceof Error
+            ? safeReasonCode(error.message)
+            : "UNKNOWN_ERROR",
+      });
+    } finally {
+      this.#manualBusy = false;
+    }
+  }
+
+  async #manualEntry(request: ManualPaperRequest): Promise<void> {
+    const eligibility = this.#manualEntryEligibility(request);
+    if (!eligibility.allowed) {
+      this.#finishManual(
+        request,
+        "REJECTED",
+        eligibility.reasonCode,
+        eligibility.evidence,
+      );
+      return;
+    }
+    const pair = { reasonCode: "EXIT_QUOTE_UNAVAILABLE" as string | null };
+    let transientQuoteError: string | null = null;
+    const quoteProvider: PaperQuoteProvider = {
+      quoteAtArrival: async (quoteRequest) => {
+        if (quoteRequest.side !== "BUY") {
+          try {
+            return await this.#quotes.quoteAtArrival(quoteRequest);
+          } catch (error) {
+            transientQuoteError = retryableQuoteError(error);
+            return null;
+          }
+        }
+        let buy: QuoteResult | null;
+        try {
+          buy = await this.#quotes.quoteAtArrival(quoteRequest);
+        } catch (error) {
+          transientQuoteError = retryableQuoteError(error);
+          return null;
+        }
+        if (
+          !this.#validManualQuote(
+            buy,
+            quoteRequest.mint,
+            "BUY",
+            quoteRequest.exactInputAmountRaw,
+            quoteRequest.requestedAtUtc,
+          )
+        ) {
+          pair.reasonCode = "BUY_QUOTE_UNAVAILABLE";
+          transientQuoteError = retryableQuoteError(buy);
+          return null;
+        }
+        const sellAmount = buy.expectedOutputAmountRaw;
+        if (!sellAmount || BigInt(sellAmount) <= 0n) return null;
+        let sell: QuoteResult | null;
+        try {
+          sell = await this.#quotes.quoteAtArrival({
+            mint: quoteRequest.mint,
+            side: "SELL",
+            exactInputAmountRaw: sellAmount,
+            requestedAtUtc: quoteRequest.requestedAtUtc,
+            maxAgeMs: quoteRequest.maxAgeMs,
+          });
+        } catch (error) {
+          transientQuoteError = retryableQuoteError(error);
+          return null;
+        }
+        if (
+          !this.#validManualQuote(
+            sell,
+            quoteRequest.mint,
+            "SELL",
+            sellAmount,
+            quoteRequest.requestedAtUtc,
+          ) ||
+          sell.venue !== buy.venue
+        ) {
+          pair.reasonCode = "EXIT_QUOTE_UNAVAILABLE";
+          transientQuoteError = retryableQuoteError(sell);
+          return null;
+        }
+        this.#store.saveQuoteResult(sell);
+        eligibility.evidence["sellQuoteId"] = sell.id;
+        eligibility.evidence["buyQuoteId"] = buy.id;
+        return buy;
+      },
+    };
+    const engine = new PaperTradingEngine({
+      repository: this.#store,
+      quotes: quoteProvider,
+      config: paperExecutionConfigFromAppConfig(this.#config),
+    });
+    const orderId = request.executionOrderId ?? manualOrderId(request);
+    this.#store.setManualPaperExecutionOrder(request.id, orderId);
+    const result = await engine.execute({
+      id: orderId,
+      idempotencyKey: `${orderId}`,
+      walletId: this.#walletId,
+      mode: "PAPER",
+      mint: request.mint,
+      side: "BUY",
+      exactInputAmountRaw: request.requestedAmountRaw,
+      decisionId: eligibility.evidence["decisionId"] as string,
+      reasonCodes: [
+        "MANUAL_ENTRY",
+        ...(eligibility.coverageExceptionReason
+          ? ["MANUAL_COVERAGE_EXCEPTION"]
+          : []),
+      ],
+      createdAtUtc: request.createdAtUtc,
+      signalQuoteId: null,
+      entrySource: "MANUAL",
+    });
+    if (result.order.status === "SIMULATED_FILLED") {
+      this.#finishManual(
+        request,
+        "FILLED",
+        null,
+        eligibility.evidence,
+        orderId,
+        eligibility.coverageExceptionReason,
+      );
+    } else {
+      const reason =
+        pair.reasonCode === "EXIT_QUOTE_UNAVAILABLE" &&
+        result.reasonCode === "PAPER_QUOTE_UNAVAILABLE"
+          ? "EXIT_QUOTE_UNAVAILABLE"
+          : (result.reasonCode ?? "MANUAL_ENTRY_NOT_FILLED");
+      if (transientQuoteError && request.attempts < 3) {
+        this.#retryManual(request, transientQuoteError, eligibility.evidence);
+      } else {
+        this.#finishManual(
+          request,
+          result.order.status === "UNFILLABLE" ? "UNFILLABLE" : "REJECTED",
+          transientQuoteError ?? reason,
+          eligibility.evidence,
+          orderId,
+          eligibility.coverageExceptionReason,
+        );
+      }
+    }
+  }
+
+  async #manualExit(request: ManualPaperRequest): Promise<void> {
+    if (request.positionId !== paperPositionId(this.#walletId, request.mint)) {
+      this.#finishManual(request, "REJECTED", "OPEN_POSITION_NOT_FOUND");
+      return;
+    }
+    const position = this.#store
+      .getPaperPortfolioState(this.#walletId)
+      .positions.find((item) => item.mint === request.mint);
+    if (!position || position.tokenAmountRaw !== request.requestedAmountRaw) {
+      this.#finishManual(request, "REJECTED", "POSITION_CHANGED_SINCE_REQUEST");
+      return;
+    }
+    const orderId = request.executionOrderId ?? manualOrderId(request);
+    this.#store.setManualPaperExecutionOrder(request.id, orderId);
+    let transientQuoteError: string | null = null;
+    const exitQuotes: PaperQuoteProvider = {
+      quoteAtArrival: async (quoteRequest) => {
+        try {
+          const quote = await this.#quotes.quoteAtArrival(quoteRequest);
+          if (!quote) transientQuoteError = null;
+          else if (quote.validationStatus !== "PASS")
+            transientQuoteError = retryableQuoteError(quote);
+          return quote;
+        } catch (error) {
+          transientQuoteError = retryableQuoteError(error);
+          return null;
+        }
+      },
+    };
+    const engine = new PaperTradingEngine({
+      repository: this.#store,
+      quotes: exitQuotes,
+      config: paperExecutionConfigFromAppConfig(this.#config),
+    });
+    const result = await engine.execute({
+      id: orderId,
+      idempotencyKey: `${orderId}`,
+      walletId: this.#walletId,
+      mode: "PAPER",
+      mint: request.mint,
+      side: "SELL",
+      exactInputAmountRaw: request.requestedAmountRaw,
+      decisionId: `manual-exit:${request.id}`,
+      reasonCodes: ["MANUAL_EXIT"],
+      createdAtUtc: request.createdAtUtc,
+      signalQuoteId: null,
+      entrySource: "MANUAL",
+    });
+    if (result.order.status === "SIMULATED_FILLED") {
+      this.#saveMonitor(request.mint, "CLOSED", null, 0, null);
+      this.#finishManual(
+        request,
+        "FILLED",
+        null,
+        { fill: result.fill },
+        orderId,
+      );
+    } else {
+      const status =
+        result.order.status === "UNFILLABLE" ? "UNFILLABLE" : "REJECTED";
+      if (transientQuoteError && request.attempts < 3)
+        this.#retryManual(request, transientQuoteError, { fill: null });
+      else
+        this.#finishManual(
+          request,
+          status,
+          transientQuoteError ?? result.reasonCode ?? "PAPER_EXIT_NOT_FILLED",
+          { fill: null },
+          orderId,
+        );
+    }
+  }
+
+  #manualEntryEligibility(request: ManualPaperRequest): {
+    allowed: boolean;
+    reasonCode: string;
+    evidence: Record<string, unknown>;
+    coverageExceptionReason: string | null;
+  } {
+    const reject = (
+      reasonCode: string,
+      evidence: Record<string, unknown> = {},
+    ) => ({
+      allowed: false,
+      reasonCode,
+      evidence,
+      coverageExceptionReason: null,
+    });
+    const token = this.#store.getToken(request.mint);
+    if (!token) return reject("TOKEN_NOT_FOUND");
+    const decision = this.#store.listRiskDecisions(request.mint, 1)[0];
+    if (!decision || decision.configVersion !== this.#configVersion)
+      return reject("CURRENT_RISK_DECISION_UNAVAILABLE");
+    if (Date.parse(decision.decidedAtUtc) > Date.parse(request.createdAtUtc))
+      return reject("RISK_DECISION_AFTER_REQUEST_TIME", {
+        decisionId: decision.id,
+      });
+    if (
+      Date.now() - Date.parse(decision.decidedAtUtc) >
+      this.#config.strategy.max_signal_age_ms
+    )
+      return reject("RISK_DECISION_STALE", { decisionId: decision.id });
+    const coverage = this.#store.getLatestTradeObservationCoverage(
+      request.mint,
+    );
+    const coverageStatus = coverage?.status ?? "UNVERIFIED";
+    const behavior = this.#store.listLaunchBehaviorSnapshots(
+      request.mint,
+      1,
+    )[0];
+    const security = this.#store.getLatestTokenRiskReport(request.mint);
+    if (
+      !security ||
+      security.id !== decision.securityReportId ||
+      security.status !== "SUPPORTED"
+    )
+      return reject("TOKEN_SECURITY_NOT_VERIFIED", {
+        decisionId: decision.id,
+        securityReportId: security?.id ?? null,
+      });
+    if (
+      Date.parse(security.observedAtUtc) > Date.parse(request.createdAtUtc) ||
+      (this.#config.security.max_snapshot_age_ms > 0 &&
+        Date.now() - Date.parse(security.observedAtUtc) >
+          this.#config.security.max_snapshot_age_ms)
+    )
+      return reject("TOKEN_SECURITY_EVIDENCE_STALE", {
+        securityReportId: security.id,
+      });
+    if (security.testTokenClassification === "LIKELY_TEST")
+      return reject("TOKEN_CLASSIFIED_LIKELY_TEST", {
+        securityReportId: security.id,
+      });
+    if (
+      security.holderSampleValidated !== true ||
+      (security.holderSampleCoverageBps ?? -1) <
+        this.#config.analysis.min_holder_sample_coverage_bps
+    )
+      return reject("HOLDER_EVIDENCE_INSUFFICIENT", {
+        securityReportId: security.id,
+      });
+    const verifiedCreator = this.#store.getVerifiedCreatorWallet(request.mint);
+    if (!verifiedCreator || token.creator !== verifiedCreator)
+      return reject("CREATOR_IDENTITY_UNVERIFIED", { decisionId: decision.id });
+    const creatorRole = this.#store
+      .listWalletRoleEvidence(request.mint)
+      .find(
+        (item) =>
+          item.wallet === verifiedCreator &&
+          item.source === "PUMP_IDL_CREATE_EVENT" &&
+          item.confidenceBps === 10000,
+      );
+    if (
+      !creatorRole ||
+      Date.parse(creatorRole.observedAtUtc) > Date.parse(request.createdAtUtc)
+    )
+      return reject("CREATOR_ROLE_EVIDENCE_UNVERIFIED", {
+        decisionId: decision.id,
+      });
+    if (
+      !decision.evidenceRefs.includes(`wallet_role_evidence:${creatorRole.id}`)
+    )
+      return reject("CREATOR_ROLE_NOT_IN_RISK_EVIDENCE", {
+        decisionId: decision.id,
+      });
+    const reputation = this.#store.getCreatorReputation(verifiedCreator);
+    if (
+      !reputation ||
+      !reputation.historyComplete ||
+      reputation.status === "SUSPICIOUS" ||
+      reputation.suspiciousIndicators.length > 0 ||
+      Date.parse(reputation.freshUntilUtc) <= Date.now()
+    )
+      return reject("CREATOR_REPUTATION_UNSAFE_OR_INCOMPLETE", {
+        creator: verifiedCreator,
+        evidenceRefs: reputation?.evidenceRefs ?? [],
+      });
+    if (Date.parse(reputation.computedAtUtc) > Date.parse(request.createdAtUtc))
+      return reject("CREATOR_REPUTATION_AFTER_REQUEST_TIME", {
+        creator: verifiedCreator,
+      });
+    if (
+      !reputation.evidenceRefs.every((reference) =>
+        decision.evidenceRefs.includes(reference),
+      )
+    )
+      return reject("CREATOR_EVIDENCE_NOT_IN_RISK_DECISION", {
+        decisionId: decision.id,
+        evidenceRefs: reputation.evidenceRefs,
+      });
+    if (
+      !security.evidenceRefs.every((reference) =>
+        decision.evidenceRefs.includes(reference),
+      )
+    )
+      return reject("SECURITY_EVIDENCE_NOT_IN_RISK_DECISION", {
+        decisionId: decision.id,
+        securityReportId: security.id,
+      });
+
+    const coverageException =
+      decision.status === "QUARANTINE" &&
+      decision.reasonCodes.length === 1 &&
+      decision.reasonCodes[0] === "LAUNCH_BEHAVIOR_INCOMPLETE" &&
+      coverageStatus !== "COMPLETE";
+    if (decision.status !== "BUY_ELIGIBLE" && !coverageException)
+      return reject("RISK_DECISION_NOT_MANUALLY_ELIGIBLE", {
+        decisionId: decision.id,
+        status: decision.status,
+        reasonCodes: decision.reasonCodes,
+      });
+    if (
+      !behavior ||
+      Date.parse(behavior.observedAtUtc) > Date.parse(request.createdAtUtc)
+    )
+      return reject("LAUNCH_BEHAVIOR_EVIDENCE_UNAVAILABLE", {
+        decisionId: decision.id,
+      });
+    if (
+      coverageException &&
+      (behavior.complete ||
+        behavior.gapReason !== "TRADE_STREAM_COMPLETENESS_UNVERIFIED")
+    )
+      return reject("COVERAGE_EXCEPTION_NOT_APPLICABLE", {
+        coverageStatus,
+        behaviorComplete: behavior.complete,
+        gapReason: behavior.gapReason,
+      });
+    if (
+      !coverageException &&
+      (coverageStatus !== "COMPLETE" || !behavior.complete)
+    )
+      return reject("TRADE_OBSERVATION_COVERAGE_INCOMPLETE", {
+        coverageStatus,
+        behaviorId: behavior.id,
+      });
+
+    const observations = this.#store
+      .listLaunchTradeObservations(
+        request.mint,
+        behavior.windowStartedAtUtc,
+        request.createdAtUtc,
+        null,
+        5000,
+      )
+      .filter(
+        (event) =>
+          event.validationStatus === "VERIFIED" &&
+          event.traderWallet !== null &&
+          event.tokenAmountRaw !== null &&
+          event.quoteAmountRaw !== null &&
+          event.quoteMint === "So11111111111111111111111111111111111111112" &&
+          event.venue !== "UNKNOWN" &&
+          Date.parse(event.receivedAtUtc) <= Date.parse(request.createdAtUtc),
+      );
+    if (observations.length === 0)
+      return reject("VERIFIED_LAUNCH_BEHAVIOR_MISSING", {
+        decisionId: decision.id,
+        behaviorId: behavior.id,
+      });
+    const assessed = analyzeLaunchBehavior({
+      mint: request.mint,
+      observations,
+      creatorWallets: [verifiedCreator],
+      linkedWallets: [],
+      windowStartedAtUtc: behavior.windowStartedAtUtc,
+      observedAtUtc: request.createdAtUtc,
+      windowSeconds: behavior.windowSeconds,
+      throughSlot: observations.reduce<number | null>(
+        (slot, event) =>
+          event.slot === null ? slot : Math.max(slot ?? 0, event.slot),
+        null,
+      ),
+      complete: behavior.complete,
+      gapReason: behavior.complete ? null : behavior.gapReason,
+      minIndependentBuyers: Math.max(
+        this.#config.analysis.min_independent_buyers,
+        this.#config.strategy.min_independent_buyers,
+      ),
+      metadataLikelyTest: behavior.reasonCodes.includes(
+        "TEST_TOKEN_METADATA_PATTERN",
+      ),
+    });
+    const unsafeBehaviorReasons = [
+      "POSSIBLE_WASH_TRADING_PATTERN",
+      "EARLY_VOLUME_CONCENTRATION_HIGH",
+      "TEST_TOKEN_METADATA_PATTERN",
+      "MULTI_VENUE_WINDOW_REQUIRES_SEPARATE_ANALYSIS",
+    ];
+    const unsafeReason = assessed.reasonCodes.find((code) =>
+      unsafeBehaviorReasons.includes(code),
+    );
+    if (unsafeReason)
+      return reject(unsafeReason, {
+        decisionId: decision.id,
+        behaviorId: behavior.id,
+        verifiedObservationIds: observations.map((event) => event.id),
+      });
+    if (
+      assessed.independentBuyerEstimate <
+      Math.max(
+        this.#config.analysis.min_independent_buyers,
+        this.#config.strategy.min_independent_buyers,
+      )
+    )
+      return reject("LAUNCH_BEHAVIOR_BUYER_THRESHOLD_NOT_MET", {
+        decisionId: decision.id,
+        behaviorId: behavior.id,
+        independentBuyerEstimate: assessed.independentBuyerEstimate,
+        verifiedObservationIds: observations.map((event) => event.id),
+      });
+
+    return {
+      allowed: true,
+      reasonCode: "MANUAL_ELIGIBILITY_PASSED",
+      coverageExceptionReason: coverageException
+        ? "MANUAL_ENTRY_ACCEPTED_UNVERIFIED_STREAM_COVERAGE"
+        : null,
+      evidence: {
+        decisionId: decision.id,
+        originalDecisionStatus: decision.status,
+        originalDecisionReasonCodes: decision.reasonCodes,
+        decisionEvidenceRefs: decision.evidenceRefs,
+        securityReportId: security.id,
+        securityReasonCodes: security.reasonCodes,
+        securityEvidenceRefs: security.evidenceRefs,
+        creator: verifiedCreator,
+        creatorEvidenceRefs: reputation.evidenceRefs,
+        behaviorId: behavior.id,
+        behaviorEvidenceRefs: assessed.evidenceRefs,
+        independentBuyerEstimate: assessed.independentBuyerEstimate,
+        coverageStatus,
+        coverageStatusAtRequest: request.originalCoverageStatus,
+        coverageReasonCode: coverage?.reasonCode ?? "NO_COVERAGE_RECORD",
+        coverageException: coverageException
+          ? "MANUAL_ENTRY_ACCEPTED_UNVERIFIED_STREAM_COVERAGE"
+          : null,
+        verifiedObservationIds: observations.map((event) => event.id),
+      },
+    };
+  }
+
+  #validManualQuote(
+    quote: QuoteResult | null,
+    mint: string,
+    side: "BUY" | "SELL",
+    amount: string,
+    requestedAtUtc: string,
+  ): quote is QuoteResult {
+    return Boolean(
+      quote &&
+      quote.validationStatus === "PASS" &&
+      quote.mint === mint &&
+      quote.direction === side &&
+      quote.exactInputAmountRaw === amount &&
+      quote.inputMint ===
+        (side === "BUY"
+          ? "So11111111111111111111111111111111111111112"
+          : mint) &&
+      quote.outputMint ===
+        (side === "BUY"
+          ? mint
+          : "So11111111111111111111111111111111111111112") &&
+      quote.venue !== null &&
+      quote.feeAmountRaw !== null &&
+      quote.expectedOutputAmountRaw !== null &&
+      quote.feeMint === "So11111111111111111111111111111111111111112" &&
+      quote.priceImpactBps !== null &&
+      quote.priceImpactBps <= this.#config.risk.max_price_impact_bps &&
+      quote.snapshotSlot !== null &&
+      quote.snapshotAtUtc !== null &&
+      Date.parse(quote.observedAtUtc) <= Date.parse(requestedAtUtc) &&
+      Date.parse(quote.snapshotAtUtc) <= Date.parse(requestedAtUtc) &&
+      Date.parse(requestedAtUtc) - Date.parse(quote.snapshotAtUtc) <=
+        this.#config.paper.max_quote_age_ms &&
+      (quote.freshnessMs ?? Number.MAX_SAFE_INTEGER) <=
+        this.#config.paper.max_quote_age_ms,
+    );
+  }
+
+  #finishManual(
+    request: ManualPaperRequest,
+    status: "FILLED" | "REJECTED" | "UNFILLABLE",
+    reasonCode: string | null,
+    evidence: Record<string, unknown> = {},
+    executionOrderId: string | null = null,
+    coverageExceptionReason: string | null = null,
+  ): void {
+    this.#store.finishManualPaperRequest({
+      id: request.id,
+      status,
+      reasonCode,
+      evidence,
+      executionOrderId,
+      coverageExceptionReason,
+      completedAtUtc: utcNow(),
+    });
+    log(
+      status === "FILLED" ? "info" : "warn",
+      "paper.manual_request.completed",
+      {
+        requestId: request.id,
+        requestType: request.requestType,
+        mint: request.mint,
+        status,
+        reasonCode,
+        executionOrderId,
+        entrySource: "MANUAL",
+      },
+    );
+  }
+
+  #retryManual(
+    request: ManualPaperRequest,
+    reasonCode: string,
+    evidence: Record<string, unknown>,
+  ): void {
+    const nextAttemptAtUtc = this.#nextRetry(request.attempts);
+    this.#store.finishManualPaperRequest({
+      id: request.id,
+      status: "PENDING",
+      reasonCode,
+      evidence,
+      resetExecutionOrder: true,
+      nextAttemptAtUtc,
+      completedAtUtc: null,
+    });
+    log("warn", "paper.manual_request.retry_scheduled", {
+      requestId: request.id,
+      requestType: request.requestType,
+      attempt: request.attempts,
+      nextAttemptAtUtc,
+      reasonCode,
+    });
+  }
+
   #syncRecoveredOrders(
     results: Awaited<ReturnType<PaperTradingEngine["recoverPendingOrders"]>>,
   ): void {
@@ -380,4 +1046,36 @@ export class PaperRuntime {
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function manualOrderId(request: ManualPaperRequest): string {
+  return hash(`manual-paper-order:${request.id}:${request.attempts}`);
+}
+
+function retryableQuoteError(value: unknown): string | null {
+  const allowed = [
+    "QUOTE_TIMEOUT",
+    "PROVIDER_UNAVAILABLE",
+    "RATE_LIMITED",
+    "PROVIDER_BUDGET_EXHAUSTED",
+  ];
+  const code =
+    value && typeof value === "object" && "failureReason" in value
+      ? String(value.failureReason)
+      : value instanceof Error
+        ? value.message.toUpperCase()
+        : "";
+  return (
+    allowed.find((candidate) =>
+      new RegExp(`(?:^|[^A-Z0-9_])${candidate}(?:$|[^A-Z0-9_])`).test(code),
+    ) ?? null
+  );
+}
+
+function safeReasonCode(value: string): string {
+  const normalized = value
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]+/g, "_")
+    .slice(0, 80);
+  return normalized || "MANUAL_REQUEST_FAILED";
 }

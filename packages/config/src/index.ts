@@ -191,6 +191,7 @@ export type RuntimeEnvironment = {
   JUPITER_API_KEY?: string;
   API_HOST?: string;
   API_PORT?: string;
+  PAPER_OPERATOR_TOKEN?: string;
 };
 
 export type LoadedConfig = {
@@ -203,6 +204,7 @@ export type LoadedConfig = {
   jupiterApiKey: string | undefined;
   apiHost: string;
   apiPort: number;
+  paperOperatorToken: string | undefined;
 };
 
 function solAmountLamports(value: string): bigint {
@@ -234,6 +236,9 @@ export async function loadConfig(
   const port = env.API_PORT === undefined ? 8787 : Number(env.API_PORT);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error("API_PORT must be an integer from 1 to 65535");
+  const paperOperatorToken = env.PAPER_OPERATOR_TOKEN?.trim() || undefined;
+  if (paperOperatorToken && paperOperatorToken.length < 32)
+    throw new Error("PAPER_OPERATOR_TOKEN must contain at least 32 characters");
   const dbPath = env.DB_PATH ?? "./data/sentinel.db";
   return {
     configVersion: createHash("sha256")
@@ -247,5 +252,6 @@ export async function loadConfig(
     jupiterApiKey: env.JUPITER_API_KEY || undefined,
     apiHost: env.API_HOST ?? "127.0.0.1",
     apiPort: port,
+    paperOperatorToken,
   };
 }

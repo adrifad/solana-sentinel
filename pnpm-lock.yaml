@@ -68,6 +68,9 @@ importers:
       '@sentinel/storage':
         specifier: workspace:*
         version: link:../../packages/storage
+      zod:
+        specifier: ^4.1.12
+        version: 4.6.7
 
   apps/worker:
     dependencies:

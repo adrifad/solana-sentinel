@@ -88,6 +88,14 @@ type PaperOrderRecord = {
     "PENDING" | "SIMULATED_FILLED" | "REJECTED" | "UNFILLABLE" | "EXPIRED";
   reasonCode: string | null;
   createdAtUtc: string;
+  entrySource: "AUTOMATIC" | "MANUAL";
+};
+
+export type PaperAccountInitialization = {
+  walletId: string;
+  initialSolLamports: string;
+  createdAtUtc: string;
+  configuredInitialBalanceMatches: boolean;
 };
 
 export interface PaperRepository {
@@ -95,10 +103,13 @@ export interface PaperRepository {
     walletId: string,
     initialSolLamports: string,
     createdAtUtc: string,
-  ): unknown;
+  ): PaperAccountInitialization;
   createPaperOrder(intent: PaperOrderIntent): PaperOrderRecord;
   getPaperOrder(orderId: string): PaperOrderRecord | null;
-  listPendingPaperOrderIntents(limit?: number): PaperOrderIntent[];
+  listPendingPaperOrderIntents(
+    limit?: number,
+    excludeManual?: boolean,
+  ): PaperOrderIntent[];
   rejectPaperOrder(
     orderId: string,
     status: "REJECTED" | "UNFILLABLE" | "EXPIRED",
@@ -133,6 +144,15 @@ export interface PaperRepository {
     unpriceablePositions: number,
     markedAtUtc: string,
   ): { peakEquityLamports: string; drawdownBps: number };
+  recordPaperPositionMark?(input: {
+    walletId: string;
+    mint: string;
+    markedAtUtc: string;
+    sellQuoteId: string;
+    sellValueLamports: string;
+    unrealizedPnlLamports: string;
+    snapshotSlot: number;
+  }): void;
   getPaperFill(orderId: string): Record<string, string | number> | null;
 }
 
@@ -143,6 +163,13 @@ export type PaperPortfolioState = {
     tokenAmountRaw: string;
     costBasisLamports: string;
     openedAtUtc: string;
+    latestMark: {
+      markedAtUtc: string;
+      sellQuoteId: string;
+      sellValueLamports: string;
+      unrealizedPnlLamports: string;
+      snapshotSlot: number;
+    } | null;
   }>;
   realizedPnl: Array<{ pnlLamports: string; filledAtUtc: string }>;
   latestMark: {
@@ -313,8 +340,14 @@ export class PaperTradingEngine {
     };
   }
 
-  async recoverPendingOrders(limit = 100): Promise<PaperExecutionResult[]> {
-    const pending = this.#repository.listPendingPaperOrderIntents(limit);
+  async recoverPendingOrders(
+    limit = 100,
+    excludeManual = false,
+  ): Promise<PaperExecutionResult[]> {
+    const pending = this.#repository.listPendingPaperOrderIntents(
+      limit,
+      excludeManual,
+    );
     const recovered: PaperExecutionResult[] = [];
     for (const intent of pending) recovered.push(await this.execute(intent));
     return recovered;
@@ -363,6 +396,9 @@ export class PaperTradingEngine {
         validQuote.feeMint !== PAPER_SOL_MINT ||
         validQuote.expectedOutputAmountRaw === null ||
         !/^\d+$/.test(validQuote.expectedOutputAmountRaw) ||
+        (validQuote.feeAmountRaw !== null &&
+          BigInt(validQuote.feeAmountRaw) >
+            BigInt(validQuote.expectedOutputAmountRaw)) ||
         validQuote.snapshotSlot === null ||
         validQuote.snapshotAtUtc === null ||
         Date.parse(validQuote.observedAtUtc) > Date.parse(quoteReadyAtUtc) ||
@@ -384,8 +420,20 @@ export class PaperTradingEngine {
       const networkFee = BigInt(this.#config.modeledNetworkFeeLamports);
       const netOutput =
         quotedOutput > networkFee ? quotedOutput - networkFee : 0n;
+      this.#repository.saveQuoteResult(validQuote);
       positionValue += netOutput;
-      unrealized += netOutput - BigInt(position.costBasisLamports);
+      const positionPnl = netOutput - BigInt(position.costBasisLamports);
+      unrealized += positionPnl;
+      if (validQuote.snapshotSlot !== null)
+        this.#repository.recordPaperPositionMark?.({
+          walletId,
+          mint: position.mint,
+          markedAtUtc: observedAtUtc,
+          sellQuoteId: validQuote.id,
+          sellValueLamports: netOutput.toString(),
+          unrealizedPnlLamports: positionPnl.toString(),
+          snapshotSlot: validQuote.snapshotSlot,
+        });
     }
     observedAtUtc = new Date(this.#clock.now()).toISOString();
     const equity = BigInt(state.solBalanceRaw) + positionValue;

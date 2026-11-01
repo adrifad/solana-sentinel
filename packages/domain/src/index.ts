@@ -381,8 +381,13 @@ export const PaperOrderIntentSchema = z.object({
   reasonCodes: z.array(z.string().regex(/^[A-Z0-9_]+$/)),
   createdAtUtc: IsoUtcSchema,
   signalQuoteId: z.string().min(1).nullable(),
+  entrySource: z.enum(["AUTOMATIC", "MANUAL"]).optional(),
 });
 export type PaperOrderIntent = z.infer<typeof PaperOrderIntentSchema>;
+
+export function paperPositionId(walletId: string, mint: string): string {
+  return `paper-position:${encodeURIComponent(walletId)}:${mint}`;
+}
 
 export type ProviderState =
   "DISABLED" | "STARTING" | "HEALTHY" | "DEGRADED" | "STOPPED";
