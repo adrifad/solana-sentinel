@@ -1,0 +1,14 @@
+{
+  "name": "@sentinel/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@sentinel/config": "workspace:*",
+    "@sentinel/domain": "workspace:*",
+    "@sentinel/providers": "workspace:*",
+    "@sentinel/storage": "workspace:*",
+    "yaml": "^2.8.1",
+    "zod": "^4.1.12"
+  }
+}

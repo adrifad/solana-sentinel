@@ -1,0 +1,12 @@
+{
+  "name": "@sentinel/providers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@sentinel/domain": "workspace:*",
+    "zod": "^4.1.12",
+    "ws": "^8.18.3"
+  }
+}

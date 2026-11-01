@@ -1,0 +1,44 @@
+services:
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_CONFIG_PATH: config/default.yaml
+      DB_PATH: /app/data/sentinel.db
+      APP_MODE: DRY_RUN
+    volumes:
+      - sentinel-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  api:
+    build: .
+    command: ["pnpm", "dev:api"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_CONFIG_PATH: config/default.yaml
+      DB_PATH: /app/data/sentinel.db
+      API_HOST: 0.0.0.0
+      API_PORT: 8787
+    volumes:
+      - sentinel-data:/app/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  sentinel-data:

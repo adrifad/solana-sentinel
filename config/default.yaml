@@ -1,0 +1,79 @@
+# Non-secret baseline. All live transaction capabilities are intentionally absent.
+version: 1
+network: mainnet-beta
+mode: DRY_RUN
+
+providers:
+  helius:
+    request_timeout_ms: 3000
+    max_requests_per_second: 5
+  pumpportal:
+    enable_new_tokens: true
+    enable_migrations: true
+    enable_token_trades: false
+    max_monitored_tokens: 20
+    max_trade_events_per_day: 5000
+  dexscreener:
+    enabled: false # no adapter is active in this implementation slice
+    requests_per_second: 2
+  jupiter:
+    enabled: false
+
+analysis:
+  concurrent_token_analysis: 6
+  creator_history_cache_ttl_seconds: 3600
+  creator_history_max_transactions: 200
+  creator_tracing_max_depth: 2
+  max_analysis_ms: 10000
+  token_observation_seconds: 60
+  social_enabled: false
+
+security:
+  require_fresh_mint_state: true
+  unknown_policy: QUARANTINE
+  test_token_policy: QUARANTINE
+  reject_untrusted_permanent_delegate: true
+  reject_unsafe_mint_authority: true
+  reject_unsafe_freeze_authority: true
+  reject_unsupported_transfer_hooks: true
+  require_sell_quote_for_buy: true
+  max_snapshot_age_ms: 1500
+
+strategy:
+  entry_mode: VALIDATED
+  min_opportunity_score: 80
+  weights:
+    creator_history: 30
+    token_security: 25
+    launch_behavior: 20
+    exit_liquidity: 15
+    social_confidence: 10
+  min_independent_buyers: 3
+  max_signal_age_ms: 3000
+  max_hold_seconds: 900
+
+risk:
+  max_trade_sol: '0.05'
+  max_exposure_sol: '0.20'
+  max_open_positions: 3
+  max_daily_loss_sol: '0.10'
+  max_drawdown_bps: 500
+  max_price_impact_bps: 300
+  max_slippage_bps: 200
+  emergency_pause: false
+
+paper:
+  initial_sol: '10.0'
+  execution_latency_ms: 750
+  max_quote_age_ms: 1000
+  conservative_extra_slippage_bps: 50
+  modeled_network_fee_lamports: '10000'
+  mark_to_sell_quote: true
+  reject_when_sell_quote_missing: true
+
+observability:
+  timezone_display: Asia/Jakarta
+  raw_event_retention_days: 14
+  decision_retention_days: 180
+  health_stale_feed_seconds: 30
+  audit_config_changes: true

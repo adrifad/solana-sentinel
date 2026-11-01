@@ -1,0 +1,36 @@
+{
+  "name": "solana-sentinel",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@11.3.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <27"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "db:migrate": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts migrate",
+    "dev:worker": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts start",
+    "dev:api": "node --env-file-if-exists=.env --experimental-strip-types apps/api/src/main.ts",
+    "tokens": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts tokens",
+    "health": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts health"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/ws": "^8.18.1",
+    "@sentinel/config": "workspace:*",
+    "@sentinel/domain": "workspace:*",
+    "@sentinel/providers": "workspace:*",
+    "@sentinel/storage": "workspace:*",
+    "@sentinel/api": "workspace:*",
+    "eslint": "^9.39.1",
+    "prettier": "^3.6.2",
+    "typescript-eslint": "^8.48.0",
+    "typescript": "^5.9.3",
+    "yaml": "^2.8.1"
+  }
+}

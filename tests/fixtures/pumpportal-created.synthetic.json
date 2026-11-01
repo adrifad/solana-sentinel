@@ -1,0 +1,11 @@
+{
+  "txType": "create",
+  "mint": "So11111111111111111111111111111111111111112",
+  "signature": "1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+  "slot": 341197053,
+  "creator": "11111111111111111111111111111111",
+  "name": "Fixture Token",
+  "symbol": "FIX",
+  "uri": "https://example.invalid/metadata.json",
+  "apiKey": "fixture-secret-must-not-persist"
+}
