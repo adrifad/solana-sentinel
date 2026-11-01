@@ -56,7 +56,7 @@ Fixture-backed fills and quote timing tests are synthetic simulations. They are 
 
 ## Delivery
 
-- Commit: pending
-- GitHub Actions: pending
+- Implementation commit: `04cf2935d123cf90532832aa997e9d5a018fa907` (`main`)
+- GitHub Actions CI run [41324819000](https://github.com/adrifad/solana-sentinel/actions/runs/41324819000) was observed as `in_progress` for the implementation commit. Follow-up status polling could not complete because `api.github.com` DNS resolution failed. CI completion is therefore not verified.
 - Mainnet trade/quote validation in this change: NOT PERFORMED
 - VPS smoke test: NOT PERFORMED
