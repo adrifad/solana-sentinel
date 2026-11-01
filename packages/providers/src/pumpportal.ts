@@ -35,6 +35,11 @@ export type PumpPortalOptions = {
 const SECRET_FIELD =
   /(?:api.?key|secret|password|private.?key|keypair|authorization|access.?token)/i;
 
+type PumpPortalSession = {
+  connected: boolean;
+  closed: boolean;
+};
+
 export function parsePumpPortalMessage(
   input: unknown,
   receivedAtMs = Date.now(),
@@ -194,6 +199,7 @@ export class PumpPortalClient {
     PumpPortalOptions;
   #running = false;
   #current: WebSocket | undefined;
+  #activeSession: PumpPortalSession | undefined;
   #loop: Promise<void> | undefined;
   #lastEventAtUtc: string | null = null;
   #lastProcessedAtUtc: string | null = null;
@@ -202,7 +208,10 @@ export class PumpPortalClient {
   #sleepTimer: ReturnType<typeof setTimeout> | undefined;
   #wakeSleep: (() => void) | undefined;
   readonly #eventHandlers = new Set<Promise<void>>();
-  readonly #eventQueue: MarketEvent[] = [];
+  readonly #eventQueue: Array<{
+    event: MarketEvent;
+    session: PumpPortalSession;
+  }> = [];
 
   constructor(options: PumpPortalOptions) {
     if (!options.apiKey.trim())
@@ -252,13 +261,7 @@ export class PumpPortalClient {
     } catch (error) {
       loopError = error;
     } finally {
-      while (this.#eventHandlers.size > 0)
-        await Promise.allSettled([...this.#eventHandlers]);
-      while (this.#eventQueue.length > 0 || this.#eventHandlers.size > 0) {
-        this.#drainEventQueue();
-        if (this.#eventHandlers.size > 0)
-          await Promise.allSettled([...this.#eventHandlers]);
-      }
+      await this.waitForIdle();
       this.#loop = undefined;
       this.#opts.onHealth(
         "STOPPED",
@@ -270,6 +273,15 @@ export class PumpPortalClient {
       );
     }
     if (loopError) throw loopError;
+  }
+
+  /** Wait for all accepted events to finish processing without stopping the socket. */
+  async waitForIdle(): Promise<void> {
+    while (this.#eventQueue.length > 0 || this.#eventHandlers.size > 0) {
+      this.#drainEventQueue();
+      if (this.#eventHandlers.size > 0)
+        await Promise.allSettled([...this.#eventHandlers]);
+    }
   }
 
   async #run(): Promise<void> {
@@ -311,20 +323,31 @@ export class PumpPortalClient {
       const socket = this.#opts.socketFactory
         ? this.#opts.socketFactory(url.toString())
         : new WebSocket(url.toString(), { handshakeTimeout: 10000 });
+      const session: PumpPortalSession = {
+        connected: false,
+        closed: false,
+      };
       this.#current = socket;
+      this.#activeSession = session;
       let closed = false;
       let awaitingPong = false;
       const finish = (): void => {
         if (closed) return;
         closed = true;
+        session.connected = false;
+        session.closed = true;
         clearInterval(heartbeat);
         clearTimeout(handshakeTimeout);
+        if (this.#running && this.#activeSession === session)
+          this.#disconnectErrorCode ??= "SOCKET_DISCONNECTED";
         if (this.#current === socket) this.#current = undefined;
         resolve();
       };
       const heartbeat = setInterval(() => {
+        if (!this.#isCurrentConnectedSession(session)) return;
         if (awaitingPong) {
-          this.#opts.onHealth(
+          this.#emitSessionHealth(
+            session,
             "DEGRADED",
             this.#reconnectCount,
             "HEARTBEAT_TIMEOUT",
@@ -344,8 +367,10 @@ export class PumpPortalClient {
         }
       }, this.#opts.heartbeatMs);
       const handshakeTimeout = setTimeout(() => {
+        if (session.closed || session.connected) return;
         this.#disconnectErrorCode = "CONNECT_TIMEOUT";
-        this.#opts.onHealth(
+        this.#emitSessionHealth(
+          session,
           "DEGRADED",
           this.#reconnectCount,
           "CONNECT_TIMEOUT",
@@ -357,11 +382,21 @@ export class PumpPortalClient {
       }, 15000);
       socket.on("open", () => {
         clearTimeout(handshakeTimeout);
+        if (
+          !this.#running ||
+          session.closed ||
+          this.#activeSession !== session
+        ) {
+          socket.close(1000, "superseded-or-stopped");
+          return;
+        }
+        session.connected = true;
         if (this.#opts.enableNewTokens)
           socket.send(JSON.stringify({ method: "subscribeNewToken" }));
         if (this.#opts.enableMigrations)
           socket.send(JSON.stringify({ method: "subscribeMigration" }));
-        this.#opts.onHealth(
+        this.#emitSessionHealth(
+          session,
           "HEALTHY",
           this.#reconnectCount,
           null,
@@ -369,8 +404,10 @@ export class PumpPortalClient {
         );
       });
       socket.on("pong", () => {
+        if (!this.#isCurrentConnectedSession(session)) return;
         awaitingPong = false;
-        this.#opts.onHealth(
+        this.#emitSessionHealth(
+          session,
           "HEALTHY",
           this.#reconnectCount,
           null,
@@ -378,6 +415,7 @@ export class PumpPortalClient {
         );
       });
       socket.on("message", (data: WebSocket.RawData) => {
+        if (!this.#isCurrentConnectedSession(session)) return;
         const receivedAt = this.#opts.now();
         const bytes = Buffer.isBuffer(data)
           ? data
@@ -385,7 +423,8 @@ export class PumpPortalClient {
             ? Buffer.concat(data)
             : Buffer.from(data as ArrayBuffer);
         if (bytes.byteLength > this.#opts.maxMessageBytes) {
-          this.#opts.onHealth(
+          this.#emitSessionHealth(
+            session,
             "DEGRADED",
             this.#reconnectCount,
             "MESSAGE_TOO_LARGE",
@@ -397,7 +436,8 @@ export class PumpPortalClient {
         try {
           parsed = JSON.parse(bytes.toString("utf8")) as unknown;
         } catch {
-          this.#opts.onHealth(
+          this.#emitSessionHealth(
+            session,
             "DEGRADED",
             this.#reconnectCount,
             "MALFORMED_JSON",
@@ -412,7 +452,8 @@ export class PumpPortalClient {
             this.#opts.persistEvent?.(event);
           } catch {
             this.#disconnectErrorCode = "EVENT_PERSIST_FAILED";
-            this.#opts.onHealth(
+            this.#emitSessionHealth(
+              session,
               "DEGRADED",
               this.#reconnectCount,
               "EVENT_PERSIST_FAILED",
@@ -425,7 +466,8 @@ export class PumpPortalClient {
           }
           if (this.#eventQueue.length >= this.#opts.maxPendingEvents) {
             this.#disconnectErrorCode = "EVENT_BACKPRESSURE";
-            this.#opts.onHealth(
+            this.#emitSessionHealth(
+              session,
               "DEGRADED",
               this.#reconnectCount,
               "EVENT_BACKPRESSURE",
@@ -436,7 +478,7 @@ export class PumpPortalClient {
             socket.terminate();
             return;
           }
-          this.#eventQueue.push(event);
+          this.#eventQueue.push({ event, session });
           this.#drainEventQueue();
         } catch (error) {
           const code =
@@ -446,7 +488,8 @@ export class PumpPortalClient {
             )
               ? error.message
               : "MALFORMED_EVENT";
-          this.#opts.onHealth(
+          this.#emitSessionHealth(
+            session,
             "DEGRADED",
             this.#reconnectCount,
             code,
@@ -455,8 +498,10 @@ export class PumpPortalClient {
         }
       });
       socket.on("error", () => {
+        if (!this.#isCurrentConnectedSession(session)) return;
         this.#disconnectErrorCode = "SOCKET_ERROR";
-        this.#opts.onHealth(
+        this.#emitSessionHealth(
+          session,
           "DEGRADED",
           this.#reconnectCount,
           "SOCKET_ERROR",
@@ -471,37 +516,67 @@ export class PumpPortalClient {
     return this.#eventQueue.length + this.#eventHandlers.size;
   }
 
+  #isCurrentConnectedSession(session: PumpPortalSession): boolean {
+    return (
+      this.#running &&
+      this.#activeSession === session &&
+      session.connected &&
+      !session.closed
+    );
+  }
+
+  #emitSessionHealth(
+    session: PumpPortalSession,
+    state: "HEALTHY" | "DEGRADED",
+    reconnectCount: number,
+    errorCode: string | null,
+    lastEventAtUtc: string | null,
+    queueDepth = this.#queueDepth,
+    lastProcessedAtUtc = this.#lastProcessedAtUtc,
+  ): void {
+    if (!this.#isCurrentConnectedSession(session)) return;
+    this.#opts.onHealth(
+      state,
+      reconnectCount,
+      errorCode,
+      lastEventAtUtc,
+      queueDepth,
+      lastProcessedAtUtc,
+    );
+  }
+
   #drainEventQueue(): void {
     while (
       this.#eventHandlers.size < this.#opts.eventProcessingConcurrency &&
       this.#eventQueue.length > 0
     ) {
-      const event = this.#eventQueue.shift();
-      if (!event) return;
+      const queued = this.#eventQueue.shift();
+      if (!queued) return;
+      const { event, session } = queued;
       const handler = Promise.resolve()
         .then(() => this.#opts.onEvent(event))
         .then(() => {
           this.#lastProcessedAtUtc = utcNow();
-          if (this.#running)
-            this.#opts.onHealth(
-              "HEALTHY",
-              this.#reconnectCount,
-              null,
-              this.#lastEventAtUtc,
-              this.#queueDepth,
-              this.#lastProcessedAtUtc,
-            );
+          this.#emitSessionHealth(
+            session,
+            "HEALTHY",
+            this.#reconnectCount,
+            null,
+            this.#lastEventAtUtc,
+            this.#queueDepth,
+            this.#lastProcessedAtUtc,
+          );
         })
         .catch(() => {
-          if (this.#running)
-            this.#opts.onHealth(
-              "DEGRADED",
-              this.#reconnectCount,
-              "EVENT_PROCESSING_FAILED",
-              this.#lastEventAtUtc,
-              this.#queueDepth,
-              this.#lastProcessedAtUtc,
-            );
+          this.#emitSessionHealth(
+            session,
+            "DEGRADED",
+            this.#reconnectCount,
+            "EVENT_PROCESSING_FAILED",
+            this.#lastEventAtUtc,
+            this.#queueDepth,
+            this.#lastProcessedAtUtc,
+          );
         });
       this.#eventHandlers.add(handler);
       void handler.finally(() => {

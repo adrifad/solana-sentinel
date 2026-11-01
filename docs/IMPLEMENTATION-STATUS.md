@@ -8,7 +8,7 @@ The provided checkout was a documentation blueprint, not an application. It cont
 
 - Strict TypeScript pnpm workspace and Zod/YAML validated mainnet `DRY_RUN` configuration.
 - SQLite WAL migrations through version 6, durable normalized PumpPortal events, bounded sanitized payloads, idempotency, separate create/migration slots, reported creator/trader roles, and provenance timestamps.
-- One PumpPortal WebSocket client with message and pending-handler bounds, heartbeat, reconnect/backoff, resubscription, and callback draining during shutdown. Handler concurrency and pending queue capacity are validated runtime configuration (`event_processing_concurrency`, `max_pending_events`). Incoming events are persisted before asynchronous enrichment/processing; overflow closes the stream and is recorded as an unrecovered gap.
+- One PumpPortal WebSocket client with message and pending-handler bounds, heartbeat, reconnect/backoff, resubscription, and callback draining during shutdown. Handler concurrency and pending queue capacity are validated runtime configuration (`event_processing_concurrency`, `max_pending_events`). Incoming events are persisted before asynchronous enrichment/processing; overflow closes the stream and is recorded as an unrecovered gap. Socket health and queued-event completion are now bound to the receiving socket session, so callbacks from a disconnected or superseded session cannot report `HEALTHY` or close an unreconciled gap. `waitForIdle()` exposes a deterministic event-drain boundary for shutdown and lifecycle validation.
 - Helius JSON-RPC reader with response validation, timeout, retries, circuit breaker, per-second pacing, persistent UTC-day request budget, and safe error codes.
 - A durable SQLite enrichment queue consumes only monitoring-eligible events, claims work with bounded concurrency, retries transient failures, and recovers interrupted jobs after restart. Shutdown waits for claimed requests to settle before closing SQLite.
 - Provider health stores socket state, last event/message time, last processed time, processing lag, queue depth, reconnect count, and provider error code separately. A shutdown drain cannot change `STOPPED` back to `HEALTHY`.
@@ -55,14 +55,15 @@ Sprint 2.5 validation record (Node.js 26 / pnpm 11):
 
 - `pnpm install --frozen-lockfile`: passed.
 - `pnpm typecheck`: passed.
-- `pnpm test`: 50 passed, 0 failed. New coverage includes Jupiter quote-only/no-taker enforcement, transaction-bearing response rejection, launch as-of filtering/classification/wash-pattern handling, wallet outflow indicator semantics, validated holder sample policy, and migration 006 persistence.
+- `pnpm test`: 51 passed, 0 failed. Coverage includes the regression for a late callback after reconnect, promise-synchronized socket-open lifecycle checks, overflow persistence/gap retention, Jupiter quote-only/no-taker enforcement, launch as-of behavior, wallet outflow indicator semantics, validated holder-sample policy, and migration 006 persistence.
 - `pnpm lint`: passed.
 - `pnpm format:check`: passed.
 - `pnpm docs:check`: passed; all README local links resolve.
 - `DB_PATH=/tmp/solana-sentinel-ci-<run>.sqlite pnpm db:migrate`: passed on a fresh database.
 - Migration tests cover version-one/version-two upgrades, partially applied columns, create/migration slot backfill, interrupted queue recovery, idempotent reopen behavior, migration 5 intelligence/security and migration 6 quote/behavior schema creation.
+- The focused reconnect/overflow tests passed 20 consecutive runs after replacing polling sleeps with explicit socket-open signals.
 
-No `HELIUS_API_KEY`, `PUMPPORTAL_API_KEY`, or `JUPITER_API_KEY` is present in this environment. PumpPortal migration and trade payloads, Helius mainnet state reads, Jupiter response behavior, curve state quote calculations against live state, PumpSwap state decoding, long-running provider reconnects, GitHub Actions execution, and Docker deployment were not validated live. Existing sanitized create capture remains a third-party capture and not a live PumpPortal session. Synthetic fixtures are contract tests, not production market data.
+No `HELIUS_API_KEY`, `PUMPPORTAL_API_KEY`, or `JUPITER_API_KEY` is present in this environment. The current official PumpPortal reference confirms `subscribeTokenTrade`, `unsubscribeTokenTrade`, one-socket guidance, and event metering, but does not specify trade message fields; without credentials and a sanitized live capture, trade decoding/subscription activation remains disabled. PumpPortal migration payloads, Helius mainnet state reads, Jupiter response behavior, curve state quote calculations against live state, PumpSwap state decoding, long-running provider reconnects, GitHub Actions execution, and Docker deployment were not validated live. Existing sanitized create capture remains a third-party capture and not a live PumpPortal session. Synthetic fixtures are contract tests, not production market data.
 
 ## Remaining milestones
 

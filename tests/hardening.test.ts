@@ -174,6 +174,10 @@ test("PumpPortal event handling applies a pending-event bound and stop drains ca
   const healthStates: string[] = [];
   let callbacks = 0;
   let persisted = 0;
+  let resolveSocketOpened!: () => void;
+  const socketOpened = new Promise<void>(
+    (resolve) => (resolveSocketOpened = resolve),
+  );
   const client = new PumpPortalClient({
     apiKey: "test",
     enableNewTokens: true,
@@ -182,7 +186,10 @@ test("PumpPortal event handling applies a pending-event bound and stop drains ca
       persisted += 1;
     },
     socketFactory: () => {
-      setImmediate(() => socket.emit("open"));
+      setImmediate(() => {
+        socket.emit("open");
+        resolveSocketOpened();
+      });
       return socket as unknown as WebSocket;
     },
     onEvent: async () => {
@@ -201,8 +208,7 @@ test("PumpPortal event handling applies a pending-event bound and stop drains ca
   });
   const running = client.start();
   try {
-    while (!socket.listenerCount("message"))
-      await new Promise((resolve) => setImmediate(resolve));
+    await socketOpened;
     const message = JSON.stringify({
       txType: "create",
       mint: "So11111111111111111111111111111111111111112",
@@ -252,6 +258,14 @@ test("burst overflow is persisted, reconnect gaps are exposed, and completeness 
   const store = new SentinelStore(join(directory, "sentinel.db"));
   await store.open();
   const sockets: Socket[] = [];
+  let resolveFirstOpen!: () => void;
+  let resolveSecondOpen!: () => void;
+  const firstSocketOpened = new Promise<void>(
+    (resolve) => (resolveFirstOpen = resolve),
+  );
+  const secondSocketOpened = new Promise<void>(
+    (resolve) => (resolveSecondOpen = resolve),
+  );
   const client = new PumpPortalClient({
     apiKey: "test",
     enableNewTokens: true,
@@ -264,7 +278,11 @@ test("burst overflow is persisted, reconnect gaps are exposed, and completeness 
     socketFactory: () => {
       const socket = new Socket();
       sockets.push(socket);
-      setImmediate(() => socket.emit("open"));
+      setImmediate(() => {
+        socket.emit("open");
+        if (sockets.length === 1) resolveFirstOpen();
+        if (sockets.length === 2) resolveSecondOpen();
+      });
       return socket as unknown as WebSocket;
     },
     persistEvent: (event) => {
@@ -297,11 +315,8 @@ test("burst overflow is persisted, reconnect gaps are exposed, and completeness 
     },
   });
   const running = client.start();
-  const pause = (ms: number) =>
-    new Promise((resolve) => setTimeout(resolve, ms));
   try {
-    for (let attempt = 0; attempt < 100 && sockets.length < 1; attempt += 1)
-      await pause(5);
+    await firstSocketOpened;
     const socket = sockets[0];
     assert.ok(socket);
     const mint = "So11111111111111111111111111111111111111112";
@@ -310,23 +325,8 @@ test("burst overflow is persisted, reconnect gaps are exposed, and completeness 
         "message",
         Buffer.from(JSON.stringify({ txType: "create", mint, name })),
       );
-    for (
-      let attempt = 0;
-      attempt < 100 &&
-      !(
-        store.getStreamCompleteness().coverageStatus === "GAPS_UNRECONCILED" &&
-        store
-          .listProviderHealth()
-          .some(
-            (health) =>
-              health.provider === "pumpportal" &&
-              health.reconnectCount > 0 &&
-              health.state === "HEALTHY",
-          )
-      );
-      attempt += 1
-    )
-      await pause(5);
+    await secondSocketOpened;
+    await client.waitForIdle();
     const completeness = store.getStreamCompleteness();
     assert.equal(store.eventCount(), 3);
     assert.equal(completeness.coverageStatus, "GAPS_UNRECONCILED");
@@ -339,6 +339,92 @@ test("burst overflow is persisted, reconnect gaps are exposed, and completeness 
     await running;
     store.close();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a completed callback from a disconnected socket cannot restore HEALTHY", async () => {
+  class Socket extends EventEmitter {
+    send(): void {}
+    ping(): void {}
+    close(): void {
+      this.emit("close");
+    }
+    terminate(): void {
+      this.emit("close");
+    }
+  }
+  const sockets: Socket[] = [];
+  let resolveFirstOpen!: () => void;
+  let resolveSecondOpen!: () => void;
+  let resolveHandlerStarted!: () => void;
+  let releaseHandler!: () => void;
+  const firstSocketOpened = new Promise<void>(
+    (resolve) => (resolveFirstOpen = resolve),
+  );
+  const secondSocketOpened = new Promise<void>(
+    (resolve) => (resolveSecondOpen = resolve),
+  );
+  const handlerStarted = new Promise<void>(
+    (resolve) => (resolveHandlerStarted = resolve),
+  );
+  const heldHandler = new Promise<void>(
+    (resolve) => (releaseHandler = resolve),
+  );
+  const health: Array<{ state: string; reconnectCount: number }> = [];
+  const client = new PumpPortalClient({
+    apiKey: "test",
+    enableNewTokens: true,
+    enableMigrations: false,
+    minBackoffMs: 1,
+    maxBackoffMs: 1,
+    heartbeatMs: 60000,
+    socketFactory: () => {
+      const socket = new Socket();
+      sockets.push(socket);
+      setImmediate(() => {
+        socket.emit("open");
+        if (sockets.length === 1) resolveFirstOpen();
+        if (sockets.length === 2) resolveSecondOpen();
+      });
+      return socket as unknown as WebSocket;
+    },
+    onEvent: () => {
+      resolveHandlerStarted();
+      return heldHandler;
+    },
+    onHealth: (state, reconnectCount) => health.push({ state, reconnectCount }),
+  });
+  const running = client.start();
+  try {
+    await firstSocketOpened;
+    const firstSocket = sockets[0];
+    assert.ok(firstSocket);
+    firstSocket.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          txType: "create",
+          mint: "So11111111111111111111111111111111111111112",
+        }),
+      ),
+    );
+    await handlerStarted;
+    firstSocket.terminate();
+    await secondSocketOpened;
+
+    const healthyAfterReconnect = () =>
+      health.filter(
+        (item) => item.state === "HEALTHY" && item.reconnectCount > 0,
+      ).length;
+    assert.equal(healthyAfterReconnect(), 1);
+
+    releaseHandler();
+    await client.waitForIdle();
+    assert.equal(healthyAfterReconnect(), 1);
+  } finally {
+    releaseHandler();
+    await client.stop();
+    await running;
   }
 });
 
