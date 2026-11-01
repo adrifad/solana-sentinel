@@ -22,7 +22,7 @@ GET    /api/tokens/:mint
 GET    /api/creators/:pubkey
 ```
 
-The implemented API is read-only: token detail includes role evidence, latest security report, and decisions; creator detail includes reputation, historical launches, and wallet-link evidence. Portfolio, orders, config mutation, authentication, and push event streaming remain unimplemented. No endpoint can change mode or arm trading.
+The implemented API is read-only: token detail includes role evidence, latest security report, decisions, analysis job outcomes, and migration transaction-recovery status; health includes provider health, completeness, and recent sanitized provider-frame diagnostics. Creator detail includes reputation, historical launches, and wallet-link evidence. Portfolio, orders, config mutation, authentication, and push event streaming remain unimplemented. No endpoint can change mode or arm trading.
 
 ## Security / UX rules
 

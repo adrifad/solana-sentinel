@@ -576,7 +576,7 @@ test("migration 006 persists quotes and behavior snapshots and reopens cleanly",
       migrations.some((item) => item.version === 6),
       true,
     );
-    assert.equal(migrations.at(-1)?.version, 7);
+    assert.equal(migrations.at(-1)?.version, 8);
     assert.equal(store.tryConsumeJupiterRequest(1), true);
     assert.equal(store.tryConsumeJupiterRequest(1), false);
   } finally {

@@ -95,6 +95,7 @@ export class SentinelStore {
       "005-intelligence-security-decisions.sql",
       "006-market-intelligence.sql",
       "007-paper-ledger.sql",
+      "008-runtime-hardening.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -184,8 +185,8 @@ export class SentinelStore {
       this.#db
         .prepare(
           `INSERT INTO market_events
-        (id, provider, kind, mint, signature, slot, observed_at_utc, received_at_utc, first_seen_at_utc, idempotency_key, payload_ref, sanitized_payload, ingestion_latency_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, provider, kind, mint, signature, slot, provider_slot, observed_at_utc, received_at_utc, first_seen_at_utc, idempotency_key, payload_ref, sanitized_payload, ingestion_latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           event.id,
@@ -193,6 +194,7 @@ export class SentinelStore {
           event.kind,
           event.mint,
           event.txSignature ?? null,
+          event.slot ?? null,
           event.slot ?? null,
           event.observedAtUtc ?? null,
           event.receivedAtUtc,
@@ -214,7 +216,7 @@ export class SentinelStore {
         )
         .run(
           event.provider,
-          event.slot ?? null,
+          event.kind === "TOKEN_MIGRATED" ? null : (event.slot ?? null),
           event.txSignature ?? null,
           event.id,
           event.receivedAtUtc,
@@ -233,8 +235,18 @@ export class SentinelStore {
           first_seen_at_utc = MIN(tokens.first_seen_at_utc, excluded.first_seen_at_utc),
           last_seen_at_utc = MAX(tokens.last_seen_at_utc, excluded.last_seen_at_utc),
           created_slot = COALESCE(tokens.created_slot, excluded.created_slot),
-          creator = COALESCE(tokens.creator, excluded.creator),
-          launch_initiator = COALESCE(tokens.launch_initiator, excluded.launch_initiator),
+          creator = CASE
+            WHEN tokens.market_phase = 'MIGRATED_UNKNOWN_VENUE' OR excluded.market_phase = 'MIGRATED_UNKNOWN_VENUE'
+            THEN (SELECT wallet_pubkey FROM wallet_role_evidence WHERE mint = tokens.mint
+              AND role = 'CLAIMED_CREATOR' AND source = 'PUMP_IDL_CREATE_EVENT' AND confidence_bps = 10000
+              ORDER BY slot ASC LIMIT 1)
+            ELSE COALESCE(tokens.creator, excluded.creator) END,
+          launch_initiator = CASE
+            WHEN tokens.market_phase = 'MIGRATED_UNKNOWN_VENUE' OR excluded.market_phase = 'MIGRATED_UNKNOWN_VENUE'
+            THEN (SELECT wallet_pubkey FROM wallet_role_evidence WHERE mint = tokens.mint
+              AND role = 'LAUNCH_INITIATOR' AND source = 'PUMP_IDL_CREATE_EVENT' AND confidence_bps = 10000
+              ORDER BY slot ASC LIMIT 1)
+            ELSE COALESCE(tokens.launch_initiator, excluded.launch_initiator) END,
           migration_slot = COALESCE(tokens.migration_slot, excluded.migration_slot),
           market_phase = CASE WHEN tokens.market_phase = 'MIGRATED_UNKNOWN_VENUE' OR excluded.market_phase = 'MIGRATED_UNKNOWN_VENUE' THEN 'MIGRATED_UNKNOWN_VENUE' ELSE tokens.market_phase END,
           name = COALESCE(tokens.name, excluded.name), symbol = COALESCE(tokens.symbol, excluded.symbol), uri = COALESCE(tokens.uri, excluded.uri),
@@ -245,16 +257,18 @@ export class SentinelStore {
           event.firstSeenAtUtc,
           event.receivedAtUtc,
           event.kind === "TOKEN_CREATED" ? (event.slot ?? null) : null,
-          event.creator ?? null,
-          event.launchInitiator ?? null,
-          event.kind === "TOKEN_MIGRATED" ? (event.slot ?? null) : null,
+          event.kind === "TOKEN_CREATED" ? (event.creator ?? null) : null,
+          event.kind === "TOKEN_CREATED"
+            ? (event.launchInitiator ?? null)
+            : null,
+          null,
           phase,
           event.name ?? null,
           event.symbol ?? null,
           event.uri ?? null,
           eligible ? 1 : 0,
         );
-      if (eligible && heliusEnabled) {
+      if (eligible && heliusEnabled && event.kind === "TOKEN_CREATED") {
         const now = utcNow();
         this.#db
           .prepare(
@@ -264,7 +278,16 @@ export class SentinelStore {
           )
           .run(event.id, event.mint, now, now, now);
       }
-      if (event.kind === "TOKEN_CREATED") {
+      if (event.kind === "TOKEN_MIGRATED") {
+        const now = utcNow();
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO migration_recovery_jobs
+            (event_id, mint, signature, status, next_attempt_at_utc, created_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, 'PENDING', ?, ?, ?)`,
+          )
+          .run(event.id, event.mint, event.txSignature ?? null, now, now, now);
+      } else {
         const now = utcNow();
         this.#db
           .prepare(
@@ -310,11 +333,13 @@ export class SentinelStore {
     creatorClaim: string | null;
     initiatorClaim: string | null;
     monitoringEligible: boolean;
+    migrationRecoveryStatus: string | null;
   } | null {
     const row = this.#db
       .prepare(
-        `SELECT e.mint, e.kind, e.signature, e.slot, e.received_at_utc, t.creator, t.launch_initiator, t.monitoring_eligible
-        FROM market_events e JOIN tokens t USING(mint) WHERE e.id = ?`,
+        `SELECT e.mint, e.kind, e.signature, e.slot, e.received_at_utc, t.creator, t.launch_initiator, t.monitoring_eligible,
+        j.status AS migration_recovery_status
+        FROM market_events e JOIN tokens t USING(mint) LEFT JOIN migration_recovery_jobs j ON j.event_id = e.id WHERE e.id = ?`,
       )
       .get(eventId) as SqlRow | undefined;
     return row
@@ -331,6 +356,10 @@ export class SentinelStore {
               ? null
               : String(row["launch_initiator"]),
           monitoringEligible: row["monitoring_eligible"] === 1,
+          migrationRecoveryStatus:
+            row["migration_recovery_status"] === null
+              ? null
+              : String(row["migration_recovery_status"]),
         }
       : null;
   }
@@ -488,6 +517,251 @@ export class SentinelStore {
     }
   }
 
+  claimMigrationRecoveryJob(): {
+    eventId: string;
+    mint: string;
+    signature: string | null;
+    eventSlot: number | null;
+    monitoringEligible: boolean;
+    attempts: number;
+  } | null {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const now = utcNow();
+      const row = this.#db
+        .prepare(
+          `SELECT j.event_id, j.mint, j.signature, j.attempts, e.provider_slot, t.monitoring_eligible
+          FROM migration_recovery_jobs j JOIN market_events e ON e.id = j.event_id
+          JOIN tokens t ON t.mint = j.mint
+          WHERE j.status = 'PENDING' AND j.next_attempt_at_utc <= ?
+          ORDER BY j.created_at_utc LIMIT 1`,
+        )
+        .get(now) as SqlRow | undefined;
+      if (!row) {
+        this.#db.exec("COMMIT");
+        return null;
+      }
+      const changed = this.#db
+        .prepare(
+          `UPDATE migration_recovery_jobs SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
+          WHERE event_id = ? AND status = 'PENDING'`,
+        )
+        .run(now, String(row["event_id"]));
+      this.#db.exec("COMMIT");
+      return Number(changed.changes) === 1
+        ? {
+            eventId: String(row["event_id"]),
+            mint: String(row["mint"]),
+            signature:
+              row["signature"] === null ? null : String(row["signature"]),
+            eventSlot:
+              row["provider_slot"] === null
+                ? null
+                : Number(row["provider_slot"]),
+            monitoringEligible: row["monitoring_eligible"] === 1,
+            attempts: Number(row["attempts"]) + 1,
+          }
+        : null;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  resolveMigrationEvent(input: {
+    eventId: string;
+    mint: string;
+    signature: string;
+    slot: number;
+    blockTime: number | null;
+  }): void {
+    if (!Number.isSafeInteger(input.slot) || input.slot < 0)
+      throw new Error("MIGRATION_SLOT_INVALID");
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const event = this.#db
+        .prepare(
+          "SELECT kind, mint, signature, slot, provider_slot FROM market_events WHERE id = ?",
+        )
+        .get(input.eventId) as SqlRow | undefined;
+      if (
+        !event ||
+        event["kind"] !== "TOKEN_MIGRATED" ||
+        event["mint"] !== input.mint ||
+        event["signature"] !== input.signature ||
+        (event["provider_slot"] !== null &&
+          Number(event["provider_slot"]) !== input.slot)
+      )
+        throw new Error("MIGRATION_EVENT_CONTRADICTS_TRANSACTION");
+      const token = this.#db
+        .prepare("SELECT migration_slot FROM tokens WHERE mint = ?")
+        .get(input.mint) as SqlRow | undefined;
+      if (
+        !token ||
+        (token["migration_slot"] !== null &&
+          Number(token["migration_slot"]) !== input.slot)
+      )
+        throw new Error("MIGRATION_SLOT_CONFLICT");
+      const chainTime =
+        input.blockTime === null
+          ? null
+          : new Date(input.blockTime * 1000).toISOString();
+      this.#db
+        .prepare(
+          `UPDATE market_events SET slot = ?, observed_at_utc = COALESCE(?, observed_at_utc),
+          chain_time_status = CASE WHEN ? IS NULL THEN chain_time_status ELSE 'RESOLVED' END,
+          chain_time_error_code = CASE WHEN ? IS NULL THEN chain_time_error_code ELSE NULL END
+          WHERE id = ?`,
+        )
+        .run(input.slot, chainTime, chainTime, chainTime, input.eventId);
+      this.#db
+        .prepare(
+          `UPDATE tokens SET migration_slot = ?, market_phase = 'MIGRATED_UNKNOWN_VENUE'
+          WHERE mint = ?`,
+        )
+        .run(input.slot, input.mint);
+      this.#db
+        .prepare(
+          `INSERT INTO discovery_checkpoints(provider, last_slot, last_signature, last_event_id, updated_at_utc)
+          VALUES ('pumpportal', ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET
+          last_slot = excluded.last_slot, last_signature = excluded.last_signature,
+          last_event_id = excluded.last_event_id, updated_at_utc = excluded.updated_at_utc
+          WHERE discovery_checkpoints.last_slot IS NULL OR excluded.last_slot >= discovery_checkpoints.last_slot`,
+        )
+        .run(input.slot, input.signature, input.eventId, utcNow());
+      this.#db
+        .prepare(
+          `UPDATE migration_recovery_jobs SET status = 'COMPLETE', resolved_slot = ?, error_code = NULL,
+          updated_at_utc = ? WHERE event_id = ? AND mint = ? AND signature = ?`,
+        )
+        .run(input.slot, utcNow(), input.eventId, input.mint, input.signature);
+      this.#enqueueMigrationAnalysis(input.eventId, input.mint);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishMigrationRecoveryJob(
+    eventId: string,
+    status: "FAILED" | "PENDING",
+    errorCode: string,
+    retryDelayMs = 0,
+  ): void {
+    const now = utcNow();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `UPDATE migration_recovery_jobs SET status = ?, error_code = ?, next_attempt_at_utc = ?, updated_at_utc = ?
+          WHERE event_id = ? AND status = 'PROCESSING'`,
+        )
+        .run(
+          status,
+          errorCode,
+          new Date(Date.now() + retryDelayMs).toISOString(),
+          now,
+          eventId,
+        );
+      if (status === "FAILED") {
+        const row = this.#db
+          .prepare(
+            "SELECT mint FROM migration_recovery_jobs WHERE event_id = ?",
+          )
+          .get(eventId) as SqlRow | undefined;
+        if (row) this.#enqueueMigrationAnalysis(eventId, String(row["mint"]));
+      }
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recoverInterruptedMigrationJobs(): number {
+    const result = this.#db
+      .prepare(
+        `UPDATE migration_recovery_jobs SET status = 'PENDING', updated_at_utc = ? WHERE status = 'PROCESSING'`,
+      )
+      .run(utcNow());
+    return Number(result.changes);
+  }
+
+  getMigrationRecoveryStatus(mint: string): Array<Record<string, unknown>> {
+    return this.#db
+      .prepare(
+        `SELECT j.event_id AS eventId, j.signature, e.provider_slot AS providerSlot, j.resolved_slot AS resolvedSlot,
+        j.status, j.attempts, j.error_code AS errorCode, j.updated_at_utc AS updatedAtUtc
+        FROM migration_recovery_jobs j JOIN market_events e ON e.id = j.event_id
+        WHERE j.mint = ? ORDER BY j.created_at_utc DESC LIMIT 20`,
+      )
+      .all(mint) as Array<Record<string, unknown>>;
+  }
+
+  #enqueueMigrationAnalysis(eventId: string, mint: string): void {
+    const row = this.#db
+      .prepare("SELECT received_at_utc FROM market_events WHERE id = ?")
+      .get(eventId) as SqlRow | undefined;
+    if (!row) return;
+    const at = String(row["received_at_utc"]);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO migration_analysis_jobs(event_id, mint, status, next_attempt_at_utc, created_at_utc, updated_at_utc)
+        VALUES (?, ?, 'PENDING', ?, ?, ?)`,
+      )
+      .run(eventId, mint, at, at, at);
+  }
+
+  recordProviderFrameDiagnostic(input: {
+    classification:
+      | "PROVIDER_ERROR"
+      | "PROVIDER_CONTROL"
+      | "UNSUPPORTED_FRAME"
+      | "MALFORMED_FRAME";
+    reasonCode: string;
+    sanitizedPayload: string;
+    observedAtUtc: string;
+  }): void {
+    const payload = input.sanitizedPayload.slice(0, 4096);
+    this.#db
+      .prepare(
+        `INSERT INTO provider_frame_diagnostics(provider, classification, reason_code, sanitized_payload, observed_at_utc)
+        VALUES ('pumpportal', ?, ?, ?, ?)`,
+      )
+      .run(
+        input.classification,
+        input.reasonCode.slice(0, 80),
+        payload,
+        input.observedAtUtc,
+      );
+  }
+
+  listProviderFrameDiagnostics(limit = 50): Array<Record<string, unknown>> {
+    const safeLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    return this.#db
+      .prepare(
+        `SELECT classification, reason_code AS reasonCode, sanitized_payload AS sanitizedPayload,
+        observed_at_utc AS observedAtUtc FROM provider_frame_diagnostics
+        ORDER BY observed_at_utc DESC, id DESC LIMIT ?`,
+      )
+      .all(safeLimit) as Array<Record<string, unknown>>;
+  }
+
+  getAnalysisOutcome(mint: string): Array<Record<string, unknown>> {
+    return this.#db
+      .prepare(
+        `SELECT * FROM (
+          SELECT j.event_id AS eventId, e.kind, j.status, j.attempts, j.updated_at_utc AS updatedAtUtc, j.created_at_utc AS createdAtUtc
+          FROM analysis_jobs j JOIN market_events e ON e.id = j.event_id WHERE j.mint = ?
+          UNION ALL
+          SELECT j.event_id AS eventId, e.kind, j.status, j.attempts, j.updated_at_utc AS updatedAtUtc, j.created_at_utc AS createdAtUtc
+          FROM migration_analysis_jobs j JOIN market_events e ON e.id = j.event_id WHERE j.mint = ?
+        ) ORDER BY createdAtUtc DESC LIMIT 20`,
+      )
+      .all(mint, mint) as Array<Record<string, unknown>>;
+  }
+
   finishEnrichmentJob(
     eventId: string,
     status: "COMPLETE" | "FAILED" | "DEFERRED_BUDGET" | "PENDING",
@@ -616,18 +890,25 @@ export class SentinelStore {
       const now = utcNow();
       const row = this.#db
         .prepare(
-          `SELECT event_id, mint, attempts FROM analysis_jobs
+          `SELECT event_id, mint, attempts, 'CREATE' AS job_type, created_at_utc FROM analysis_jobs
+          WHERE status = 'PENDING' AND next_attempt_at_utc <= ?
+          UNION ALL
+          SELECT event_id, mint, attempts, 'MIGRATION' AS job_type, created_at_utc FROM migration_analysis_jobs
           WHERE status = 'PENDING' AND next_attempt_at_utc <= ?
           ORDER BY created_at_utc LIMIT 1`,
         )
-        .get(now) as SqlRow | undefined;
+        .get(now, now) as SqlRow | undefined;
       if (!row) {
         this.#db.exec("COMMIT");
         return null;
       }
+      const table =
+        row["job_type"] === "MIGRATION"
+          ? "migration_analysis_jobs"
+          : "analysis_jobs";
       const changed = this.#db
         .prepare(
-          `UPDATE analysis_jobs SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
+          `UPDATE ${table} SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
           WHERE event_id = ? AND status = 'PENDING'`,
         )
         .run(now, String(row["event_id"]));
@@ -647,27 +928,34 @@ export class SentinelStore {
 
   finishAnalysisJob(eventId: string, retryDelayMs = 0): void {
     const now = utcNow();
-    this.#db
-      .prepare(
-        `UPDATE analysis_jobs SET status = ?, next_attempt_at_utc = ?, updated_at_utc = ?
-        WHERE event_id = ?`,
-      )
-      .run(
-        retryDelayMs > 0 ? "PENDING" : "COMPLETE",
-        new Date(Date.now() + retryDelayMs).toISOString(),
-        now,
-        eventId,
-      );
+    const args = [
+      retryDelayMs > 0 ? "PENDING" : "COMPLETE",
+      new Date(Date.now() + retryDelayMs).toISOString(),
+      now,
+      eventId,
+    ] as const;
+    for (const table of ["analysis_jobs", "migration_analysis_jobs"])
+      this.#db
+        .prepare(
+          `UPDATE ${table} SET status = ?, next_attempt_at_utc = ?, updated_at_utc = ?
+          WHERE event_id = ?`,
+        )
+        .run(...args);
   }
 
   recoverInterruptedAnalysisJobs(): number {
-    const result = this.#db
-      .prepare(
-        `UPDATE analysis_jobs SET status = 'PENDING', updated_at_utc = ?
-        WHERE status = 'PROCESSING'`,
-      )
-      .run(utcNow());
-    return Number(result.changes);
+    const now = utcNow();
+    let changed = 0;
+    for (const table of ["analysis_jobs", "migration_analysis_jobs"])
+      changed += Number(
+        this.#db
+          .prepare(
+            `UPDATE ${table} SET status = 'PENDING', updated_at_utc = ?
+            WHERE status = 'PROCESSING'`,
+          )
+          .run(now).changes,
+      );
+    return changed;
   }
 
   saveWalletTransaction(input: {
@@ -756,6 +1044,18 @@ export class SentinelStore {
         reasonCode: row["reason_code"],
       }),
     );
+  }
+
+  getVerifiedCreatorWallet(mint: string): string | null {
+    const row = this.#db
+      .prepare(
+        `SELECT wallet_pubkey FROM wallet_role_evidence
+        WHERE mint = ? AND role = 'CLAIMED_CREATOR' AND source = 'PUMP_IDL_CREATE_EVENT'
+          AND confidence_bps = 10000
+        ORDER BY slot ASC LIMIT 1`,
+      )
+      .get(mint) as SqlRow | undefined;
+    return row ? String(row["wallet_pubkey"]) : null;
   }
 
   saveCreatorLaunch(input: {
@@ -1397,7 +1697,7 @@ export class SentinelStore {
     maxDailyLossLamports: string;
     maxDrawdownBps: number;
     maxQuoteAgeMs: number;
-    emergencyStop: boolean;
+    pauseNewEntries: boolean;
   }): { status: "SIMULATED_FILLED" | "REJECTED"; reasonCode: string | null } {
     const quote = QuoteResultSchema.parse(input.quote);
     if (
@@ -1448,7 +1748,8 @@ export class SentinelStore {
         this.#db.exec("COMMIT");
         return { status: "REJECTED" as const, reasonCode };
       };
-      if (input.emergencyStop) return reject("PAPER_EMERGENCY_STOP");
+      if (input.pauseNewEntries && side === "BUY")
+        return reject("PAPER_NEW_ENTRIES_PAUSED");
       const storedQuoteRow = this.#db
         .prepare("SELECT quote_json FROM market_quotes WHERE id = ?")
         .get(quote.id) as SqlRow | undefined;
@@ -1457,10 +1758,7 @@ export class SentinelStore {
         String(storedQuoteRow["quote_json"]) !== JSON.stringify(quote)
       )
         return reject("PAPER_QUOTE_NOT_PERSISTED");
-      if (
-        (side === "BUY" && amount > BigInt(input.maxTradeInputRaw)) ||
-        (side === "SELL" && output + venueFee > BigInt(input.maxTradeInputRaw))
-      )
+      if (side === "BUY" && amount > BigInt(input.maxTradeInputRaw))
         return reject("PAPER_MAX_TRADE_EXCEEDED");
       if (
         quote.validationStatus !== "PASS" ||

@@ -43,6 +43,16 @@ Read-only Helius mainnet health, historical transaction, and account-state calls
 
 **Current status:** PAPER foundation tests exist, but application mode and automatic entries remain disabled. Milestone A has not passed because live PumpPortal trade observations and continuous stream coverage are unavailable. The isolated package is not yet readiness for live PAPER operation.
 
+## Sprint 3.1 — Runtime hardening and migration recovery
+
+- [x] Persist migration recovery and analysis jobs separately from token creation jobs; resolve missing slots by finalized transaction signature and verify signature, mint participation, transaction success, and provider-slot agreement before atomic persistence.
+- [x] Recover interrupted migration jobs after restart and produce a fail-closed report for migration-first discovery without inventing creator identity.
+- [x] Dispatch PumpPortal token events, provider errors, known controls, unsupported frames, and malformed frames separately; persist bounded sanitized diagnostics.
+- [x] Permit valid risk-reducing PAPER SELLs while new entries are paused; apply max trade size to BUY entries and enforce held-balance and quote checks atomically.
+- [x] Re-run local integration and CI-equivalent checks; live PumpPortal trade coverage remains blocked and PAPER mode stays disabled.
+
+**Status:** Safety defects are corrected and regression tests are added. Operational PAPER readiness remains blocked on Milestone A live trade observations and complete decision evidence.
+
 ## Sprint 2.5 — Intelligence and quote foundation (partial)
 
 - [x] Persist queried-wallet token balance outflows and identify repeated patterns without claiming fraud.

@@ -114,7 +114,7 @@ function config(
       maxDrawdownBps: 9000,
       maxPriceImpactBps: 300,
       maxSlippageBps: 200,
-      emergencyStop: false,
+      pauseNewEntries: false,
     },
     ...overrides,
   };
@@ -176,7 +176,7 @@ test("paper buy uses a quote after arrival, applies costs, and deduplicates fill
     assert.equal(result.fill?.["venueFeeRaw"], "10000");
     assert.equal(quoteProvider.calls[0]?.at, "2026-11-01T00:00:00.250Z");
     const state = store.getPaperPortfolioState("paper-wallet");
-    assert.equal(store.listAppliedMigrations().at(-1)?.version, 7);
+    assert.equal(store.listAppliedMigrations().at(-1)?.version, 8);
     assert.equal(state.solBalanceRaw, "999990000");
     assert.equal(state.positions[0]?.tokenAmountRaw, "99500");
     const quoteCount = quoteProvider.calls.length;
@@ -223,6 +223,164 @@ test("quote snapshots fetched during RPC are validated at quote-ready time", asy
     assert.equal(result.fill?.["arrivalAtUtc"], "2026-11-01T00:00:00.250Z");
     assert.equal(result.fill?.["snapshotAtUtc"], "2026-11-01T00:00:00.550Z");
     assert.equal(result.fill?.["filledAtUtc"], "2026-11-01T00:00:00.550Z");
+  });
+});
+
+test("BUY size limit does not reject larger profitable or losing SELL proceeds", async () => {
+  await withStore(async (store) => {
+    const base = config();
+    const risk = { ...base.risk, maxTradeInputRaw: "50000000" };
+    const clock = new TestClock();
+    const quotes = new TestQuotes();
+    const engine = new PaperTradingEngine({
+      repository: store,
+      quotes,
+      config: { ...base, risk },
+      clock,
+    });
+    engine.initializeWallet("paper-wallet", "1");
+    const buy = await engine.execute(
+      intent({ id: "sell-cap-buy", exactInputAmountRaw: "50000000" }),
+    );
+    assert.equal(buy.order.status, "SIMULATED_FILLED");
+
+    quotes.sellOutput = 100000000n;
+    const profitable = await engine.execute(
+      intent({
+        id: "sell-cap-profit",
+        side: "SELL",
+        exactInputAmountRaw: "99500",
+      }),
+    );
+    assert.equal(profitable.order.status, "SIMULATED_FILLED");
+    assert.equal(
+      store.getPaperPortfolioState("paper-wallet").positions.length,
+      0,
+    );
+    assert.ok(
+      BigInt(store.getPaperPortfolioState("paper-wallet").solBalanceRaw) >
+        1000000000n,
+    );
+  });
+
+  await withStore(async (store) => {
+    const base = config();
+    const clock = new TestClock();
+    const quotes = new TestQuotes();
+    const engine = new PaperTradingEngine({
+      repository: store,
+      quotes,
+      config: { ...base, risk: { ...base.risk, maxTradeInputRaw: "50000000" } },
+      clock,
+    });
+    engine.initializeWallet("paper-wallet", "1");
+    await engine.execute(
+      intent({ id: "sell-loss-buy", exactInputAmountRaw: "50000000" }),
+    );
+    quotes.sellOutput = 20000000n;
+    const losing = await engine.execute(
+      intent({
+        id: "sell-loss-exit",
+        side: "SELL",
+        exactInputAmountRaw: "99500",
+      }),
+    );
+    assert.equal(losing.order.status, "SIMULATED_FILLED");
+  });
+});
+
+test("partial SELL and SELL during entry pause remain risk reducing", async () => {
+  await withStore(async (store) => {
+    const clock = new TestClock();
+    const quotes = new TestQuotes();
+    const base = config();
+    const active = new PaperTradingEngine({
+      repository: store,
+      quotes,
+      config: base,
+      clock,
+    });
+    active.initializeWallet("paper-wallet", "1");
+    await active.execute(
+      intent({ id: "pause-buy", exactInputAmountRaw: "50000000" }),
+    );
+
+    store.recordPaperEquityMark(
+      "paper-wallet",
+      "2000000000",
+      0,
+      "2026-11-01T00:00:01.000Z",
+    );
+    store.recordPaperEquityMark(
+      "paper-wallet",
+      "1000000",
+      0,
+      "2026-11-01T00:00:02.000Z",
+    );
+    const paused = new PaperTradingEngine({
+      repository: store,
+      quotes,
+      config: {
+        ...base,
+        risk: { ...base.risk, pauseNewEntries: true, maxTradeInputRaw: "1" },
+      },
+      clock,
+    });
+    const stateBefore = store.getPaperPortfolioState("paper-wallet");
+    const partial = await paused.execute(
+      intent({
+        id: "pause-partial-sell",
+        side: "SELL",
+        exactInputAmountRaw: "40000",
+      }),
+    );
+    assert.equal(partial.order.status, "SIMULATED_FILLED");
+    assert.equal(
+      store.getPaperPortfolioState("paper-wallet").positions[0]?.tokenAmountRaw,
+      "59500",
+    );
+    assert.notEqual(
+      store.getPaperPortfolioState("paper-wallet").solBalanceRaw,
+      stateBefore.solBalanceRaw,
+    );
+
+    const buyCalls = quotes.calls.filter((call) => call.side === "BUY").length;
+    const blockedBuy = await paused.execute(
+      intent({ id: "pause-new-buy", exactInputAmountRaw: "1000000" }),
+    );
+    assert.equal(blockedBuy.order.status, "REJECTED");
+    assert.equal(blockedBuy.reasonCode, "PAPER_NEW_ENTRIES_PAUSED");
+    assert.equal(
+      quotes.calls.filter((call) => call.side === "BUY").length,
+      buyCalls,
+    );
+  });
+});
+
+test("SELL cannot exceed verified held tokens and rejection preserves balances", async () => {
+  await withStore(async (store) => {
+    const clock = new TestClock();
+    const quotes = new TestQuotes();
+    const engine = new PaperTradingEngine({
+      repository: store,
+      quotes,
+      config: config(),
+      clock,
+    });
+    engine.initializeWallet("paper-wallet", "1");
+    await engine.execute(intent({ id: "oversell-buy" }));
+    const before = store.getPaperPortfolioState("paper-wallet");
+    const result = await engine.execute(
+      intent({ id: "oversell", side: "SELL", exactInputAmountRaw: "99501" }),
+    );
+    assert.equal(result.order.status, "REJECTED");
+    assert.equal(result.reasonCode, "PAPER_INSUFFICIENT_TOKEN_BALANCE");
+    const after = store.getPaperPortfolioState("paper-wallet");
+    assert.equal(after.solBalanceRaw, before.solBalanceRaw);
+    assert.equal(
+      after.positions[0]?.tokenAmountRaw,
+      before.positions[0]?.tokenAmountRaw,
+    );
   });
 });
 

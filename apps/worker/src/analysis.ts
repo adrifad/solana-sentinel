@@ -163,12 +163,40 @@ export class TokenAnalysisScheduler {
       roleEvidence: [],
       walletProfiles: [],
       clusterWallets: new Set(),
-      asOfSlot: event.slot,
+      asOfSlot:
+        event.kind === "TOKEN_MIGRATED" &&
+        event.migrationRecoveryStatus !== "COMPLETE"
+          ? null
+          : event.slot,
       evidenceRefs: new Set([`market_event:${job.eventId}`]),
       errors: new Set(),
     };
 
-    if (!event.monitoringEligible) {
+    if (event.kind === "TOKEN_MIGRATED") {
+      if (event.migrationRecoveryStatus === "COMPLETE") {
+        evidence.evidenceRefs.add(`migration_recovery:${job.eventId}`);
+        const verifiedCreator = this.#store.getVerifiedCreatorWallet(job.mint);
+        if (!verifiedCreator) {
+          evidence.errors.add("MIGRATION_CREATION_EVIDENCE_UNAVAILABLE");
+        } else if (this.#helius && evidence.asOfSlot !== null) {
+          const reputation = await this.#refreshWalletHistory(
+            verifiedCreator,
+            evidence.asOfSlot,
+            evidence,
+            startedAt,
+          );
+          if (reputation) evidence.walletProfiles.push(reputation);
+          for (const linked of this.#store.listLinkedWallets(
+            verifiedCreator,
+            evidence.asOfSlot,
+          ))
+            evidence.clusterWallets.add(linked);
+        }
+      } else {
+        evidence.errors.add("MIGRATION_EVIDENCE_INCOMPLETE");
+        evidence.errors.add("MIGRATION_CREATION_EVIDENCE_UNAVAILABLE");
+      }
+    } else if (!event.monitoringEligible) {
       evidence.errors.add("TOKEN_OUTSIDE_MONITORING_BUDGET");
     } else if (this.#helius) {
       await this.#resolveLaunchRoles(event, evidence);
@@ -204,9 +232,9 @@ export class TokenAnalysisScheduler {
       ? await this.#securityReport(
           job.mint,
           evidence.verifiedCreateEvents.find((item) => item.mint === job.mint)
-            ?.creator ?? token.creator,
+            ?.creator ?? this.#store.getVerifiedCreatorWallet(job.mint),
           evidence.verifiedCreateEvents.find((item) => item.mint === job.mint)
-            ?.user ?? token.launchInitiator,
+            ?.user ?? null,
           token.name,
           token.symbol,
           token.uri,
@@ -234,7 +262,7 @@ export class TokenAnalysisScheduler {
 
     const primaryWallet =
       evidence.verifiedCreateEvents.find((item) => item.mint === job.mint)
-        ?.creator ?? token.creator;
+        ?.creator ?? this.#store.getVerifiedCreatorWallet(job.mint);
     const reputation = primaryWallet
       ? this.#store.getCreatorReputation(
           primaryWallet,
@@ -871,17 +899,7 @@ export class TokenAnalysisScheduler {
   }
 
   #persistTransaction(wallet: string, tx: WalletTransaction): void {
-    const fundingTransfers = extractDirectFundingTransfers(tx);
-    const summary = JSON.stringify({
-      signature: tx.signature,
-      slot: tx.slot,
-      blockTime: tx.blockTime,
-      succeeded: tx.succeeded,
-      feeLamportsRaw: String(tx.feeLamports),
-      signers: transactionSigners(tx).slice(0, 16),
-      fundingTransfers: fundingTransfers.slice(0, 16),
-      createEvents: decodePumpCreateEvents(tx.logMessages).slice(0, 8),
-    });
+    const summary = serializeWalletTransactionSummary(tx);
     this.#store.saveWalletTransaction({
       wallet,
       signature: tx.signature,
@@ -1336,6 +1354,28 @@ function providerError(error: unknown): HeliusErrorCode {
     : error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
       ? error.message
       : "PROVIDER_UNAVAILABLE";
+}
+
+export function serializeWalletTransactionSummary(
+  tx: WalletTransaction,
+): string {
+  const fundingTransfers = extractDirectFundingTransfers(tx);
+  const createEvents = decodePumpCreateEvents(tx.logMessages).map(
+    ({ timestampSeconds, ...event }) => ({
+      ...event,
+      timestampSeconds: timestampSeconds.toString(),
+    }),
+  );
+  return JSON.stringify({
+    signature: tx.signature,
+    slot: tx.slot,
+    blockTime: tx.blockTime,
+    succeeded: tx.succeeded,
+    feeLamportsRaw: String(tx.feeLamports),
+    signers: transactionSigners(tx).slice(0, 16),
+    fundingTransfers: fundingTransfers.slice(0, 16),
+    createEvents: createEvents.slice(0, 8),
+  });
 }
 
 function unique(values: Array<string | null>): string[] {

@@ -59,4 +59,6 @@ Migration `006-market-intelligence.sql` adds queried-wallet token outflow eviden
 
 Migration `007-paper-ledger.sql` adds isolated paper accounts, idempotent paper orders, atomic fills, double-entry journals, raw-amount positions, realized PnL, and portfolio equity/drawdown marks. Ledger updates and deletes are rejected by SQLite triggers. The schema exists for the standalone `@sentinel/paper` library; the application mode remains `DRY_RUN`, and the worker/API do not have a paper settlement path.
 
+Migration `008-runtime-hardening.sql` adds durable migration transaction recovery jobs and bounded provider-frame diagnostics. Existing migration events are queued for verification, and previously stored provider-reported migration slots are cleared until a successful finalized Helius transaction confirms the same signature, mint, and slot. Analysis is queued after recovery succeeds or reaches a terminal incomplete outcome, so migration-first discovery produces an auditable fail-closed report without inventing a creator. Provider diagnostics store only bounded sanitized frames and stable reason codes.
+
 ---

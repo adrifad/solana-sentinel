@@ -32,6 +32,8 @@ async function handleRequest(
       mode: options.mode,
       checkedAtUtc: utcNow(),
       completeness: options.store.getStreamCompleteness(),
+      providers: options.store.listProviderHealth(),
+      providerFrames: options.store.listProviderFrameDiagnostics(20),
     });
   }
   if (url.pathname === "/ready") {
@@ -79,6 +81,8 @@ async function handleRequest(
           roleEvidence: options.store.listWalletRoleEvidence(mint),
           securityReport: options.store.getLatestTokenRiskReport(mint),
           decisions: options.store.listRiskDecisions(mint),
+          analysisJobs: options.store.getAnalysisOutcome(mint),
+          migrationRecovery: options.store.getMigrationRecoveryStatus(mint),
         })
       : send(response, 404, { error: "NOT_FOUND" });
   }

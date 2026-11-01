@@ -36,7 +36,7 @@ export function paperExecutionConfigFromAppConfig(
       maxDrawdownBps: config.risk.max_drawdown_bps,
       maxPriceImpactBps: config.risk.max_price_impact_bps,
       maxSlippageBps: config.risk.max_slippage_bps,
-      emergencyStop: config.risk.emergency_pause,
+      pauseNewEntries: config.risk.emergency_pause,
     },
   };
 }
@@ -65,7 +65,7 @@ export type PaperRiskLimits = {
   maxDrawdownBps: number;
   maxPriceImpactBps: number;
   maxSlippageBps: number;
-  emergencyStop: boolean;
+  pauseNewEntries: boolean;
 };
 
 export type PaperExecutionConfig = {
@@ -124,7 +124,7 @@ export interface PaperRepository {
     maxDailyLossLamports: string;
     maxDrawdownBps: number;
     maxQuoteAgeMs: number;
-    emergencyStop: boolean;
+    pauseNewEntries: boolean;
   }): { status: "SIMULATED_FILLED" | "REJECTED"; reasonCode: string | null };
   getPaperPortfolioState(walletId: string): PaperPortfolioState;
   recordPaperEquityMark(
@@ -205,11 +205,13 @@ export class PaperTradingEngine {
         fill: this.#repository.getPaperFill(order.id),
         reasonCode: order.reasonCode,
       };
-    if (this.#config.risk.emergencyStop) {
+    // The legacy emergency_pause setting now pauses new exposure only.
+    // Risk-reducing SELL exits remain available and are checked atomically by storage.
+    if (this.#config.risk.pauseNewEntries && intent.side === "BUY") {
       this.#repository.rejectPaperOrder(
         order.id,
         "REJECTED",
-        "PAPER_EMERGENCY_STOP",
+        "PAPER_NEW_ENTRIES_PAUSED",
         new Date(this.#clock.now()).toISOString(),
       );
       return this.#result(order.id);

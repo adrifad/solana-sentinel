@@ -27,6 +27,9 @@
 - Jupiter quote-only returns no route and paper does not sign or call execute.
 - Subscriptions automatically unsubscribe after expiration/analysis cap.
 - SQLite crash/restart resumes without duplicate ledger writes.
+- Migration-first discovery persists a dedicated recovery job; verified signature/mint/success/slot updates are atomic, failed or conflicting transactions do not set `migration_slot`, and interrupted work is reclaimed after restart.
+- PumpPortal token, error, control, unsupported, and malformed frames are classified separately; diagnostics are bounded, sanitized, persisted, and visible through read-only health.
+- Pausing new entries rejects BUYs while valid SELL exits remain eligible, including proceeds above the BUY trade-size cap and after drawdown; held-token, quote, liquidity, and ledger checks still reject invalid exits.
 
 ## Security and mode separation tests
 

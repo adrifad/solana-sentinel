@@ -12,6 +12,12 @@ export type PumpPortalOptions = {
   enableNewTokens: boolean;
   enableMigrations: boolean;
   persistEvent?: (event: MarketEvent) => void;
+  onFrameDiagnostic?: (input: {
+    classification: PumpPortalDiagnosticClassification;
+    reasonCode: string;
+    sanitizedPayload: string;
+    observedAtUtc: string;
+  }) => void;
   onEvent: (event: MarketEvent) => Promise<void>;
   onHealth: (
     state: "STARTING" | "HEALTHY" | "DEGRADED" | "STOPPED",
@@ -31,6 +37,23 @@ export type PumpPortalOptions = {
   maxPendingEvents?: number;
   eventProcessingConcurrency?: number;
 };
+
+type PumpPortalDiagnosticClassification = Exclude<
+  PumpPortalFrameClassification["classification"],
+  "TOKEN_EVENT"
+>;
+
+export type PumpPortalFrameClassification =
+  | { classification: "TOKEN_EVENT"; event: MarketEvent }
+  | {
+      classification:
+        | "PROVIDER_ERROR"
+        | "PROVIDER_CONTROL"
+        | "UNSUPPORTED_FRAME"
+        | "MALFORMED_FRAME";
+      reasonCode: string;
+      sanitizedPayload: string;
+    };
 
 const SECRET_FIELD =
   /(?:api.?key|secret|password|private.?key|keypair|authorization|access.?token)/i;
@@ -85,6 +108,7 @@ export function parsePumpPortalMessage(
     if (field === "creator" || field === "traderPublicKey") return value;
     return value;
   };
+
   if (
     signature !== undefined &&
     (typeof signature !== "string" ||
@@ -148,12 +172,91 @@ export function parsePumpPortalMessage(
   return MarketEventSchema.parse(event);
 }
 
+export function classifyPumpPortalFrame(
+  input: unknown,
+  receivedAtMs = Date.now(),
+): PumpPortalFrameClassification {
+  const sanitizedPayload = JSON.stringify(sanitizePayload(input)).slice(
+    0,
+    4096,
+  );
+  const frame = (
+    classification: Exclude<
+      PumpPortalFrameClassification["classification"],
+      "TOKEN_EVENT"
+    >,
+    reasonCode: string,
+  ) =>
+    ({
+      classification,
+      reasonCode,
+      sanitizedPayload,
+    }) as PumpPortalFrameClassification;
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    return frame("MALFORMED_FRAME", "MALFORMED_FRAME_SHAPE");
+  const record = input as Record<string, unknown>;
+  if (Object.hasOwn(record, "errors") || Object.hasOwn(record, "error"))
+    return frame("PROVIDER_ERROR", "PUMPPORTAL_PROVIDER_ERROR");
+  if (Object.hasOwn(record, "message")) {
+    const message = record["message"];
+    if (typeof message !== "string" || message.length > 2048)
+      return frame("MALFORMED_FRAME", "MALFORMED_PROVIDER_MESSAGE");
+    const normalized = message.trim().toLowerCase();
+    if (
+      /error|failed|invalid|denied|limit|not authorized|insufficient/.test(
+        normalized,
+      )
+    )
+      return frame("PROVIDER_ERROR", "PUMPPORTAL_PROVIDER_MESSAGE_ERROR");
+    if (
+      /^(subscribed|unsubscribed|successfully subscribed|successfully unsubscribed)(\b|\s)/.test(
+        normalized,
+      )
+    )
+      return frame("PROVIDER_CONTROL", "PUMPPORTAL_SUBSCRIPTION_ACK");
+    return frame("PROVIDER_ERROR", "PUMPPORTAL_MESSAGE_UNRECOGNIZED");
+  }
+  const discriminator = [
+    record["txType"],
+    record["type"],
+    record["event"],
+  ].find((value): value is string => typeof value === "string");
+  if (typeof discriminator !== "string")
+    return frame("UNSUPPORTED_FRAME", "UNSUPPORTED_PUMPPORTAL_FRAME");
+  if (
+    ![
+      "create",
+      "token_created",
+      "migrate",
+      "migration",
+      "token_migrated",
+    ].includes(discriminator.trim().toLowerCase())
+  )
+    return frame("UNSUPPORTED_FRAME", "UNSUPPORTED_PUMPPORTAL_EVENT");
+  if (typeof record["mint"] !== "string")
+    return frame("MALFORMED_FRAME", "MALFORMED_PUMPPORTAL_EVENT");
+  try {
+    return {
+      classification: "TOKEN_EVENT",
+      event: parsePumpPortalMessage(input, receivedAtMs),
+    };
+  } catch {
+    return frame("MALFORMED_FRAME", "MALFORMED_PUMPPORTAL_EVENT");
+  }
+}
+
 function sanitizePayload(value: unknown, depth = 0): unknown {
   if (depth > 5) return "[DEPTH_LIMIT]";
   if (Array.isArray(value))
     return value.slice(0, 40).map((item) => sanitizePayload(item, depth + 1));
   if (!value || typeof value !== "object") {
-    if (typeof value === "string") return redactUrl(value.slice(0, 1024));
+    if (typeof value === "string")
+      return redactUrl(value.slice(0, 1024))
+        .replace(
+          /((?:api[-_ ]?key|authorization|access[-_ ]?token)\s*[:=]\s*)[^\s,;]+/gi,
+          "$1[REDACTED]",
+        )
+        .replace(/(bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]");
     if (
       typeof value === "number" ||
       typeof value === "boolean" ||
@@ -436,6 +539,12 @@ export class PumpPortalClient {
         try {
           parsed = JSON.parse(bytes.toString("utf8")) as unknown;
         } catch {
+          this.#recordFrameDiagnostic({
+            classification: "MALFORMED_FRAME",
+            reasonCode: "MALFORMED_PROVIDER_JSON",
+            sanitizedPayload: JSON.stringify({ byteLength: bytes.byteLength }),
+            observedAtUtc: new Date(receivedAt).toISOString(),
+          });
           this.#emitSessionHealth(
             session,
             "DEGRADED",
@@ -446,7 +555,24 @@ export class PumpPortalClient {
           return;
         }
         try {
-          const event = parsePumpPortalMessage(parsed, receivedAt);
+          const classified = classifyPumpPortalFrame(parsed, receivedAt);
+          if (classified.classification !== "TOKEN_EVENT") {
+            this.#recordFrameDiagnostic({
+              ...classified,
+              observedAtUtc: new Date(receivedAt).toISOString(),
+            });
+            if (classified.classification !== "PROVIDER_CONTROL") {
+              this.#emitSessionHealth(
+                session,
+                "DEGRADED",
+                this.#reconnectCount,
+                classified.reasonCode,
+                this.#lastEventAtUtc,
+              );
+            }
+            return;
+          }
+          const event = classified.event;
           this.#lastEventAtUtc = event.receivedAtUtc;
           try {
             this.#opts.persistEvent?.(event);
@@ -480,19 +606,21 @@ export class PumpPortalClient {
           }
           this.#eventQueue.push({ event, session });
           this.#drainEventQueue();
-        } catch (error) {
-          const code =
-            error instanceof Error &&
-            ["MALFORMED_EVENT", "UNSUPPORTED_EVENT_KIND"].includes(
-              error.message,
-            )
-              ? error.message
-              : "MALFORMED_EVENT";
+        } catch {
+          this.#recordFrameDiagnostic({
+            classification: "MALFORMED_FRAME",
+            reasonCode: "PUMPPORTAL_EVENT_PROCESSING_ERROR",
+            sanitizedPayload: JSON.stringify(sanitizePayload(parsed)).slice(
+              0,
+              4096,
+            ),
+            observedAtUtc: new Date(receivedAt).toISOString(),
+          });
           this.#emitSessionHealth(
             session,
             "DEGRADED",
             this.#reconnectCount,
-            code,
+            "MALFORMED_PUMPPORTAL_EVENT",
             this.#lastEventAtUtc,
           );
         }
@@ -510,6 +638,19 @@ export class PumpPortalClient {
       });
       socket.on("close", finish);
     });
+  }
+
+  #recordFrameDiagnostic(input: {
+    classification: PumpPortalDiagnosticClassification;
+    reasonCode: string;
+    sanitizedPayload: string;
+    observedAtUtc: string;
+  }): void {
+    try {
+      this.#opts.onFrameDiagnostic?.(input);
+    } catch {
+      // Diagnostic persistence must not throw across a provider socket callback.
+    }
   }
 
   get #queueDepth(): number {

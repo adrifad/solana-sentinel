@@ -164,12 +164,13 @@ test("persists unique events, preserves migration phase on out-of-order launch, 
       "MIGRATED_UNKNOWN_VENUE",
     );
     assert.equal(store.getToken(launch.mint)?.createdSlot, launch.slot);
-    assert.equal(store.getToken(launch.mint)?.migrationSlot, migrated.slot);
-    assert.equal(store.getDiscoveryCheckpoint()?.lastSlot, migrated.slot);
+    assert.equal(store.getToken(launch.mint)?.migrationSlot, null);
     assert.equal(
-      store.getToken(launch.mint)?.launchInitiator,
-      launch.launchInitiator,
+      store.getMigrationRecoveryStatus(launch.mint)[0]?.["status"],
+      "PENDING",
     );
+    assert.equal(store.getDiscoveryCheckpoint()?.lastSlot, launch.slot);
+    assert.equal(store.getToken(launch.mint)?.launchInitiator, null);
     assert.equal(store.getToken(launch.mint)?.eventCount, 2);
 
     const secondMint = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -241,7 +242,7 @@ test("applies the mint-state migration to an existing version-one database", asy
   }
 });
 
-test("migration 003 repairs legacy creation slots from event kind and retains migration slots", async () => {
+test("migration 008 clears unverified provider migration slots and queues signature recovery", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sentinel-slot-repair-"));
   const dbPath = join(dir, "legacy-v2.db");
   const legacy = new DatabaseSync(dbPath);
@@ -313,7 +314,11 @@ test("migration 003 repairs legacy creation slots from event kind and retains mi
   try {
     const token = store.getToken("So11111111111111111111111111111111111111112");
     assert.equal(token?.createdSlot, parsePumpPortalMessage(created).slot);
-    assert.equal(token?.migrationSlot, parsePumpPortalMessage(migration).slot);
+    assert.equal(token?.migrationSlot, null);
+    assert.equal(
+      store.getMigrationRecoveryStatus(token!.mint)[0]?.["status"],
+      "PENDING",
+    );
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

@@ -11,7 +11,10 @@ import type { HeliusRpcClient } from "@sentinel/providers";
 import type { WalletTransaction } from "@sentinel/providers";
 import { LEGACY_TOKEN_PROGRAM_ID } from "@sentinel/security";
 import { SentinelStore } from "@sentinel/storage";
-import { TokenAnalysisScheduler } from "../apps/worker/src/analysis.ts";
+import {
+  serializeWalletTransactionSummary,
+  TokenAnalysisScheduler,
+} from "../apps/worker/src/analysis.ts";
 
 const fixture = JSON.parse(
   await readFile("tests/fixtures/pumpportal-created.synthetic.json", "utf8"),
@@ -69,7 +72,11 @@ function createEventLogs(input: {
     Buffer.alloc(32, 4),
     Buffer.from(base58Decode(input.user)),
     Buffer.from(base58Decode(input.creator)),
-    Buffer.alloc(8),
+    (() => {
+      const timestamp = Buffer.alloc(8);
+      timestamp.writeBigInt64LE(1_800_000_000n);
+      return timestamp;
+    })(),
   ]);
   const program = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
   return [
@@ -78,6 +85,28 @@ function createEventLogs(input: {
     `Program ${program} success`,
   ];
 }
+
+test("historical transaction summaries serialize Pump event bigint timestamps safely", () => {
+  const mint = base58Encode(Buffer.alloc(32, 1));
+  const user = base58Encode(Buffer.alloc(32, 2));
+  const creator = base58Encode(Buffer.alloc(32, 3));
+  const summary = serializeWalletTransactionSummary({
+    signature: "1".repeat(64),
+    slot: 100,
+    blockTime: 1_800_000_000,
+    succeeded: true,
+    feeLamports: 5000,
+    accountKeys: [],
+    instructions: [],
+    logMessages: createEventLogs({ mint, user, creator }),
+    preBalances: [],
+    postBalances: [],
+  });
+  const parsed = JSON.parse(summary) as {
+    createEvents: Array<{ timestampSeconds: string }>;
+  };
+  assert.equal(parsed.createEvents[0]?.timestampSeconds, "1800000000");
+});
 
 test("detected launch gets persistent fail-closed reports without Helius credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "sentinel-analysis-"));
@@ -133,6 +162,56 @@ test("detected launch gets persistent fail-closed reports without Helius credent
       true,
     );
     assert.equal(decision?.status, "QUARANTINE");
+  } finally {
+    await scheduler.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("migration-first discovery persists an incomplete security report and quarantines without creator evidence", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "sentinel-migration-analysis-"),
+  );
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  const config = await loadConfig({});
+  const scheduler = new TokenAnalysisScheduler({
+    store,
+    helius: undefined,
+    config: config.config,
+    configVersion: config.configVersion,
+    concurrency: 1,
+  });
+  try {
+    const event = parsePumpPortalMessage({
+      txType: "migrate",
+      mint: "So11111111111111111111111111111111111111112",
+    });
+    store.ingestEvent(event, 10, false);
+    const claimed = store.claimMigrationRecoveryJob();
+    assert.equal(claimed?.eventId, event.id);
+    store.finishMigrationRecoveryJob(
+      event.id,
+      "FAILED",
+      "MIGRATION_SIGNATURE_MISSING",
+    );
+    scheduler.start();
+    await waitForDecision(store, event.mint);
+    const report = store.getLatestTokenRiskReport(event.mint);
+    const decision = store.listRiskDecisions(event.mint)[0];
+    assert.ok(report);
+    assert.equal(report.status === "UNSAFE", false);
+    assert.equal(decision?.status, "QUARANTINE");
+    assert.equal(
+      decision?.reasonCodes.includes("MIGRATION_CREATION_EVIDENCE_UNAVAILABLE"),
+      true,
+    );
+    assert.equal(store.getToken(event.mint)?.creator, null);
+    assert.equal(
+      store.getAnalysisOutcome(event.mint)[0]?.["status"],
+      "COMPLETE",
+    );
   } finally {
     await scheduler.stop();
     store.close();

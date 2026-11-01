@@ -88,14 +88,12 @@ async function main(): Promise<void> {
     errorCode: heliusError,
   });
 
-  const enrichment = helius
-    ? new EnrichmentScheduler(
-        store,
-        helius,
-        loaded.config.providers.helius.max_concurrent_enrichments,
-      )
-    : undefined;
-  enrichment?.start();
+  const enrichment = new EnrichmentScheduler(
+    store,
+    helius,
+    loaded.config.providers.helius.max_concurrent_enrichments,
+  );
+  enrichment.start();
 
   const jupiter =
     loaded.config.providers.jupiter.enabled && loaded.jupiterApiKey
@@ -132,6 +130,19 @@ async function main(): Promise<void> {
     eventProcessingConcurrency:
       loaded.config.providers.pumpportal.event_processing_concurrency,
     maxPendingEvents: loaded.config.providers.pumpportal.max_pending_events,
+    onFrameDiagnostic(input) {
+      store.recordProviderFrameDiagnostic(input);
+      if (input.classification !== "PROVIDER_CONTROL")
+        store.recordProviderIssue("pumpportal", input.reasonCode);
+      log(
+        input.classification === "PROVIDER_CONTROL" ? "info" : "warn",
+        "provider.pumpportal.frame",
+        {
+          classification: input.classification,
+          reasonCode: input.reasonCode,
+        },
+      );
+    },
     onHealth(
       state,
       reconnectCount,
@@ -196,7 +207,7 @@ async function main(): Promise<void> {
         } catch (error) {
           pumpStopError = error;
         }
-        await enrichment?.stop();
+        await enrichment.stop();
         await analysis.stop();
         if (pumpStopError) throw pumpStopError;
       } finally {

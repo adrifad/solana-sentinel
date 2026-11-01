@@ -7,6 +7,7 @@ import test from "node:test";
 import { isSolanaPubkey } from "@sentinel/domain";
 import {
   HeliusRpcClient,
+  classifyPumpPortalFrame,
   parsePumpPortalMessage,
   PumpPortalClient,
   pumpPortalHealth,
@@ -41,6 +42,236 @@ test("Helius request budget rejects before network access", async () => {
     /REQUEST_BUDGET_EXHAUSTED/,
   );
   assert.equal(fetchCount, 0);
+});
+
+test("PumpPortal frame classes persist bounded sanitized provider errors", async () => {
+  const event = classifyPumpPortalFrame({
+    txType: "create",
+    mint: "So11111111111111111111111111111111111111112",
+  });
+  assert.equal(event.classification, "TOKEN_EVENT");
+  assert.equal(
+    classifyPumpPortalFrame({ errors: [{ code: "RATE_LIMIT" }] })
+      .classification,
+    "PROVIDER_ERROR",
+  );
+  assert.equal(
+    classifyPumpPortalFrame({
+      message: "Successfully subscribed to migrations",
+    }).classification,
+    "PROVIDER_CONTROL",
+  );
+  const unknownMessage = classifyPumpPortalFrame({
+    message: "unknown response",
+  });
+  assert.equal(unknownMessage.classification, "PROVIDER_ERROR");
+  assert.equal(
+    classifyPumpPortalFrame({ type: "new-protocol-frame" }).classification,
+    "UNSUPPORTED_FRAME",
+  );
+  assert.equal(
+    classifyPumpPortalFrame({ txType: "create", mint: "not-a-mint" })
+      .classification,
+    "MALFORMED_FRAME",
+  );
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-provider-frame-"));
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  try {
+    const errorFrame = classifyPumpPortalFrame({
+      errors: [{ code: "RATE_LIMIT", apiKey: "never-store-this" }],
+    });
+    assert.equal(errorFrame.classification, "PROVIDER_ERROR");
+    store.recordProviderFrameDiagnostic({
+      ...errorFrame,
+      observedAtUtc: "2026-11-01T00:00:00.000Z",
+    });
+    const persisted = store.listProviderFrameDiagnostics()[0];
+    assert.equal(persisted?.["classification"], "PROVIDER_ERROR");
+    assert.equal(
+      String(persisted?.["sanitizedPayload"]).includes("never-store-this"),
+      false,
+    );
+    assert.equal(
+      String(persisted?.["sanitizedPayload"]).includes("[REDACTED]"),
+      true,
+    );
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("migration-first events resolve by signature and enqueue analysis without inventing a creator", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "sentinel-migration-recovery-"),
+  );
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  const signature = "1".repeat(64);
+  const event = parsePumpPortalMessage({
+    txType: "migrate",
+    mint: "So11111111111111111111111111111111111111112",
+    signature,
+    traderPublicKey: "11111111111111111111111111111111",
+  });
+  store.ingestEvent(event, 10, true);
+  const helius = {
+    getTransaction: async (requested: string) => ({
+      signature: requested,
+      slot: 464027585,
+      blockTime: 1793522301,
+      succeeded: true,
+      feeLamports: 5000,
+      accountKeys: [{ pubkey: event.mint, signer: false, writable: true }],
+      instructions: [],
+      logMessages: [],
+      preBalances: [],
+      postBalances: [],
+    }),
+  } as unknown as HeliusRpcClient;
+  const scheduler = new EnrichmentScheduler(store, helius, 1);
+  const pause = (ms: number) =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+  try {
+    assert.equal(store.getToken(event.mint)?.migrationSlot, null);
+    assert.equal(store.claimAnalysisJob(), null);
+    scheduler.start();
+    for (
+      let attempt = 0;
+      attempt < 200 &&
+      store.getMigrationRecoveryStatus(event.mint)[0]?.["status"] !==
+        "COMPLETE";
+      attempt += 1
+    )
+      await pause(10);
+    assert.equal(
+      store.getMigrationRecoveryStatus(event.mint)[0]?.["status"],
+      "COMPLETE",
+    );
+    assert.equal(store.getToken(event.mint)?.migrationSlot, 464027585);
+    assert.equal(
+      store.getToken(event.mint)?.marketPhase,
+      "MIGRATED_UNKNOWN_VENUE",
+    );
+    assert.equal(store.getToken(event.mint)?.creator, null);
+    assert.equal(store.getToken(event.mint)?.launchInitiator, null);
+    assert.equal(store.getMarketEventSummary(event.id)?.slot, 464027585);
+    assert.equal(store.getDiscoveryCheckpoint()?.lastSlot, 464027585);
+    assert.equal(store.claimAnalysisJob()?.eventId, event.id);
+  } finally {
+    await scheduler.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("interrupted migration recovery jobs are reclaimed after restart", async () => {
+  const directory = await mkdtemp(
+    join(tmpdir(), "sentinel-migration-restart-"),
+  );
+  const dbPath = join(directory, "sentinel.db");
+  let store = new SentinelStore(dbPath);
+  await store.open();
+  const event = parsePumpPortalMessage({
+    txType: "migrate",
+    mint: "So11111111111111111111111111111111111111112",
+    signature: "1".repeat(64),
+  });
+  store.ingestEvent(event, 10, true);
+  assert.equal(store.claimMigrationRecoveryJob()?.eventId, event.id);
+  store.close();
+  store = new SentinelStore(dbPath);
+  await store.open();
+  try {
+    assert.equal(store.recoverInterruptedMigrationJobs(), 1);
+    assert.equal(store.claimMigrationRecoveryJob()?.eventId, event.id);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("migration recovery rejects failed transactions, mismatched slots, and unrelated mints", async () => {
+  const cases = [
+    {
+      name: "failed",
+      providerSlot: undefined,
+      txSlot: 100,
+      succeeded: false,
+      txMint: "So11111111111111111111111111111111111111112",
+      reason: "MIGRATION_TRANSACTION_FAILED",
+    },
+    {
+      name: "slot",
+      providerSlot: 99,
+      txSlot: 100,
+      succeeded: true,
+      txMint: "So11111111111111111111111111111111111111112",
+      reason: "MIGRATION_SLOT_MISMATCH",
+    },
+    {
+      name: "mint",
+      providerSlot: undefined,
+      txSlot: 100,
+      succeeded: true,
+      txMint: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      reason: "MIGRATION_MINT_NOT_IN_TRANSACTION",
+    },
+  ] as const;
+  for (const [index, item] of cases.entries()) {
+    const directory = await mkdtemp(
+      join(tmpdir(), `sentinel-migration-${item.name}-`),
+    );
+    const store = new SentinelStore(join(directory, "sentinel.db"));
+    await store.open();
+    const event = parsePumpPortalMessage({
+      txType: "migrate",
+      mint: "So11111111111111111111111111111111111111112",
+      signature: "1".repeat(64),
+      ...(item.providerSlot === undefined ? {} : { slot: item.providerSlot }),
+    });
+    store.ingestEvent(event, 10, true);
+    const helius = {
+      getTransaction: async (signature: string) => ({
+        signature,
+        slot: item.txSlot,
+        blockTime: null,
+        succeeded: item.succeeded,
+        feeLamports: 5000,
+        accountKeys: [{ pubkey: item.txMint, signer: false, writable: true }],
+        instructions: [],
+        logMessages: [],
+        preBalances: [],
+        postBalances: [],
+      }),
+    } as unknown as HeliusRpcClient;
+    const scheduler = new EnrichmentScheduler(store, helius, 1);
+    try {
+      scheduler.start();
+      for (
+        let attempt = 0;
+        attempt < 200 &&
+        store.getMigrationRecoveryStatus(event.mint)[0]?.["status"] !==
+          "FAILED";
+        attempt += 1
+      )
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      const outcome = store.getMigrationRecoveryStatus(event.mint)[0];
+      assert.equal(
+        outcome?.["status"],
+        "FAILED",
+        `case ${index}: ${item.name}`,
+      );
+      assert.equal(outcome?.["errorCode"], item.reason);
+      assert.equal(store.getToken(event.mint)?.migrationSlot, null);
+      assert.equal(store.claimAnalysisJob()?.eventId, event.id);
+    } finally {
+      await scheduler.stop();
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 test("provider health distinguishes a socket from a protocol failure and exposes lag", () => {
