@@ -157,6 +157,15 @@ test("Pump CreateEvent separates creator from launch initiator and fee payer", (
 
 test("risk decision cannot be BUY_ELIGIBLE with unknown security or incomplete history", () => {
   const now = Date.parse("2026-11-01T00:00:00.000Z");
+  const validatedExit = {
+    status: "PASS" as const,
+    buyQuoteId: "buy-quote",
+    sellQuoteId: "sell-quote",
+    requiredSellAmountRaw: "100",
+    expectedExitAmountRaw: "95",
+    reasonCodes: ["BUY_AND_SELL_QUOTES_VALIDATED"],
+    evidenceRefs: ["quote:buy", "quote:sell"],
+  };
   const security: TokenRiskReport = {
     id: "security-1",
     mint: base58Encode(Buffer.alloc(32, 3)),
@@ -199,7 +208,7 @@ test("risk decision cannot be BUY_ELIGIBLE with unknown security or incomplete h
     security: { ...security, status: "MISSING" },
     creator,
     marketPhase: "PUMP_CURVE",
-    exitValidation: "PASS",
+    exitValidation: validatedExit,
     startedAtMs: now,
     nowMs: now,
   });
@@ -209,4 +218,57 @@ test("risk decision cannot be BUY_ELIGIBLE with unknown security or incomplete h
     true,
   );
   assert.equal(decision.reasonCodes.includes("TOKEN_SECURITY_MISSING"), true);
+  const completeCreator = {
+    ...creator,
+    historyComplete: true,
+    freshUntilUtc: new Date(now + 60000).toISOString(),
+  };
+  const behavior = {
+    id: "behavior-1",
+    mint: security.mint,
+    windowSeconds: 30 as const,
+    windowStartedAtUtc: new Date(now - 30000).toISOString(),
+    observedAtUtc: new Date(now).toISOString(),
+    throughSlot: 10,
+    buyCount: 3,
+    sellCount: 0,
+    uniqueBuyers: 3,
+    independentBuyerEstimate: 3,
+    creatorAssociatedBuys: 0,
+    repeatedWalletTransactions: 0,
+    largestWalletVolumeBps: 4000,
+    volumeBuyRaw: "300",
+    volumeSellRaw: "0",
+    marketPhase: "PUMP_CURVE" as const,
+    classification: "ORGANIC_CANDIDATE" as const,
+    reasonCodes: ["INDEPENDENT_BUYER_THRESHOLD_MET"],
+    confidenceBps: 5750,
+    complete: true,
+    gapReason: null,
+    evidenceRefs: ["behavior:1"],
+  };
+  const coverageDecision = evaluateRiskDecision({
+    mint: security.mint,
+    configVersion: "b".repeat(64),
+    security: {
+      ...security,
+      holderSampleCoverageBps: 9500,
+      holderSampleValidated: true,
+    },
+    creator: completeCreator,
+    launchBehavior: behavior,
+    minimumIndependentBuyers: 3,
+    marketPhase: "PUMP_CURVE",
+    exitValidation: validatedExit,
+    minimumHolderSampleCoverageBps: 9000,
+    startedAtMs: now,
+    nowMs: now,
+  });
+  assert.equal(coverageDecision.status, "BUY_ELIGIBLE");
+  assert.equal(
+    coverageDecision.reasonCodes.includes(
+      "VALIDATED_HOLDER_SAMPLE_COVERAGE_POLICY_PASSED",
+    ),
+    true,
+  );
 });

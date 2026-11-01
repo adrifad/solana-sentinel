@@ -15,6 +15,9 @@ providers:
     enable_token_trades: false
     max_monitored_tokens: 20
     max_trade_events_per_day: 5000
+    max_active_trade_subscriptions: 20
+    observation_window_seconds: 60
+    monitoring_duration_seconds: 120
     event_processing_concurrency: 4
     max_pending_events: 128
   dexscreener:
@@ -22,6 +25,10 @@ providers:
     requests_per_second: 2
   jupiter:
     enabled: false
+    request_timeout_ms: 3000
+    max_requests_per_second: 1
+    max_requests_per_utc_day: 500
+    max_quote_age_ms: 1500
 
 analysis:
   concurrent_token_analysis: 6
@@ -33,6 +40,8 @@ analysis:
   suspicious_launch_window_seconds: 3600
   max_analysis_ms: 10000
   token_observation_seconds: 60
+  min_independent_buyers: 3
+  min_holder_sample_coverage_bps: 9000
   social_enabled: false
 
 security:

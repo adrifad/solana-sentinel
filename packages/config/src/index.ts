@@ -40,6 +40,13 @@ export const AppConfigSchema = z
             enable_token_trades: z.literal(false),
             max_monitored_tokens: positiveInt,
             max_trade_events_per_day: positiveInt,
+            max_active_trade_subscriptions: z.number().int().min(1).max(5000),
+            observation_window_seconds: z.union([
+              z.literal(30),
+              z.literal(60),
+              z.literal(120),
+            ]),
+            monitoring_duration_seconds: positiveInt,
             event_processing_concurrency: z.number().int().min(1).max(32),
             max_pending_events: z.number().int().min(1).max(10000),
           })
@@ -47,7 +54,15 @@ export const AppConfigSchema = z
         dexscreener: z
           .object({ enabled: z.boolean(), requests_per_second: positiveInt })
           .strict(),
-        jupiter: z.object({ enabled: z.literal(false) }).strict(),
+        jupiter: z
+          .object({
+            enabled: z.boolean(),
+            request_timeout_ms: z.number().int().min(100).max(30000),
+            max_requests_per_second: z.number().int().min(1).max(100),
+            max_requests_per_utc_day: positiveInt,
+            max_quote_age_ms: z.number().int().min(100).max(60000),
+          })
+          .strict(),
       })
       .strict(),
     analysis: z
@@ -61,6 +76,8 @@ export const AppConfigSchema = z
         suspicious_launch_window_seconds: positiveInt,
         max_analysis_ms: positiveInt,
         token_observation_seconds: positiveInt,
+        min_independent_buyers: z.number().int().nonnegative(),
+        min_holder_sample_coverage_bps: z.number().int().min(0).max(10000),
         social_enabled: z.boolean(),
       })
       .strict(),
@@ -135,6 +152,7 @@ export type RuntimeEnvironment = {
   DB_PATH?: string;
   PUMPPORTAL_API_KEY?: string;
   HELIUS_API_KEY?: string;
+  JUPITER_API_KEY?: string;
   API_HOST?: string;
   API_PORT?: string;
 };
@@ -146,6 +164,7 @@ export type LoadedConfig = {
   dbPath: string;
   pumpPortalApiKey: string | undefined;
   heliusApiKey: string | undefined;
+  jupiterApiKey: string | undefined;
   apiHost: string;
   apiPort: number;
 };
@@ -174,6 +193,7 @@ export async function loadConfig(
     dbPath,
     pumpPortalApiKey: env.PUMPPORTAL_API_KEY || undefined,
     heliusApiKey: env.HELIUS_API_KEY || undefined,
+    jupiterApiKey: env.JUPITER_API_KEY || undefined,
     apiHost: env.API_HOST ?? "127.0.0.1",
     apiPort: port,
   };

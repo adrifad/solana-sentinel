@@ -38,6 +38,18 @@
 
 **Done when:** 100 fixture scenarios pass; no paper trade changes chain balances.
 
+## Sprint 2.5 — Intelligence and quote foundation (partial)
+
+- [x] Persist queried-wallet token balance outflows and identify repeated patterns without claiming fraud.
+- [x] Add normalized launch behavior contracts/analyzer with as-of filtering, independent buyer estimates, explicit completeness and unknown outcomes.
+- [x] Add exact-in quote contracts, persistent quote records, a quote-only Jupiter adapter with request pacing/budgets, and Pump official SDK bonding-curve calculations for caller-supplied verified state.
+- [x] Add explicit validated-holder-sample coverage policy while keeping exhaustive holder completeness false.
+- [ ] Validate PumpPortal trade message schema and wire the metered stream manager, expiry, budget and reconnection lifecycle.
+- [ ] Wire a budgeted Helius state loader for Pump bonding curves, implement PumpSwap pool/vault state quotes, and validate both against on-chain snapshots.
+- [ ] Run a complete token-to-behavior-to-buy/sell-quote pipeline with fresh live provider snapshots; current environment has no Helius, PumpPortal, or Jupiter credentials.
+
+**Status:** foundation contracts and isolated quote calculations are implemented, but acceptance is not met; no live quote or `BUY_ELIGIBLE` result is claimed. Do not start PAPER until the remaining quote/state and streaming items pass.
+
 ## Sprint 4 — Dashboard + operations
 
 - [ ] REST/SSE API, overview, tokens, creator detail, decisions, paper portfolio.

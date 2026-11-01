@@ -6,6 +6,7 @@
 - Subscribe: `subscribeNewToken`, `subscribeMigration`, `subscribeTokenTrade`, `subscribeAccountTrade`.
 - **One socket** and dynamically update subscriptions; do not open a connection per mint.
 - Creation/migration streaming is listed as free; trade/account streams are metered and may require linked wallet funding. Check provider pricing and enforce monthly event budgets.
+- Official provider guidance currently prices trade streams at 0.01 SOL per 10,000 received events and says the linked wallet must have at least 0.02 SOL. This runtime keeps `enable_token_trades: false`; it has no validated trade-payload adapter, metered subscription lifecycle, or raw event budget enforcement yet.
 - Security note: PumpPortal **Lightning API key may control its linked wallet**. Even for read-only data, treat it as a signing-capable secret; never fund that wallet with trading capital for MVP.
 - Parse and validate event signatures, blockchain slot, mint, creator, tx type and amounts. Store unknown fields in redacted raw record for forward compatibility.
 - On reconnect: use jittered exponential backoff and restore subscriptions. Each interruption is persisted as an unreconciled gap; a Helius missed-launch reconciler is not yet implemented. At-most-once receipt is not guaranteed.
@@ -26,17 +27,19 @@
 - **Not authoritative at launch:** new Pump.fun tokens may not be indexed immediately; missing pair is NOT automatically a scam. Do not use DEX Screener alone for Pump curve pricing.
 - Cache endpoint responses with short TTL; never use an old price to claim a live fill.
 
-## Jupiter Swap V2 — routing and eventual live trading
+## Jupiter Swap V2 — read-only quote and eventual live trading
 
 - API base: `https://api.jup.ag/swap/v2`; documented `GET /order` and `POST /execute`.
-- Jupiter `/order` can return quote-only without `taker`, but route absence or no buildable tx must be interpreted carefully.
+- The implemented adapter calls only `GET /order` without `taker`, validates the documented quote fields, rejects any response carrying a transaction, and never calls `/execute`. It is opt-in with `providers.jupiter.enabled`, `JUPITER_API_KEY`, request pacing, timeout, and a persistent UTC-day request cap.
+- The current `/order` contract does not provide a verified Solana snapshot slot in the contract used here; quote results preserve that as unknown. Missing impact data, state slot, or freshness prevents exit validation from passing. Jupiter quotes are therefore evidence, not a BUY authorization.
 - **Paper:** only quote path; no transaction signing and never call `/execute`.
 - **Live:** only inside isolated live-executor; validate mint, route, min-out, fees, expiry and transaction before signing; reconcile signature on-chain.
 - New Pump curve tokens may not have an immediately available Jupiter route; use official Pump SDK math / verified on-chain state rather than inventing a price.
 
 ## Pump.fun and PumpSwap official SDKs
 
-- Use `@pump-fun/pump-sdk` and `@pump-fun/pump-swap-sdk` for supported market-state and trade/quote math when available.
+- Pinned read-only quote calculation dependency: `@pump-fun/pump-sdk@4.1.0`. `PumpCurveQuoteEngine` uses its current v3 exact-input buy and sell math when supplied a validated, slot-stamped curve/global/fee snapshot. State acquisition is not yet wired to Helius, and completed curves are explicitly unsupported.
+- `@pump-fun/pump-swap-sdk@2.1.0` is pinned for current protocol documentation alignment, but PumpSwap account/vault state decoding and quote calculation are not yet wired. Migrated tokens remain unsupported by the worker.
 - Pin versions only after checking official latest docs/IDL against supported programs; do not copy old constant-product formulas blindly. Pump protocol introduced v3 trades and v2 PumpSwap, multi-hop and negative virtual reserve handling in 2026.
 - Treat migration as a state transition and invalidate old quote snapshots. Quote output includes fee assumptions and provenance; avoid double-charging fees.
 
@@ -53,6 +56,6 @@
 
 ## Provider cost controls
 
-Set `max_monitored_tokens`, `max_trades_stream_events_per_day`, per-provider rate limits, budget alert threshold, and adaptive unsubscribe policy. Track overages; stop costly subscriptions safely when reaching budget.
+Set `max_monitored_tokens`, per-provider request rates and UTC-day caps. The metered PumpPortal token-trade feature remains hard-disabled in schema until event decoding, subscription lifecycle, and persistent event-budget enforcement are available.
 
 ---

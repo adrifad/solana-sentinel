@@ -40,7 +40,9 @@ Token program semantics vary: a standard Pump.fun token and a custom Token-2022 
 
 The current worker persists `SUPPORTED`, `UNSUPPORTED`, `MISSING`, or `UNSAFE` mint/security reports and `REJECT`, `QUARANTINE`, `WATCH`, or `BUY_ELIGIBLE` decisions with evidence references, config hash, timestamps, and analysis latency. The SPL base mint layout and a conservative Token-2022 TLV parser are implemented. Unknown/malformed extensions fail closed; active mint/freeze authorities are classified unsafe. Holder concentration is sampled and explicitly incomplete. Test-token metadata patterns are persisted with a separate heuristic confidence.
 
-The current pipeline cannot produce `BUY_ELIGIBLE`: full holder coverage and a current executable sell/exit validation are unavailable, and the exit check remains `UNKNOWN`. No order is submitted and no virtual portfolio is changed. A successful mint decode by itself does not imply the full security gate passed.
+Holder completeness remains `false`; the scanner never treats a sample as exhaustive. Reports separately expose the count, validated status, and share of total supply covered by the validated largest-account sample. The explicit `analysis.min_holder_sample_coverage_bps` default is 9000 (90% of supply); a sample only satisfies this policy when every selected holder account is decoded and matches its indexed amount. This is a conservative policy threshold, not an empirically calibrated safety guarantee.
+
+The current worker still cannot produce `BUY_ELIGIBLE`: Jupiter quote-only results have no verified chain snapshot slot and no guaranteed price-impact field, Pump curve state acquisition is not wired, and PumpSwap quotes are unsupported. Exit validation remains `UNKNOWN` or fails closed. No order is submitted and no virtual portfolio is changed. A successful mint decode or a high sample-coverage value by itself does not imply the full security gate passed.
 
 ## Opportunity score (only after hard gate)
 

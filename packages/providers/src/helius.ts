@@ -71,6 +71,18 @@ const ParsedInstruction = z
     parsed: z.unknown().optional(),
   })
   .passthrough();
+const TokenBalance = z
+  .object({
+    accountIndex: z.number().int().nonnegative(),
+    mint: PubkeySchema,
+    owner: PubkeySchema.optional(),
+    programId: PubkeySchema.optional(),
+    uiTokenAmount: z.object({
+      amount: z.string().regex(/^\d+$/),
+      decimals: z.number().int().min(0).max(255),
+    }),
+  })
+  .passthrough();
 const TransactionResult = z
   .object({
     slot: z.number().int().nonnegative().safe(),
@@ -93,6 +105,8 @@ const TransactionResult = z
         logMessages: z.array(z.string()).nullable().optional(),
         preBalances: z.array(z.number().int().nonnegative().safe()).optional(),
         postBalances: z.array(z.number().int().nonnegative().safe()).optional(),
+        preTokenBalances: z.array(TokenBalance).optional(),
+        postTokenBalances: z.array(TokenBalance).optional(),
       })
       .passthrough()
       .nullable(),
@@ -148,6 +162,18 @@ export type WalletTransaction = {
   logMessages: string[];
   preBalances: number[];
   postBalances: number[];
+  preTokenBalances?: Array<{
+    accountIndex: number;
+    mint: string;
+    owner: string | null;
+    amountRaw: string;
+  }>;
+  postTokenBalances?: Array<{
+    accountIndex: number;
+    mint: string;
+    owner: string | null;
+    amountRaw: string;
+  }>;
 };
 
 export type HeliusOptions = {
@@ -364,6 +390,18 @@ export class HeliusRpcClient {
       logMessages: meta.logMessages ?? [],
       preBalances: meta.preBalances ?? [],
       postBalances: meta.postBalances ?? [],
+      preTokenBalances: (meta.preTokenBalances ?? []).map((balance) => ({
+        accountIndex: balance.accountIndex,
+        mint: balance.mint,
+        owner: balance.owner ?? null,
+        amountRaw: balance.uiTokenAmount.amount,
+      })),
+      postTokenBalances: (meta.postTokenBalances ?? []).map((balance) => ({
+        accountIndex: balance.accountIndex,
+        mint: balance.mint,
+        owner: balance.owner ?? null,
+        amountRaw: balance.uiTokenAmount.amount,
+      })),
     };
   }
 

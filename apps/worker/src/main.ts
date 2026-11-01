@@ -3,6 +3,7 @@ import { utcNow } from "@sentinel/domain";
 import type { ProviderHealth } from "@sentinel/domain";
 import {
   HeliusRpcClient,
+  JupiterQuoteClient,
   PumpPortalClient,
   pumpPortalHealth,
 } from "@sentinel/providers";
@@ -96,9 +97,28 @@ async function main(): Promise<void> {
     : undefined;
   enrichment?.start();
 
+  const jupiter =
+    loaded.config.providers.jupiter.enabled && loaded.jupiterApiKey
+      ? new JupiterQuoteClient({
+          apiKey: loaded.jupiterApiKey,
+          timeoutMs: loaded.config.providers.jupiter.request_timeout_ms,
+          maxRequestsPerSecond:
+            loaded.config.providers.jupiter.max_requests_per_second,
+          consumeRequestBudget: () =>
+            store.tryConsumeJupiterRequest(
+              loaded.config.providers.jupiter.max_requests_per_utc_day,
+            ),
+        })
+      : undefined;
+  if (loaded.config.providers.jupiter.enabled && !loaded.jupiterApiKey)
+    log("warn", "provider.jupiter.disabled", {
+      errorCode: "JUPITER_API_KEY_MISSING",
+    });
+
   const analysis = new TokenAnalysisScheduler({
     store,
     helius,
+    jupiter,
     config: loaded.config,
     configVersion: loaded.configVersion,
     concurrency: loaded.config.analysis.concurrent_token_analysis,

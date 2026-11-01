@@ -6,6 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import {
   CreatorReputationSchema,
   MarketEventSchema,
+  LaunchBehaviorSnapshotSchema,
+  LaunchTradeObservationSchema,
+  QuoteResultSchema,
   RiskDecisionSchema,
   TokenRiskReportSchema,
   WalletRoleEvidenceSchema,
@@ -14,6 +17,9 @@ import {
 import type {
   CreatorReputation,
   MarketEvent,
+  LaunchBehaviorSnapshot,
+  LaunchTradeObservation,
+  QuoteResult,
   ProviderHealth,
   RiskDecision,
   TokenRiskReport,
@@ -56,6 +62,18 @@ export class SentinelStore {
 
   readonly path: string;
 
+  listAppliedMigrations(): Array<{ version: number; appliedAtUtc: string }> {
+    const rows = this.#db
+      .prepare(
+        "SELECT version, applied_at_utc FROM schema_migrations ORDER BY version",
+      )
+      .all() as SqlRow[];
+    return rows.map((row) => ({
+      version: Number(row["version"]),
+      appliedAtUtc: String(row["applied_at_utc"]),
+    }));
+  }
+
   async open(): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
     this.#db = new DatabaseSync(this.path);
@@ -71,6 +89,7 @@ export class SentinelStore {
       "003-discovery-hardening.sql",
       "004-enrichment-and-completeness.sql",
       "005-intelligence-security-decisions.sql",
+      "006-market-intelligence.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -374,6 +393,30 @@ export class SentinelStore {
         .prepare(
           `UPDATE helius_request_budget SET requests_used = requests_used + 1
           WHERE utc_day = ? AND requests_used < ?`,
+        )
+        .run(utcDay, maxRequestsPerUtcDay);
+      this.#db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  tryConsumeJupiterRequest(maxRequestsPerUtcDay: number): boolean {
+    const utcDay = utcNow().slice(0, 10);
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO external_request_budget(provider, utc_day, requests_used)
+          VALUES ('jupiter', ?, 0)`,
+        )
+        .run(utcDay);
+      const result = this.#db
+        .prepare(
+          `UPDATE external_request_budget SET requests_used = requests_used + 1
+          WHERE provider = 'jupiter' AND utc_day = ? AND requests_used < ?`,
         )
         .run(utcDay, maxRequestsPerUtcDay);
       this.#db.exec("COMMIT");
@@ -1009,6 +1052,209 @@ export class SentinelStore {
         report.observedAtUtc,
         JSON.stringify(report),
       );
+  }
+
+  saveWalletTokenOutflow(input: {
+    id: string;
+    wallet: string;
+    mint: string;
+    signature: string;
+    slot: number;
+    beforeAmountRaw: string;
+    afterAmountRaw: string;
+    observedAtUtc: string | null;
+    reasonCode: string;
+    confidenceBps: number;
+  }): void {
+    if (
+      !/^\d+$/.test(input.beforeAmountRaw) ||
+      !/^\d+$/.test(input.afterAmountRaw) ||
+      input.confidenceBps < 0 ||
+      input.confidenceBps > 10000
+    )
+      throw new Error("INVALID_CREATOR_ACTIVITY_EVIDENCE");
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO wallet_token_outflows
+        (id, wallet_pubkey, mint, signature, slot, before_amount_raw, after_amount_raw,
+        observed_at_utc, reason_code, confidence_bps)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.wallet,
+        input.mint,
+        input.signature,
+        input.slot,
+        input.beforeAmountRaw,
+        input.afterAmountRaw,
+        input.observedAtUtc,
+        input.reasonCode,
+        input.confidenceBps,
+      );
+  }
+
+  listWalletTokenOutflows(
+    wallet: string,
+    asOfSlot: number,
+  ): Array<Record<string, unknown>> {
+    const rows = this.#db
+      .prepare(
+        `SELECT id, mint, signature, slot, before_amount_raw, after_amount_raw,
+        observed_at_utc, reason_code, confidence_bps FROM wallet_token_outflows
+        WHERE wallet_pubkey = ? AND slot <= ? ORDER BY slot, signature`,
+      )
+      .all(wallet, asOfSlot) as SqlRow[];
+    return rows.map((row) => ({
+      id: String(row["id"]),
+      mint: String(row["mint"]),
+      signature: String(row["signature"]),
+      slot: Number(row["slot"]),
+      beforeAmountRaw: String(row["before_amount_raw"]),
+      afterAmountRaw: String(row["after_amount_raw"]),
+      observedAtUtc:
+        row["observed_at_utc"] === null ? null : String(row["observed_at_utc"]),
+      reasonCode: String(row["reason_code"]),
+      confidenceBps: Number(row["confidence_bps"]),
+    }));
+  }
+
+  saveLaunchTradeObservation(input: LaunchTradeObservation): void {
+    const observation = LaunchTradeObservationSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO launch_trade_observations
+        (id, mint, signature, slot, block_time_utc, received_at_utc, side, trader_wallet,
+        token_amount_raw, quote_amount_raw, venue, source, payload_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        observation.id,
+        observation.mint,
+        observation.signature,
+        observation.slot,
+        observation.blockTimeUtc,
+        observation.receivedAtUtc,
+        observation.side,
+        observation.traderWallet,
+        observation.tokenAmountRaw,
+        observation.quoteAmountRaw,
+        observation.venue,
+        observation.source,
+        observation.payloadRef,
+      );
+  }
+
+  listLaunchTradeObservations(
+    mint: string,
+    fromUtc: string,
+    throughUtc: string,
+    throughSlot: number | null,
+    limit = 5000,
+  ): LaunchTradeObservation[] {
+    const safeLimit = Math.max(1, Math.min(10000, Math.trunc(limit)));
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM launch_trade_observations WHERE mint = ?
+        AND received_at_utc >= ? AND received_at_utc <= ?
+        AND (? IS NULL OR slot IS NULL OR slot <= ?)
+        ORDER BY received_at_utc, slot LIMIT ?`,
+      )
+      .all(
+        mint,
+        fromUtc,
+        throughUtc,
+        throughSlot,
+        throughSlot,
+        safeLimit,
+      ) as SqlRow[];
+    return rows.map((row) =>
+      LaunchTradeObservationSchema.parse({
+        id: row["id"],
+        mint: row["mint"],
+        signature: row["signature"],
+        slot: row["slot"],
+        blockTimeUtc: row["block_time_utc"],
+        receivedAtUtc: row["received_at_utc"],
+        side: row["side"],
+        traderWallet: row["trader_wallet"],
+        tokenAmountRaw: row["token_amount_raw"],
+        quoteAmountRaw: row["quote_amount_raw"],
+        venue: row["venue"],
+        source: row["source"],
+        payloadRef: row["payload_ref"],
+      }),
+    );
+  }
+
+  saveLaunchBehaviorSnapshot(input: LaunchBehaviorSnapshot): void {
+    const snapshot = LaunchBehaviorSnapshotSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO launch_behavior_snapshots
+        (id, mint, window_seconds, observed_at_utc, through_slot, complete, gap_reason, snapshot_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        snapshot.id,
+        snapshot.mint,
+        snapshot.windowSeconds,
+        snapshot.observedAtUtc,
+        snapshot.throughSlot,
+        snapshot.complete ? 1 : 0,
+        snapshot.gapReason,
+        JSON.stringify(snapshot),
+      );
+  }
+
+  listLaunchBehaviorSnapshots(
+    mint: string,
+    limit = 100,
+  ): LaunchBehaviorSnapshot[] {
+    const safeLimit = Math.max(1, Math.min(1000, Math.trunc(limit)));
+    const rows = this.#db
+      .prepare(
+        `SELECT snapshot_json FROM launch_behavior_snapshots
+        WHERE mint = ? ORDER BY observed_at_utc DESC LIMIT ?`,
+      )
+      .all(mint, safeLimit) as SqlRow[];
+    return rows.map((row) =>
+      LaunchBehaviorSnapshotSchema.parse(
+        JSON.parse(String(row["snapshot_json"])),
+      ),
+    );
+  }
+
+  saveQuoteResult(input: QuoteResult): void {
+    const quote = QuoteResultSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO market_quotes
+        (id, mint, venue, snapshot_slot, observed_at_utc, validation_status, quote_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        quote.id,
+        quote.mint,
+        quote.venue,
+        quote.snapshotSlot,
+        quote.observedAtUtc,
+        quote.validationStatus,
+        JSON.stringify(quote),
+      );
+  }
+
+  listQuoteResults(mint: string, limit = 50): QuoteResult[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    const rows = this.#db
+      .prepare(
+        `SELECT quote_json FROM market_quotes WHERE mint = ?
+        ORDER BY observed_at_utc DESC LIMIT ?`,
+      )
+      .all(mint, safeLimit) as SqlRow[];
+    return rows.map((row) =>
+      QuoteResultSchema.parse(JSON.parse(String(row["quote_json"]))),
+    );
   }
 
   getLatestTokenRiskReport(mint: string): TokenRiskReport | null {

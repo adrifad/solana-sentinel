@@ -47,7 +47,7 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The initial checkout was a documentation-only blueprint. The current implementation provides validated `DRY_RUN` configuration, SQLite event persistence and migrations, PumpPortal launch/migration discovery, bounded Helius read adapters, creator-intelligence and token-security reports, explainable fail-closed decisions, and read-only APIs. PAPER execution, LIVE execution, and the dashboard remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md).
+The initial checkout was a documentation-only blueprint. The current implementation provides validated `DRY_RUN` configuration, SQLite event persistence and migrations, PumpPortal launch/migration discovery, bounded Helius read adapters, creator-intelligence and token-security reports, quote-only Jupiter routing, an official Pump bonding-curve quote calculator for verified SDK state, time-indexed launch behavior contracts, explainable fail-closed decisions, and read-only APIs. Live Pump quotes, PumpSwap state decoding, PumpPortal trade subscriptions, PAPER execution, LIVE execution, and the dashboard remain unimplemented or disabled. Jupiter results without chain slot and price-impact evidence cannot pass exit validation. See [implementation status](docs/IMPLEMENTATION-STATUS.md).
 
 ## Local implementation commands
 
@@ -75,4 +75,4 @@ Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_
 
 ## Definition of MVP
 
-The current milestone delivers realtime token discovery and persisted creator/security `DRY_RUN` decisions. PAPER fills, SOL ledger accounting, dashboards, and LIVE execution are future milestones. The current runtime uses no wallet secret and has no transaction-signing or submission capability.
+The current milestone delivers realtime token discovery and persisted creator/security `DRY_RUN` decisions with optional read-only quote evidence. PAPER fills, SOL ledger accounting, dashboards, and LIVE execution are future milestones. The current runtime uses no wallet secret and has no transaction-signing or submission capability.

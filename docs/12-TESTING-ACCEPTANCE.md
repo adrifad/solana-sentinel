@@ -15,6 +15,10 @@
 
 - WebSocket connection, reconnection, resubscribe, duplicate/out-of-order events, event budget cap.
 - Helius 429/5xx/timeout, pagination, malformed transaction payload.
+- Jupiter quote-only requests omit `taker`, reject transaction-bearing responses, and honor the persistent provider budget before network access.
+- Launch-window look-ahead exclusion, incomplete-window behavior, and wallet token outflow evidence that does not claim a proven sell.
+- Repeated same-wallet buy/sell activity remains `UNKNOWN` with a possible wash-pattern reason code.
+- Version 6 migration persistence for quote and time-indexed behavior evidence.
 - DEX Screener missing pool data not classified as scam by itself.
 - Jupiter quote-only returns no route and paper does not sign or call execute.
 - Subscriptions automatically unsubscribe after expiration/analysis cap.

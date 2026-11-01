@@ -143,6 +143,14 @@ export const TokenRiskReportSchema = z.object({
   clusterConcentrationRaw: z.string().regex(/^\d+$/).nullable(),
   holderSampleCount: z.number().int().nonnegative(),
   holderSampleComplete: z.literal(false),
+  holderSampleCoverageBps: z
+    .number()
+    .int()
+    .min(0)
+    .max(10000)
+    .nullable()
+    .optional(),
+  holderSampleValidated: z.boolean().optional(),
   testTokenClassification: z.enum(["LIKELY_TEST", "UNKNOWN"]),
   testTokenConfidenceBps: z.number().int().min(0).max(10000),
   reasonCodes: z.array(z.string().regex(/^[A-Z0-9_]+$/)),
@@ -153,6 +161,150 @@ export const TokenRiskReportSchema = z.object({
   evidenceRefs: z.array(z.string().min(1)),
 });
 export type TokenRiskReport = z.infer<typeof TokenRiskReportSchema>;
+
+export const VenueTypeSchema = z.enum([
+  "PUMP_BONDING_CURVE",
+  "PUMPSWAP",
+  "JUPITER",
+]);
+export type VenueType = z.infer<typeof VenueTypeSchema>;
+export const QuoteDirectionSchema = z.enum(["BUY", "SELL"]);
+export const QuoteFailureReasonSchema = z.enum([
+  "VENUE_UNSUPPORTED",
+  "STATE_MISSING",
+  "STATE_UNSAFE",
+  "QUOTE_TIMEOUT",
+  "PROVIDER_UNAVAILABLE",
+  "RATE_LIMITED",
+  "PROVIDER_BUDGET_EXHAUSTED",
+  "NO_ROUTE",
+  "INSUFFICIENT_LIQUIDITY",
+  "STALE_SNAPSHOT",
+  "PRICE_IMPACT_UNKNOWN",
+  "MALFORMED_PROVIDER_DATA",
+]);
+export type QuoteFailureReason = z.infer<typeof QuoteFailureReasonSchema>;
+
+export const MarketSnapshotSchema = z.object({
+  mint: PubkeySchema,
+  venue: VenueTypeSchema,
+  slot: z.number().int().nonnegative().safe(),
+  observedAtUtc: IsoUtcSchema,
+  source: z.string().min(1),
+  stateRef: z.string().min(1),
+  baseReserveRaw: z.string().regex(/^\d+$/).nullable(),
+  quoteReserveRaw: z.string().regex(/^\d+$/).nullable(),
+  liquidityQuoteRaw: z.string().regex(/^\d+$/).nullable(),
+  confidenceBps: z.number().int().min(0).max(10000),
+});
+export type MarketSnapshot = z.infer<typeof MarketSnapshotSchema>;
+
+export const QuoteRequestSchema = z
+  .object({
+    mint: PubkeySchema,
+    direction: QuoteDirectionSchema,
+    exactInputAmountRaw: z.string().regex(/^[1-9]\d*$/),
+    inputMint: PubkeySchema,
+    outputMint: PubkeySchema,
+    expectedVenue: VenueTypeSchema.optional(),
+    maxAgeMs: z.number().int().nonnegative(),
+    requestedAtUtc: IsoUtcSchema,
+  })
+  .refine(
+    (request) =>
+      request.direction === "BUY"
+        ? request.outputMint === request.mint
+        : request.inputMint === request.mint,
+    "Quote side must use the requested token mint",
+  );
+export type QuoteRequest = z.infer<typeof QuoteRequestSchema>;
+
+export const QuoteResultSchema = z.object({
+  id: z.string().min(1),
+  mint: PubkeySchema,
+  direction: QuoteDirectionSchema,
+  exactInputAmountRaw: z.string().regex(/^\d+$/),
+  expectedOutputAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  inputMint: PubkeySchema,
+  outputMint: PubkeySchema,
+  venue: VenueTypeSchema.nullable(),
+  source: z.string().min(1),
+  snapshotSlot: z.number().int().nonnegative().safe().nullable(),
+  snapshotAtUtc: IsoUtcSchema.nullable(),
+  feeAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  feeMint: PubkeySchema.nullable(),
+  feeModel: z.string().min(1),
+  priceImpactBps: z.number().int().nonnegative().nullable(),
+  liquidityQuoteRaw: z.string().regex(/^\d+$/).nullable(),
+  freshnessMs: z.number().int().nonnegative().nullable(),
+  validationStatus: z.enum(["PASS", "FAIL", "UNKNOWN"]),
+  failureReason: QuoteFailureReasonSchema.nullable(),
+  evidenceRefs: z.array(z.string().min(1)),
+  provenance: z.record(z.string(), z.unknown()),
+  observedAtUtc: IsoUtcSchema,
+});
+export type QuoteResult = z.infer<typeof QuoteResultSchema>;
+
+export const ExitValidationResultSchema = z.object({
+  status: z.enum(["PASS", "FAIL", "UNKNOWN"]),
+  buyQuoteId: z.string().min(1).nullable(),
+  sellQuoteId: z.string().min(1).nullable(),
+  requiredSellAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  expectedExitAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  reasonCodes: z.array(z.string().regex(/^[A-Z0-9_]+$/)),
+  evidenceRefs: z.array(z.string().min(1)),
+});
+export type ExitValidationResult = z.infer<typeof ExitValidationResultSchema>;
+
+export const LaunchBehaviorSnapshotSchema = z.object({
+  id: z.string().min(1),
+  mint: PubkeySchema,
+  windowSeconds: z.union([z.literal(30), z.literal(60), z.literal(120)]),
+  windowStartedAtUtc: IsoUtcSchema,
+  observedAtUtc: IsoUtcSchema,
+  throughSlot: z.number().int().nonnegative().safe().nullable(),
+  buyCount: z.number().int().nonnegative(),
+  sellCount: z.number().int().nonnegative(),
+  uniqueBuyers: z.number().int().nonnegative(),
+  independentBuyerEstimate: z.number().int().nonnegative(),
+  creatorAssociatedBuys: z.number().int().nonnegative(),
+  repeatedWalletTransactions: z.number().int().nonnegative(),
+  largestWalletVolumeBps: z.number().int().min(0).max(10000).nullable(),
+  volumeBuyRaw: z.string().regex(/^\d+$/),
+  volumeSellRaw: z.string().regex(/^\d+$/),
+  marketPhase: z.enum(["PUMP_CURVE", "MIGRATED_PUMPSWAP", "UNKNOWN"]),
+  classification: z.enum(["LIKELY_TEST", "ORGANIC_CANDIDATE", "UNKNOWN"]),
+  reasonCodes: z.array(z.string().regex(/^[A-Z0-9_]+$/)),
+  confidenceBps: z.number().int().min(0).max(10000),
+  complete: z.boolean(),
+  gapReason: z
+    .string()
+    .regex(/^[A-Z0-9_]+$/)
+    .nullable(),
+  evidenceRefs: z.array(z.string().min(1)),
+});
+export type LaunchBehaviorSnapshot = z.infer<
+  typeof LaunchBehaviorSnapshotSchema
+>;
+
+export const LaunchTradeObservationSchema = z.object({
+  id: z.string().min(1),
+  mint: PubkeySchema,
+  signature: z.string().min(1),
+  slot: z.number().int().nonnegative().safe().nullable(),
+  blockTimeUtc: IsoUtcSchema.nullable(),
+  receivedAtUtc: IsoUtcSchema,
+  side: z.enum(["BUY", "SELL"]),
+  traderWallet: PubkeySchema.nullable(),
+  tokenAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  quoteAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  venue: z.enum(["PUMP_BONDING_CURVE", "PUMPSWAP", "UNKNOWN"]),
+  source: z.string().min(1),
+  payloadRef: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+});
+export type LaunchTradeObservation = z.infer<
+  typeof LaunchTradeObservationSchema
+>;
 
 export const RiskDecisionSchema = z.object({
   id: z.string().min(1),

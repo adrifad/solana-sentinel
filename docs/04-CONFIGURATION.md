@@ -22,7 +22,9 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 ## Config domains
 
 - `discovery`: source, subscriptions, concurrent analysis cap, supported token programs.
-- `analysis`: creator history page/transaction limits, cache TTL, tracing depth, refresh windows, analysis concurrency and timeout.
+- `analysis`: creator history page/transaction limits, cache TTL, tracing depth, refresh windows, analysis concurrency and timeout, minimum independent buyers, and minimum validated holder-sample supply coverage.
+- `providers.jupiter`: opt-in quote-only adapter, request timeout/rate/day budgets, and maximum quote age. `JUPITER_API_KEY` is required to activate requests; missing slot/impact evidence still fails closed.
+- `providers.pumpportal`: trade streaming remains schema-locked disabled (`enable_token_trades: false`) until provider payload validation and metered event budgeting are implemented.
 - `security`: mint authority/extension policy, unknown handling, holder sampling size, snapshot freshness and slot-skew limits.
 - `strategy`: entry timing, opportunity score and scoring weights, min observations.
 - `paper`: initial SOL, latency simulation, quote stale window, fee model, conservative slippage.

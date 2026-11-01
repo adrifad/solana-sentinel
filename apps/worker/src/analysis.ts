@@ -8,12 +8,14 @@ import {
 } from "@sentinel/domain";
 import type {
   CreatorReputation,
+  QuoteResult,
   TokenRiskReport,
   WalletRoleEvidence,
 } from "@sentinel/domain";
 import {
   decodePumpCreateEvents,
   extractDirectFundingTransfers,
+  detectWalletTokenOutflows,
   transactionFeePayer,
   transactionSigners,
 } from "@sentinel/intelligence";
@@ -23,13 +25,14 @@ import {
   type HeliusRpcClient,
   type WalletTransaction,
 } from "@sentinel/providers";
+import type { JupiterQuoteClient } from "@sentinel/providers";
 import type { AppConfig } from "@sentinel/config";
 import {
   assessTestTokenMetadata,
   decodeMintAccount,
   ratioBps,
 } from "@sentinel/security";
-import { evaluateRiskDecision } from "@sentinel/strategy";
+import { evaluateRiskDecision, validateExitQuotes } from "@sentinel/strategy";
 import type { SentinelStore } from "@sentinel/storage";
 import { log } from "./logger.ts";
 
@@ -39,6 +42,7 @@ type HeliusErrorCode = string;
 export type AnalysisOptions = {
   store: SentinelStore;
   helius: HeliusRpcClient | undefined;
+  jupiter?: JupiterQuoteClient | undefined;
   config: AppConfig;
   configVersion: string;
   concurrency: number;
@@ -59,6 +63,7 @@ type AnalysisEvidence = {
 export class TokenAnalysisScheduler {
   readonly #store: SentinelStore;
   readonly #helius: HeliusRpcClient | undefined;
+  readonly #jupiter: JupiterQuoteClient | undefined;
   readonly #config: AppConfig;
   readonly #configVersion: string;
   readonly #concurrency: number;
@@ -71,6 +76,7 @@ export class TokenAnalysisScheduler {
   constructor(options: AnalysisOptions) {
     this.#store = options.store;
     this.#helius = options.helius;
+    this.#jupiter = options.jupiter;
     this.#config = options.config;
     this.#configVersion = options.configVersion;
     this.#concurrency = options.concurrency;
@@ -214,17 +220,37 @@ export class TokenAnalysisScheduler {
           evidence.asOfSlot ?? undefined,
         )
       : null;
+    const quotes =
+      this.#jupiter &&
+      event.monitoringEligible &&
+      security.status === "SUPPORTED"
+        ? await this.#quoteExit(job.mint)
+        : { buy: null, sell: null };
+    const exitValidation = validateExitQuotes({
+      ...quotes,
+      maximumAgeMs: this.#config.providers.jupiter.max_quote_age_ms,
+      maximumPriceImpactBps: this.#config.risk.max_price_impact_bps,
+      minimumExitAmountRaw: "1",
+    });
+    for (const reference of exitValidation.evidenceRefs)
+      evidence.evidenceRefs.add(`market_quote:${reference}`);
+    for (const reason of exitValidation.reasonCodes)
+      evidence.errors.add(reason);
     const decision = evaluateRiskDecision({
       mint: job.mint,
       configVersion: this.#configVersion,
       security,
       creator: reputation,
       marketPhase: token.marketPhase,
-      exitValidation: "UNKNOWN",
+      exitValidation,
       startedAtMs: startedAt,
       nowMs: this.#now(),
       supportingEvidenceRefs: [...evidence.evidenceRefs],
       analysisReasonCodes: [...evidence.errors],
+      minimumHolderSampleCoverageBps:
+        this.#config.analysis.min_holder_sample_coverage_bps,
+      minimumIndependentBuyers: this.#config.analysis.min_independent_buyers,
+      launchBehavior: null,
     });
     this.#store.saveRiskDecision(decision);
     if (decision.status === "BUY_ELIGIBLE") {
@@ -254,6 +280,45 @@ export class TokenAnalysisScheduler {
       evidenceCount: evidence.evidenceRefs.size,
       latencyMs: decision.latencyMs,
     });
+  }
+
+  async #quoteExit(mint: string): Promise<{
+    buy: QuoteResult | null;
+    sell: QuoteResult | null;
+  }> {
+    const inputAmountRaw = solToLamports(this.#config.risk.max_trade_sol);
+    const requestedAtUtc = new Date(this.#now()).toISOString();
+    try {
+      const buy = await this.#jupiter!.quote({
+        mint,
+        direction: "BUY",
+        exactInputAmountRaw: inputAmountRaw,
+        inputMint: "So11111111111111111111111111111111111111112",
+        outputMint: mint,
+        maxAgeMs: this.#config.providers.jupiter.max_quote_age_ms,
+        requestedAtUtc,
+      });
+      this.#store.saveQuoteResult(buy);
+      if (!buy.expectedOutputAmountRaw || buy.expectedOutputAmountRaw === "0")
+        return { buy, sell: null };
+      const sell = await this.#jupiter!.quote({
+        mint,
+        direction: "SELL",
+        exactInputAmountRaw: buy.expectedOutputAmountRaw,
+        inputMint: mint,
+        outputMint: "So11111111111111111111111111111111111111112",
+        maxAgeMs: this.#config.providers.jupiter.max_quote_age_ms,
+        requestedAtUtc: new Date(this.#now()).toISOString(),
+      });
+      this.#store.saveQuoteResult(sell);
+      return { buy, sell };
+    } catch (error) {
+      log("warn", "analysis.quote_failed", {
+        mint,
+        errorCode: providerError(error),
+      });
+      return { buy: null, sell: null };
+    }
   }
 
   async #resolveLaunchRoles(
@@ -595,8 +660,22 @@ export class TokenAnalysisScheduler {
       );
     if (repeatedCosignerLinks.length > 0)
       indicators.add("REPEATED_COSIGNER_NETWORK");
+    const walletOutflows = this.#store.listWalletTokenOutflows(
+      wallet,
+      asOfSlot,
+    );
+    const outflowCounts = new Map<string, number>();
+    for (const outflow of walletOutflows) {
+      const mint = String(outflow["mint"]);
+      outflowCounts.set(mint, (outflowCounts.get(mint) ?? 0) + 1);
+    }
+    if ([...outflowCounts.values()].some((count) => count >= 2))
+      indicators.add("REPEATED_WALLET_TOKEN_OUTFLOWS");
     const evidenceRefs = [
       ...launches.map((launch) => `solana_transaction:${launch.signature}`),
+      ...walletOutflows.map(
+        (outflow) => `wallet_token_outflow:${String(outflow["id"])}`,
+      ),
       ...repeatedCosignerLinks.map(
         (link) => `wallet_link:${String(link["id"])}`,
       ),
@@ -658,6 +737,16 @@ export class TokenAnalysisScheduler {
     evidence: AnalysisEvidence,
   ): void {
     if (!transaction.succeeded) return;
+    for (const outflow of detectWalletTokenOutflows(
+      queriedWallet,
+      transaction,
+    )) {
+      const id = hashId(
+        `${outflow.wallet}|${outflow.mint}|${outflow.signature}|${outflow.reasonCode}`,
+      );
+      this.#store.saveWalletTokenOutflow({ id, ...outflow });
+      evidence.evidenceRefs.add(`wallet_token_outflow:${id}`);
+    }
     const observedAtUtc = transaction.blockTime
       ? new Date(transaction.blockTime * 1000).toISOString()
       : utcNow();
@@ -787,6 +876,8 @@ export class TokenAnalysisScheduler {
         clusterConcentrationRaw: null,
         holderSampleCount: 0,
         holderSampleComplete: false,
+        holderSampleCoverageBps: null,
+        holderSampleValidated: false,
         testTokenClassification: testToken.classification,
         testTokenConfidenceBps: testToken.confidenceBps,
         reasonCodes: [...reasons],
@@ -875,6 +966,7 @@ export class TokenAnalysisScheduler {
     let clusterConcentrationRaw: string | null = null;
     let sampleCount = 0;
     let holderOwnersValidated = false;
+    let holderSampleCoverageBps: number | null = null;
     let minSlot = accountResult.slot;
     let maxSlot = accountResult.slot;
     if (supply) {
@@ -938,6 +1030,7 @@ export class TokenAnalysisScheduler {
           BigInt(supply.amountRaw),
         );
         if (ownerResultsComplete) {
+          holderSampleCoverageBps = topHolderConcentrationBps;
           creatorConcentrationRaw = creatorTotal.toString();
           clusterConcentrationRaw = clusterTotal.toString();
           holderOwnersValidated = true;
@@ -990,6 +1083,8 @@ export class TokenAnalysisScheduler {
       clusterConcentrationRaw,
       holderSampleCount: sampleCount,
       holderSampleComplete: false,
+      holderSampleCoverageBps,
+      holderSampleValidated: holderOwnersValidated,
       testTokenClassification: testToken.classification,
       testTokenConfidenceBps: testToken.confidenceBps,
       reasonCodes: [...new Set([...reasons, ...evidence.errors])].sort(),
@@ -1037,6 +1132,8 @@ export class TokenAnalysisScheduler {
       clusterConcentrationRaw: null,
       holderSampleCount,
       holderSampleComplete: false,
+      holderSampleCoverageBps: null,
+      holderSampleValidated: false,
       testTokenClassification: reasons.has("TEST_TOKEN_METADATA_PATTERN")
         ? "LIKELY_TEST"
         : "UNKNOWN",
@@ -1084,4 +1181,14 @@ function unique(values: Array<string | null>): string[] {
 
 function hashId(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function solToLamports(value: string): string {
+  const [whole = "0", fraction = ""] = value.split(".");
+  if (!/^\d+$/.test(whole) || !/^\d*$/.test(fraction) || fraction.length > 9)
+    throw new Error("INVALID_SOL_AMOUNT_CONFIGURATION");
+  return (
+    BigInt(whole) * 1_000_000_000n +
+    BigInt(fraction.padEnd(9, "0") || "0")
+  ).toString();
 }

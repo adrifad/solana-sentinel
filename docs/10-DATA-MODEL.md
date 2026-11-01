@@ -51,8 +51,10 @@
 
 Keep minimal normalized market events and decisions long enough for replay; rotate raw provider payload after configurable retention once references are verified. Back up DB with consistent SQLite backup mechanism, encrypt off host, test restoration monthly.
 
-## Implemented migration 5 tables
+## Implemented migrations 5 and 6 tables
 
 Migration `005-intelligence-security-decisions.sql` adds the persisted analysis queue, sanitized historical wallet transactions, wallet-role evidence, creator launches, evidence-backed wallet links, history refresh cursors, current and as-of creator reputation, token security reports, risk decisions, and DRY_RUN-only trade intents. Provider observations retain signatures, slots, timestamps, provenance, confidence, and reason codes where applicable. The current implementation does not create paper positions or live orders.
+
+Migration `006-market-intelligence.sql` adds queried-wallet token outflow evidence, normalized time-indexed launch trade observations, launch behavior snapshots with explicit completeness/gap status, quote results with venue/source/snapshot fields, and a persistent Jupiter UTC-day request budget. Raw trade observations are not currently populated from PumpPortal because its trade event payload has not been validated in a sanitized capture.
 
 ---

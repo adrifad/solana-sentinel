@@ -7,7 +7,7 @@ The provided checkout was a documentation blueprint, not an application. It cont
 ## Delivered in this slice
 
 - Strict TypeScript pnpm workspace and Zod/YAML validated mainnet `DRY_RUN` configuration.
-- SQLite WAL migrations through version 5, durable normalized PumpPortal events, bounded sanitized payloads, idempotency, separate create/migration slots, reported creator/trader roles, and provenance timestamps.
+- SQLite WAL migrations through version 6, durable normalized PumpPortal events, bounded sanitized payloads, idempotency, separate create/migration slots, reported creator/trader roles, and provenance timestamps.
 - One PumpPortal WebSocket client with message and pending-handler bounds, heartbeat, reconnect/backoff, resubscription, and callback draining during shutdown. Handler concurrency and pending queue capacity are validated runtime configuration (`event_processing_concurrency`, `max_pending_events`). Incoming events are persisted before asynchronous enrichment/processing; overflow closes the stream and is recorded as an unrecovered gap.
 - Helius JSON-RPC reader with response validation, timeout, retries, circuit breaker, per-second pacing, persistent UTC-day request budget, and safe error codes.
 - A durable SQLite enrichment queue consumes only monitoring-eligible events, claims work with bounded concurrency, retries transient failures, and recovers interrupted jobs after restart. Shutdown waits for claimed requests to settle before closing SQLite.
@@ -18,7 +18,11 @@ The provided checkout was a documentation blueprint, not an application. It cont
 - Fixture tests for config fail-closed cases, malformed/duplicate/out-of-order events, monitoring caps, Helius malformed responses and secret redaction.
 - Creator intelligence foundation: Pump CreateEvent decoding against the current public IDL layout; distinct claimed creator, launch initiator (`user`), and transaction fee payer evidence; historical finalized wallet signature pagination and transaction ingestion; cached, as-of-slot creator launch history; direct funding observations and repeated co-signer evidence with confidence. Direct exchange funding evidence is retained as a weak edge and is excluded from suspected-cluster membership.
 - Token security foundation: SPL Token mint-state decoding, Token-2022 TLV parsing with unknown/malformed extensions failing closed, authority checks, metadata-only test-token heuristic, supply/holder snapshot comparisons, and sampled creator/cluster concentration.
-- Explainable DRY_RUN analysis: every token creation has a durable analysis job, a security report, a risk decision, reason codes, evidence references, config hash, timestamp, and latency. Jobs recover after restart and incomplete history/security work is refreshed with bounded backoff. Over-budget tokens receive a missing-data report without Helius calls. No buy intent is generated while exit validation and complete holder distribution remain unavailable.
+- Explainable DRY_RUN analysis: every token creation has a durable analysis job, a security report, a risk decision, reason codes, evidence references, config hash, timestamp, and latency. Jobs recover after restart and incomplete history/security work is refreshed with bounded backoff. Over-budget tokens receive a missing-data report without Helius calls. No buy intent is generated while launch behavior, validated holder sample coverage, or exit quote requirements are incomplete.
+- Sprint 2.5 additions: parsed historical pre/post token balances produce evidence-backed queried-wallet outflow indicators (not a proven sell/rug); normalized launch behavior snapshots classify only complete observation windows, flag possible same-wallet wash patterns, and filter data after the decision timestamp; quote/snapshot/exit-validation domain contracts and migration 006 persist observations, behavior snapshots, quote results, wallet outflows, and Jupiter request budgets.
+- Quote support is intentionally partial: `PumpCurveQuoteEngine` calls `@pump-fun/pump-sdk@4.1.0` exact-input v3 math from caller-supplied, slot-stamped verified state; there is no budgeted Helius state loader yet and completed curves are unsupported. PumpSwap state/quotes are unsupported. Opt-in Jupiter V2 `/order` is called without `taker`; the adapter rejects transaction-bearing responses and never signs or executes. Because current response evidence here lacks a verified snapshot slot and may omit price impact, Jupiter quotes remain `UNKNOWN` for exit validation.
+- Holder evidence now distinguishes sample count, validated decoded sample, and sample supply coverage. `holderSampleComplete` remains false. The configurable 90% supply-coverage threshold is heuristic and is not an exhaustive distribution or a validated security guarantee.
+- `analyzeLaunchBehavior` and its persistent schemas are ready for normalized provider observations, but PumpPortal metered trade subscriptions remain disabled (`enable_token_trades: false`) because the public docs do not define a trade payload contract and there is no sanitized capture in this environment. No realtime launch behavior report is currently emitted by the worker.
 - Read-only detail routes expose token role evidence/security/decisions and creator reputation/launches/wallet links.
 
 ## Provider contract limits
@@ -31,7 +35,7 @@ PumpPortal does not document replay/cursor support on the public streaming page.
 
 Helius uses the documented mainnet RPC endpoint and standard Solana `getHealth`, `getGenesisHash`, `getAccountInfo`, `getBlockTime`, `getSignaturesForAddress`, `getTransaction`, `getTokenSupply`, `getTokenLargestAccounts`, and `getMultipleAccounts` methods. Historical calls use finalized transaction data and are bounded by page size, analysis concurrency, a per-request rate limit, and a persisted UTC-day request budget. `getBlockTime` is an estimated ledger timestamp, separate from local receipt time. Mint and holder snapshots use confirmed RPC state and are checked for slot skew, freshness, and amount consistency. Without Helius credentials, chain history, mint state, and holder state remain unknown rather than inferred. The Helius credit cost is not separately calculated; the enforced limit is RPC request count, and plan-dependent provider costs were not validated.
 
-The baseline retains later-phase intelligence, risk, paper, and provider settings as validated templates, but only settings used by this foundation/discovery slice affect runtime behavior. DEX Screener, Jupiter, social intelligence, and token-trade streaming are disabled until their adapters are implemented.
+The baseline retains later-phase paper/risk settings as validated templates. Jupiter is an opt-in quote-only adapter with persistent rate budget; DEX Screener, social intelligence, and metered PumpPortal token-trade streaming remain disabled. No provider response is substituted with fabricated market data.
 
 SQLite currently uses Node's built-in `node:sqlite` API. Node's official docs classify this API as Release Candidate in supported Node 24/26, so this reduces native dependency/setup complexity but remains a pre-stable runtime API risk for production. Pin Node and the SQLite API behavior, or replace the adapter with a stable SQLite binding before treating the service as production-ready.
 
@@ -47,24 +51,25 @@ SQLite currently uses Node's built-in `node:sqlite` API. Node's official docs cl
 
 ## Validation record
 
-Verified locally on Node.js 26.8.1 / pnpm 11.3.0 after the intelligence/security implementation:
+Sprint 2.5 validation record (Node.js 26 / pnpm 11):
 
-- `pnpm install --offline --frozen-lockfile`: passed.
+- `pnpm install --frozen-lockfile`: passed.
 - `pnpm typecheck`: passed.
-- `pnpm test`: 41 passed, 0 failed. Coverage includes create-capture parsing, event conflict/idempotency fallback, bounded overflow and reconnect simulations, shutdown drain races, independent mint/timestamp outcomes, schema upgrades, interrupted analysis recovery, provider response validation/timeouts, Pump CreateEvent role separation, Token-2022 fail-closed cases, creator/reputation storage, as-of refresh behavior, and DRY_RUN decision gating.
+- `pnpm test`: 50 passed, 0 failed. New coverage includes Jupiter quote-only/no-taker enforcement, transaction-bearing response rejection, launch as-of filtering/classification/wash-pattern handling, wallet outflow indicator semantics, validated holder sample policy, and migration 006 persistence.
 - `pnpm lint`: passed.
 - `pnpm format:check`: passed.
 - `pnpm docs:check`: passed; all README local links resolve.
 - `DB_PATH=/tmp/solana-sentinel-ci-<run>.sqlite pnpm db:migrate`: passed on a fresh database.
-- Migration tests cover version-one/version-two upgrades, partially applied columns, create/migration slot backfill, interrupted queue recovery, idempotent reopen behavior, and migration 5 intelligence/security schema creation.
+- Migration tests cover version-one/version-two upgrades, partially applied columns, create/migration slot backfill, interrupted queue recovery, idempotent reopen behavior, migration 5 intelligence/security and migration 6 quote/behavior schema creation.
 
-PumpPortal provider connectivity and migration payload behavior, Helius credential-backed mainnet reads, long-running reconnect behavior against the provider, GitHub Actions execution, and Docker deployment were not verified. The environment had no `PUMPPORTAL_API_KEY` or `HELIUS_API_KEY`; mainnet integrations were not tested during this milestone. The create event is an independently checked third-party capture, not a live provider session. Synthetic fixtures are not production market data.
+No `HELIUS_API_KEY`, `PUMPPORTAL_API_KEY`, or `JUPITER_API_KEY` is present in this environment. PumpPortal migration and trade payloads, Helius mainnet state reads, Jupiter response behavior, curve state quote calculations against live state, PumpSwap state decoding, long-running provider reconnects, GitHub Actions execution, and Docker deployment were not validated live. Existing sanitized create capture remains a third-party capture and not a live PumpPortal session. Synthetic fixtures are contract tests, not production market data.
 
 ## Remaining milestones
 
 1. Capture and validate PumpPortal migration events and verify event-version role semantics against finalized transactions; current migration payload behavior is an explicit limitation.
 2. Add a Helius-backed missed-launch reconciler only after validating program-history paging and historical Pump instruction/event variants; current stream gaps remain unrecovered.
 3. Expand token security with supported token extension decoding and audited allowlists; currently unknown extensions fail closed and several known extensions are classified conservatively.
-4. Add reliable all-holder/venue-specific current-state sell quotes before any `BUY_ELIGIBLE` decision or paper execution. No profitability metric is calculated from incomplete trading history.
-5. Add authorized dashboard and configuration workflows after API contracts stabilize; the API remains read-only.
-6. Keep PAPER and LIVE unimplemented and signing isolated until their separate safety gates are completed.
+4. Add the budgeted Helius state loader for Pump bonding curves and PumpSwap pools, then validate executable-size buy/sell quotes, current snapshot slots, fee decomposition, liquidity and impact from verified protocol state. No profitability metric is calculated from incomplete trading history.
+5. Capture/validate PumpPortal trade messages and implement explicit metered subscribe/unsubscribe lifecycle, persisted event budget, reconnect resubscription and stream-gap coverage before enabling behavior reports.
+6. Add authorized dashboard and configuration workflows after API contracts stabilize; the API remains read-only.
+7. Keep PAPER and LIVE unimplemented and signing isolated until their separate safety gates are completed.
