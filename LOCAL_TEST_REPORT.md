@@ -164,3 +164,10 @@ The worker's migration event is real mainnet runtime evidence, but it is not a r
 | **Milestone B — PAPER foundation**                               | **PASS for isolated library tests; NOT operational** | Accounting and SELL regressions pass, but application PAPER mode stays disabled and Milestone A is incomplete.                                            |
 
 **PAPER operational readiness: NOT READY.** Keep automatic PAPER entries disabled until authorized trade-stream access, complete observation coverage, and the full evidence-backed discovery-to-decision path have passed. No signing, swap submission, or virtual portfolio settlement was performed in this follow-up.
+
+## Latest test rerun — 2026-11-01
+
+- `pnpm test`: **PASS — 77/77**, 0 failures, 0 skipped.
+- `node --experimental-strip-types --test tests/paper.test.ts`: **PASS — 15/15**.
+- A worker startup attempt using the current `.env` returned `APP_MODE supports DRY_RUN only; paper and live execution are not implemented`. Configuration validation occurs before `SentinelStore.open()`, so this attempt did not open the configured database or start providers.
+- These are automated tests and a startup-boundary check. They do not constitute real-time PAPER trading or live execution validation.
