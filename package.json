@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format:check": "prettier --check .",
+    "docs:check": "node scripts/check-doc-links.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "db:migrate": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts migrate",
     "dev:worker": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts start",

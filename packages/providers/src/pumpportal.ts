@@ -17,6 +17,8 @@ export type PumpPortalOptions = {
     reconnectCount: number,
     errorCode: string | null,
     lastEventAtUtc: string | null,
+    queueDepth?: number,
+    lastProcessedAtUtc?: string | null,
   ) => void;
   socketFactory?: (url: string) => WebSocket;
   random?: () => number;
@@ -25,6 +27,7 @@ export type PumpPortalOptions = {
   maxBackoffMs?: number;
   heartbeatMs?: number;
   maxMessageBytes?: number;
+  maxPendingEvents?: number;
 };
 
 const SECRET_FIELD =
@@ -60,6 +63,7 @@ export function parsePumpPortalMessage(
   const signature = record["signature"];
   const slot = record["slot"];
   const creator = record["creator"];
+  const traderPublicKey = record["traderPublicKey"];
   const name = record["name"];
   const symbol = record["symbol"];
   const uri = record["uri"];
@@ -71,7 +75,7 @@ export function parsePumpPortalMessage(
     if (value === undefined || value === null) return undefined;
     if (typeof value !== "string" || value.length > limit)
       throw new Error("MALFORMED_EVENT");
-    if (field === "creator") return value;
+    if (field === "creator" || field === "traderPublicKey") return value;
     return value;
   };
   if (
@@ -86,6 +90,11 @@ export function parsePumpPortalMessage(
   )
     throw new Error("MALFORMED_EVENT");
   const safeCreator = optionalString(creator, 44, "creator");
+  const safeLaunchInitiator = optionalString(
+    traderPublicKey,
+    44,
+    "traderPublicKey",
+  );
   const safeName = optionalString(name, 128, "name");
   const safeSymbol = optionalString(symbol, 32, "symbol");
   const safeUri = optionalString(uri, 2048, "uri");
@@ -103,6 +112,7 @@ export function parsePumpPortalMessage(
     ...(typeof signature === "string" ? { signature } : {}),
     ...(typeof slot === "number" ? { slot } : {}),
     ...(safeCreator ? { creator: safeCreator } : {}),
+    ...(safeLaunchInitiator ? { launchInitiator: safeLaunchInitiator } : {}),
     ...(safeName ? { name: safeName } : {}),
     ...(safeSymbol ? { symbol: safeSymbol } : {}),
   });
@@ -121,6 +131,7 @@ export function parsePumpPortalMessage(
     sanitizedPayload: payload,
     ingestionLatencyMs: 0,
     ...(safeCreator ? { creator: safeCreator } : {}),
+    ...(safeLaunchInitiator ? { launchInitiator: safeLaunchInitiator } : {}),
     ...(safeName ? { name: safeName } : {}),
     ...(safeSymbol ? { symbol: safeSymbol } : {}),
     ...(safeUri ? { uri: redactUrl(safeUri) } : {}),
@@ -170,6 +181,7 @@ export class PumpPortalClient {
       | "maxBackoffMs"
       | "heartbeatMs"
       | "maxMessageBytes"
+      | "maxPendingEvents"
       | "random"
       | "now"
     >
@@ -179,9 +191,12 @@ export class PumpPortalClient {
   #current: WebSocket | undefined;
   #loop: Promise<void> | undefined;
   #lastEventAtUtc: string | null = null;
+  #lastProcessedAtUtc: string | null = null;
   #reconnectCount = 0;
+  #disconnectErrorCode: string | null = null;
   #sleepTimer: ReturnType<typeof setTimeout> | undefined;
   #wakeSleep: (() => void) | undefined;
+  readonly #eventHandlers = new Set<Promise<void>>();
 
   constructor(options: PumpPortalOptions) {
     if (!options.apiKey.trim())
@@ -196,6 +211,7 @@ export class PumpPortalClient {
       maxBackoffMs: options.maxBackoffMs ?? 30000,
       heartbeatMs: options.heartbeatMs ?? 15000,
       maxMessageBytes: options.maxMessageBytes ?? 65536,
+      maxPendingEvents: options.maxPendingEvents ?? 128,
       random: options.random ?? Math.random,
       now: options.now ?? Date.now,
     };
@@ -229,8 +245,17 @@ export class PumpPortalClient {
       this.#lastEventAtUtc,
     );
     this.#current?.close(1000, "shutdown");
-    await this.#loop;
-    this.#loop = undefined;
+    let loopError: unknown;
+    try {
+      await this.#loop;
+    } catch (error) {
+      loopError = error;
+    } finally {
+      while (this.#eventHandlers.size > 0)
+        await Promise.allSettled([...this.#eventHandlers]);
+      this.#loop = undefined;
+    }
+    if (loopError) throw loopError;
   }
 
   async #run(): Promise<void> {
@@ -238,11 +263,16 @@ export class PumpPortalClient {
       await this.#connectOnce();
       if (!this.#running) break;
       this.#reconnectCount += 1;
+      const disconnectErrorCode =
+        this.#disconnectErrorCode ?? "SOCKET_DISCONNECTED";
+      this.#disconnectErrorCode = null;
       this.#opts.onHealth(
         "DEGRADED",
         this.#reconnectCount,
-        "SOCKET_DISCONNECTED",
+        disconnectErrorCode,
         this.#lastEventAtUtc,
+        this.#eventHandlers.size,
+        this.#lastProcessedAtUtc,
       );
       const base = Math.min(
         this.#opts.maxBackoffMs,
@@ -285,7 +315,10 @@ export class PumpPortalClient {
             this.#reconnectCount,
             "HEARTBEAT_TIMEOUT",
             this.#lastEventAtUtc,
+            this.#eventHandlers.size,
+            this.#lastProcessedAtUtc,
           );
+          this.#disconnectErrorCode = "HEARTBEAT_TIMEOUT";
           socket.terminate();
           return;
         }
@@ -297,11 +330,14 @@ export class PumpPortalClient {
         }
       }, this.#opts.heartbeatMs);
       const handshakeTimeout = setTimeout(() => {
+        this.#disconnectErrorCode = "CONNECT_TIMEOUT";
         this.#opts.onHealth(
           "DEGRADED",
           this.#reconnectCount,
           "CONNECT_TIMEOUT",
           this.#lastEventAtUtc,
+          this.#eventHandlers.size,
+          this.#lastProcessedAtUtc,
         );
         socket.terminate();
       }, 15000);
@@ -357,15 +393,35 @@ export class PumpPortalClient {
         }
         try {
           const event = parsePumpPortalMessage(parsed, receivedAt);
-          void this.#opts
-            .onEvent(event)
+          this.#lastEventAtUtc = event.receivedAtUtc;
+          if (this.#eventHandlers.size >= this.#opts.maxPendingEvents) {
+            this.#disconnectErrorCode = "EVENT_BACKPRESSURE";
+            this.#opts.onHealth(
+              "DEGRADED",
+              this.#reconnectCount,
+              "EVENT_BACKPRESSURE",
+              this.#lastEventAtUtc,
+              this.#eventHandlers.size,
+              this.#lastProcessedAtUtc,
+            );
+            socket.terminate();
+            return;
+          }
+          let eventPromise: Promise<void>;
+          try {
+            eventPromise = Promise.resolve(this.#opts.onEvent(event));
+          } catch (error) {
+            eventPromise = Promise.reject(error);
+          }
+          const handler = eventPromise
             .then(() => {
-              this.#lastEventAtUtc = event.receivedAtUtc;
               this.#opts.onHealth(
                 "HEALTHY",
                 this.#reconnectCount,
                 null,
                 this.#lastEventAtUtc,
+                this.#eventHandlers.size,
+                (this.#lastProcessedAtUtc = utcNow()),
               );
             })
             .catch(() =>
@@ -374,8 +430,12 @@ export class PumpPortalClient {
                 this.#reconnectCount,
                 "EVENT_PERSIST_FAILED",
                 this.#lastEventAtUtc,
+                this.#eventHandlers.size,
+                this.#lastProcessedAtUtc,
               ),
             );
+          this.#eventHandlers.add(handler);
+          void handler.finally(() => this.#eventHandlers.delete(handler));
         } catch (error) {
           const code =
             error instanceof Error &&
@@ -392,14 +452,15 @@ export class PumpPortalClient {
           );
         }
       });
-      socket.on("error", () =>
+      socket.on("error", () => {
+        this.#disconnectErrorCode = "SOCKET_ERROR";
         this.#opts.onHealth(
           "DEGRADED",
           this.#reconnectCount,
           "SOCKET_ERROR",
           this.#lastEventAtUtc,
-        ),
-      );
+        );
+      });
       socket.on("close", finish);
     });
   }
@@ -410,7 +471,16 @@ export function pumpPortalHealth(
   reconnectCount: number,
   errorCode: string | null,
   lastEventAtUtc: string | null,
+  queueDepth = 0,
+  lastProcessedAtUtc: string | null = null,
 ) {
+  const disconnectedCodes = new Set([
+    "SOCKET_DISCONNECTED",
+    "SOCKET_ERROR",
+    "EVENT_BACKPRESSURE",
+    "CONNECT_TIMEOUT",
+    "HEARTBEAT_TIMEOUT",
+  ]);
   return {
     provider: "pumpportal" as const,
     state,
@@ -418,5 +488,23 @@ export function pumpPortalHealth(
     lastEventAtUtc,
     reconnectCount,
     errorCode,
+    connectionState:
+      state === "STOPPED"
+        ? ("STOPPED" as const)
+        : state === "STARTING"
+          ? ("STARTING" as const)
+          : !disconnectedCodes.has(errorCode ?? "")
+            ? ("CONNECTED" as const)
+            : ("DISCONNECTED" as const),
+    lastMessageAtUtc: lastEventAtUtc,
+    lastProcessedAtUtc,
+    processingLagMs:
+      lastProcessedAtUtc && lastEventAtUtc
+        ? Math.max(
+            0,
+            Date.parse(lastProcessedAtUtc) - Date.parse(lastEventAtUtc),
+          )
+        : null,
+    queueDepth,
   };
 }

@@ -7,6 +7,8 @@ providers:
   helius:
     request_timeout_ms: 3000
     max_requests_per_second: 5
+    max_requests_per_utc_day: 1000
+    max_concurrent_enrichments: 4
   pumpportal:
     enable_new_tokens: true
     enable_migrations: true

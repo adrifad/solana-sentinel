@@ -17,6 +17,8 @@ export type StoredToken = {
   lastSeenAtUtc: string;
   createdSlot: number | null;
   creator: string | null;
+  launchInitiator: string | null;
+  migrationSlot: number | null;
   marketPhase: string;
   name: string | null;
   symbol: string | null;
@@ -47,7 +49,11 @@ export class SentinelStore {
     this.#db.exec(
       "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at_utc TEXT NOT NULL)",
     );
-    const migrations = ["001-initial.sql", "002-mint-state-and-provenance.sql"];
+    const migrations = [
+      "001-initial.sql",
+      "002-mint-state-and-provenance.sql",
+      "003-discovery-hardening.sql",
+    ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
       const alreadyApplied = this.#db
@@ -77,6 +83,7 @@ export class SentinelStore {
   ingestEvent(
     input: MarketEvent,
     maxMonitoredTokens: number,
+    heliusEnabled = false,
   ): {
     inserted: boolean;
     monitoringEligible: boolean;
@@ -143,6 +150,23 @@ export class SentinelStore {
           ingestionLatencyMs,
         );
 
+      this.#db
+        .prepare(
+          `INSERT INTO discovery_checkpoints(provider, last_slot, last_signature, last_event_id, updated_at_utc)
+          VALUES (?, ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET
+          last_slot = excluded.last_slot, last_signature = excluded.last_signature,
+          last_event_id = excluded.last_event_id, updated_at_utc = excluded.updated_at_utc
+          WHERE excluded.last_slot IS NOT NULL AND
+          (discovery_checkpoints.last_slot IS NULL OR excluded.last_slot >= discovery_checkpoints.last_slot)`,
+        )
+        .run(
+          event.provider,
+          event.slot ?? null,
+          event.txSignature ?? null,
+          event.id,
+          event.receivedAtUtc,
+        );
+
       const phase =
         event.kind === "TOKEN_MIGRATED"
           ? "MIGRATED_UNKNOWN_VENUE"
@@ -150,13 +174,15 @@ export class SentinelStore {
       this.#db
         .prepare(
           `INSERT INTO tokens
-        (mint, first_seen_at_utc, last_seen_at_utc, created_slot, creator, market_phase, name, symbol, uri, monitoring_eligible, event_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        (mint, first_seen_at_utc, last_seen_at_utc, created_slot, creator, launch_initiator, migration_slot, market_phase, name, symbol, uri, monitoring_eligible, event_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(mint) DO UPDATE SET
           first_seen_at_utc = MIN(tokens.first_seen_at_utc, excluded.first_seen_at_utc),
           last_seen_at_utc = MAX(tokens.last_seen_at_utc, excluded.last_seen_at_utc),
           created_slot = COALESCE(tokens.created_slot, excluded.created_slot),
           creator = COALESCE(tokens.creator, excluded.creator),
+          launch_initiator = COALESCE(tokens.launch_initiator, excluded.launch_initiator),
+          migration_slot = COALESCE(tokens.migration_slot, excluded.migration_slot),
           market_phase = CASE WHEN tokens.market_phase = 'MIGRATED_UNKNOWN_VENUE' OR excluded.market_phase = 'MIGRATED_UNKNOWN_VENUE' THEN 'MIGRATED_UNKNOWN_VENUE' ELSE tokens.market_phase END,
           name = COALESCE(tokens.name, excluded.name), symbol = COALESCE(tokens.symbol, excluded.symbol), uri = COALESCE(tokens.uri, excluded.uri),
           event_count = tokens.event_count + 1`,
@@ -165,14 +191,26 @@ export class SentinelStore {
           event.mint,
           event.firstSeenAtUtc,
           event.receivedAtUtc,
-          event.slot ?? null,
+          event.kind === "TOKEN_CREATED" ? (event.slot ?? null) : null,
           event.creator ?? null,
+          event.launchInitiator ?? null,
+          event.kind === "TOKEN_MIGRATED" ? (event.slot ?? null) : null,
           phase,
           event.name ?? null,
           event.symbol ?? null,
           event.uri ?? null,
           eligible ? 1 : 0,
         );
+      if (eligible && heliusEnabled) {
+        const now = utcNow();
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO enrichment_jobs
+            (event_id, mint, status, next_attempt_at_utc, created_at_utc, updated_at_utc)
+            VALUES (?, ?, 'PENDING', ?, ?, ?)`,
+          )
+          .run(event.id, event.mint, now, now, now);
+      }
       this.#db.exec("COMMIT");
       return {
         inserted: true,
@@ -223,13 +261,134 @@ export class SentinelStore {
       .run(status, slot, owner, errorCode, mint);
   }
 
+  tryConsumeHeliusRequest(maxRequestsPerUtcDay: number): boolean {
+    const utcDay = utcNow().slice(0, 10);
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          "INSERT OR IGNORE INTO helius_request_budget(utc_day, requests_used) VALUES (?, 0)",
+        )
+        .run(utcDay);
+      const result = this.#db
+        .prepare(
+          `UPDATE helius_request_budget SET requests_used = requests_used + 1
+          WHERE utc_day = ? AND requests_used < ?`,
+        )
+        .run(utcDay, maxRequestsPerUtcDay);
+      this.#db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  claimEnrichmentJob(): {
+    eventId: string;
+    mint: string;
+    kind: MarketEvent["kind"];
+    slot: number | null;
+    attempts: number;
+  } | null {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const now = utcNow();
+      const row = this.#db
+        .prepare(
+          `SELECT j.event_id, j.mint, j.attempts, e.kind, e.slot
+          FROM enrichment_jobs j JOIN market_events e ON e.id = j.event_id
+          WHERE j.status = 'PENDING' AND j.next_attempt_at_utc <= ?
+          ORDER BY j.created_at_utc LIMIT 1`,
+        )
+        .get(now) as SqlRow | undefined;
+      if (!row) {
+        this.#db.exec("COMMIT");
+        return null;
+      }
+      const changed = this.#db
+        .prepare(
+          `UPDATE enrichment_jobs SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
+          WHERE event_id = ? AND status = 'PENDING'`,
+        )
+        .run(now, String(row["event_id"]));
+      this.#db.exec("COMMIT");
+      return Number(changed.changes) === 1
+        ? {
+            eventId: String(row["event_id"]),
+            mint: String(row["mint"]),
+            kind: row["kind"] as MarketEvent["kind"],
+            slot: row["slot"] === null ? null : Number(row["slot"]),
+            attempts: Number(row["attempts"]) + 1,
+          }
+        : null;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishEnrichmentJob(
+    eventId: string,
+    status: "COMPLETE" | "FAILED" | "DEFERRED_BUDGET" | "PENDING",
+    errorCode: string | null = null,
+    retryDelayMs = 0,
+  ): void {
+    const now = utcNow();
+    this.#db
+      .prepare(
+        `UPDATE enrichment_jobs SET status = ?, last_error_code = ?,
+        next_attempt_at_utc = ?, updated_at_utc = ? WHERE event_id = ?`,
+      )
+      .run(
+        status,
+        errorCode,
+        new Date(Date.now() + retryDelayMs).toISOString(),
+        now,
+        eventId,
+      );
+  }
+
+  recoverInterruptedEnrichmentJobs(): number {
+    const result = this.#db
+      .prepare(
+        `UPDATE enrichment_jobs SET status = 'PENDING', updated_at_utc = ?
+        WHERE status = 'PROCESSING'`,
+      )
+      .run(utcNow());
+    return Number(result.changes);
+  }
+
+  recordStreamDisconnect(errorCode: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO stream_gaps(provider, disconnected_at_utc, reconciliation_state, error_code)
+        SELECT 'pumpportal', ?, 'OPEN', ? WHERE NOT EXISTS
+        (SELECT 1 FROM stream_gaps WHERE provider = 'pumpportal' AND reconciliation_state = 'OPEN')`,
+      )
+      .run(utcNow(), errorCode);
+  }
+
+  recordStreamReconnect(): void {
+    this.#db
+      .prepare(
+        `UPDATE stream_gaps SET reconciliation_state = 'UNRECOVERED', reconnected_at_utc = ?
+        WHERE provider = 'pumpportal' AND reconciliation_state = 'OPEN'`,
+      )
+      .run(utcNow());
+  }
+
   setProviderHealth(health: ProviderHealth): void {
     this.#db
       .prepare(
-        `INSERT INTO provider_health(provider, state, checked_at_utc, last_event_at_utc, reconnect_count, error_code)
-      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET state = excluded.state,
+        `INSERT INTO provider_health(provider, state, checked_at_utc, last_event_at_utc, reconnect_count, error_code,
+      connection_state, last_message_at_utc, last_processed_at_utc, processing_lag_ms, queue_depth)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET state = excluded.state,
       checked_at_utc = excluded.checked_at_utc, last_event_at_utc = excluded.last_event_at_utc,
-      reconnect_count = excluded.reconnect_count, error_code = excluded.error_code`,
+      reconnect_count = excluded.reconnect_count, error_code = excluded.error_code,
+      connection_state = excluded.connection_state, last_message_at_utc = excluded.last_message_at_utc,
+      last_processed_at_utc = excluded.last_processed_at_utc, processing_lag_ms = excluded.processing_lag_ms,
+      queue_depth = excluded.queue_depth`,
       )
       .run(
         health.provider,
@@ -238,6 +397,11 @@ export class SentinelStore {
         health.lastEventAtUtc,
         health.reconnectCount,
         health.errorCode,
+        health.connectionState ?? null,
+        health.lastMessageAtUtc ?? health.lastEventAtUtc,
+        health.lastProcessedAtUtc ?? null,
+        health.processingLagMs ?? null,
+        health.queueDepth ?? 0,
       );
   }
 
@@ -258,6 +422,26 @@ export class SentinelStore {
           : String(row["last_event_at_utc"]),
       reconnectCount: Number(row["reconnect_count"]),
       errorCode: row["error_code"] === null ? null : String(row["error_code"]),
+      ...(row["connection_state"] === null
+        ? {}
+        : {
+            connectionState: String(row["connection_state"]) as NonNullable<
+              ProviderHealth["connectionState"]
+            >,
+          }),
+      lastMessageAtUtc:
+        row["last_message_at_utc"] === null
+          ? null
+          : String(row["last_message_at_utc"]),
+      lastProcessedAtUtc:
+        row["last_processed_at_utc"] === null
+          ? null
+          : String(row["last_processed_at_utc"]),
+      processingLagMs:
+        row["processing_lag_ms"] === null
+          ? null
+          : Number(row["processing_lag_ms"]),
+      queueDepth: Number(row["queue_depth"] ?? 0),
     }));
   }
 
@@ -266,6 +450,26 @@ export class SentinelStore {
       .prepare("SELECT COUNT(*) AS count FROM market_events")
       .get() as SqlRow;
     return Number(row["count"] ?? 0);
+  }
+
+  getDiscoveryCheckpoint(provider = "pumpportal"): {
+    lastSlot: number | null;
+    lastSignature: string | null;
+    lastEventId: string | null;
+    updatedAtUtc: string;
+  } | null {
+    const row = this.#db
+      .prepare("SELECT * FROM discovery_checkpoints WHERE provider = ?")
+      .get(provider) as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      lastSlot: row["last_slot"] === null ? null : Number(row["last_slot"]),
+      lastSignature:
+        row["last_signature"] === null ? null : String(row["last_signature"]),
+      lastEventId:
+        row["last_event_id"] === null ? null : String(row["last_event_id"]),
+      updatedAtUtc: String(row["updated_at_utc"]),
+    };
   }
 
   close(): void {
@@ -300,6 +504,10 @@ function mapToken(row: SqlRow): StoredToken {
     createdSlot:
       row["created_slot"] === null ? null : Number(row["created_slot"]),
     creator: row["creator"] === null ? null : String(row["creator"]),
+    launchInitiator:
+      row["launch_initiator"] === null ? null : String(row["launch_initiator"]),
+    migrationSlot:
+      row["migration_slot"] === null ? null : Number(row["migration_slot"]),
     marketPhase: String(row["market_phase"]),
     name: row["name"] === null ? null : String(row["name"]),
     symbol: row["symbol"] === null ? null : String(row["symbol"]),

@@ -7,6 +7,7 @@ import {
   pumpPortalHealth,
 } from "@sentinel/providers";
 import { SentinelStore } from "@sentinel/storage";
+import { EnrichmentScheduler } from "./enrichment.ts";
 import { log } from "./logger.ts";
 
 async function main(): Promise<void> {
@@ -63,6 +64,10 @@ async function main(): Promise<void> {
       requestTimeoutMs: loaded.config.providers.helius.request_timeout_ms,
       maxRequestsPerSecond:
         loaded.config.providers.helius.max_requests_per_second,
+      consumeRequestBudget: () =>
+        store.tryConsumeHeliusRequest(
+          loaded.config.providers.helius.max_requests_per_utc_day,
+        ),
     });
     const health = await helius.getHealth();
     heliusState = health.ok ? "HEALTHY" : "DEGRADED";
@@ -81,18 +86,40 @@ async function main(): Promise<void> {
     errorCode: heliusError,
   });
 
+  const enrichment = helius
+    ? new EnrichmentScheduler(
+        store,
+        helius,
+        loaded.config.providers.helius.max_concurrent_enrichments,
+      )
+    : undefined;
+  enrichment?.start();
+
   const pump = new PumpPortalClient({
     apiKey: loaded.pumpPortalApiKey,
     enableNewTokens: loaded.config.providers.pumpportal.enable_new_tokens,
     enableMigrations: loaded.config.providers.pumpportal.enable_migrations,
-    onHealth(state, reconnectCount, errorCode, lastEventAtUtc) {
+    onHealth(
+      state,
+      reconnectCount,
+      errorCode,
+      lastEventAtUtc,
+      queueDepth,
+      lastProcessedAtUtc,
+    ) {
       const health = pumpPortalHealth(
         state,
         reconnectCount,
         errorCode,
         lastEventAtUtc,
+        queueDepth,
+        lastProcessedAtUtc ?? null,
       );
       store.setProviderHealth(health);
+      if (health.connectionState === "DISCONNECTED")
+        store.recordStreamDisconnect(errorCode ?? "SOCKET_DISCONNECTED");
+      if (state === "HEALTHY" && reconnectCount > 0)
+        store.recordStreamReconnect();
       log(state === "DEGRADED" ? "warn" : "info", "provider.pumpportal.state", {
         state,
         reconnectCount,
@@ -103,80 +130,10 @@ async function main(): Promise<void> {
       const outcome = store.ingestEvent(
         event,
         loaded.config.providers.pumpportal.max_monitored_tokens,
+        Boolean(helius),
       );
-      if (outcome.inserted && event.kind === "TOKEN_CREATED" && helius) {
-        try {
-          const mintAccount = await helius.getAccountInfo(event.mint);
-          store.recordMintAccount(
-            event.mint,
-            mintAccount.account ? "PRESENT" : "NOT_FOUND",
-            mintAccount.slot,
-            mintAccount.account?.owner ?? null,
-            null,
-          );
-          store.setProviderHealth({
-            provider: "helius",
-            state: "HEALTHY",
-            checkedAtUtc: utcNow(),
-            lastEventAtUtc: null,
-            reconnectCount: 0,
-            errorCode: null,
-          });
-        } catch (error) {
-          const errorCode =
-            error instanceof Error ? error.message : "PROVIDER_UNAVAILABLE";
-          store.recordMintAccount(
-            event.mint,
-            "PROVIDER_ERROR",
-            null,
-            null,
-            errorCode,
-          );
-          store.setProviderHealth({
-            provider: "helius",
-            state: "DEGRADED",
-            checkedAtUtc: utcNow(),
-            lastEventAtUtc: null,
-            reconnectCount: 0,
-            errorCode,
-          });
-          log("warn", "provider.helius.mint_read_failed", {
-            mint: event.mint,
-            errorCode,
-          });
-        }
-      }
-      if (outcome.inserted && event.slot !== undefined && helius) {
-        try {
-          const observedAtUtc = await helius.getBlockTime(event.slot);
-          if (observedAtUtc)
-            store.recordObservedTimestamp(event.id, observedAtUtc);
-          store.setProviderHealth({
-            provider: "helius",
-            state: "HEALTHY",
-            checkedAtUtc: utcNow(),
-            lastEventAtUtc: null,
-            reconnectCount: 0,
-            errorCode: null,
-          });
-        } catch (error) {
-          const errorCode =
-            error instanceof Error ? error.message : "PROVIDER_UNAVAILABLE";
-          store.setProviderHealth({
-            provider: "helius",
-            state: "DEGRADED",
-            checkedAtUtc: utcNow(),
-            lastEventAtUtc: null,
-            reconnectCount: 0,
-            errorCode,
-          });
-          log("warn", "provider.helius.block_time_failed", {
-            mint: event.mint,
-            slot: event.slot,
-            errorCode,
-          });
-        }
-      }
+      if (outcome.inserted && outcome.monitoringEligible && helius)
+        enrichment?.wake();
       log(
         "info",
         outcome.inserted ? "token.event.persisted" : "token.event.duplicate",
@@ -191,23 +148,38 @@ async function main(): Promise<void> {
     },
   });
 
-  let stopped = false;
-  const shutdown = (): void => {
-    if (stopped) return;
-    stopped = true;
-    void pump.stop().finally(() => {
-      store.close();
-      log("info", "worker.stopped");
-    });
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      let pumpStopError: unknown;
+      try {
+        try {
+          await pump.stop();
+        } catch (error) {
+          pumpStopError = error;
+        }
+        await enrichment?.stop();
+        if (pumpStopError) throw pumpStopError;
+      } finally {
+        store.close();
+        log("info", "worker.stopped");
+      }
+    })();
+    return shutdownPromise;
   };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
   log("info", "worker.started", {
     mode: loaded.config.mode,
     configVersion: loaded.configVersion,
     database: loaded.dbPath,
   });
-  await pump.start();
+  try {
+    await pump.start();
+  } finally {
+    await shutdown();
+  }
 }
 
 main().catch((error: unknown) => {

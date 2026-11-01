@@ -31,6 +31,7 @@ export type HeliusOptions = {
   maxRequestsPerSecond?: number;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  consumeRequestBudget?: () => boolean;
 };
 export type HeliusAccount = {
   slot: number;
@@ -136,6 +137,8 @@ export class HeliusRpcClient {
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await this.#pace();
+      if (this.#opts.consumeRequestBudget && !this.#opts.consumeRequestBudget())
+        throw new ProviderFailure("REQUEST_BUDGET_EXHAUSTED");
       const controller = new AbortController();
       const timeout = setTimeout(
         () => controller.abort(),
@@ -171,7 +174,8 @@ export class HeliusRpcClient {
               );
         if (
           lastFailure.code === "RPC_REJECTED" ||
-          lastFailure.code === "MALFORMED_RESPONSE"
+          lastFailure.code === "MALFORMED_RESPONSE" ||
+          lastFailure.code === "REQUEST_BUDGET_EXHAUSTED"
         )
           break;
         if (attempt < 2)

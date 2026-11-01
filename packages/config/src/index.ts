@@ -29,6 +29,8 @@ export const AppConfigSchema = z
           .object({
             request_timeout_ms: z.number().int().min(100).max(30000),
             max_requests_per_second: z.number().int().min(1).max(1000),
+            max_requests_per_utc_day: positiveInt,
+            max_concurrent_enrichments: z.number().int().min(1).max(32),
           })
           .strict(),
         pumpportal: z

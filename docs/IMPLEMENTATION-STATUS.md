@@ -7,15 +7,19 @@ The provided checkout was a documentation blueprint, not an application. It cont
 ## Delivered in this slice
 
 - Strict TypeScript pnpm workspace and Zod/YAML validated mainnet `DRY_RUN` configuration.
-- SQLite WAL migration, durable normalized PumpPortal events, bounded sanitized payloads, deterministic idempotency keys, first-seen/received times, event ingestion duration, token records, provider health, and migration-safe phase updates.
-- One PumpPortal WebSocket client subscribing to launch and migration streams, with bounded message size, schema checks, heartbeat, reconnect/backoff, and graceful stop.
-- Helius JSON-RPC health/genesis and account-info reader with response validation, deadline, retry, circuit breaker, and safe error codes.
+- SQLite WAL migrations through version 3, durable normalized PumpPortal events, bounded sanitized payloads, idempotency, separate create/migration slots, reported creator/trader roles, and provenance timestamps.
+- One PumpPortal WebSocket client with message and pending-handler bounds, heartbeat, reconnect/backoff, resubscription, and callback draining during shutdown. Overflow closes the stream and is recorded as an unrecovered gap.
+- Helius JSON-RPC reader with response validation, timeout, retries, circuit breaker, per-second pacing, persistent UTC-day request budget, and safe error codes.
+- A durable SQLite enrichment queue consumes only monitoring-eligible events, claims work with bounded concurrency, retries transient failures, and recovers interrupted jobs after restart. Shutdown waits for claimed requests to settle before closing SQLite.
+- Provider health stores socket state, last event/message time, last processed time, processing lag, queue depth, reconnect count, and provider error code separately.
 - Read-only worker commands and API health/readiness/token routes, with readiness based on PumpPortal heartbeat freshness; no dashboard, signing, sending, wallet key, paper fills, or live arming.
 - Fixture tests for config fail-closed cases, malformed/duplicate/out-of-order events, monitoring caps, Helius malformed responses and secret redaction.
 
 ## Provider contract limits
 
-The official PumpPortal streaming reference verifies the WebSocket URL, `subscribeNewToken`, `subscribeMigration`, one-connection guidance, and that those two feeds are free. Its public page does not establish a stable event payload schema. The adapter therefore treats every payload as untrusted, accepts only recognized `txType`/`type`/`event` discriminator values plus a mint that validates as a public key, and rejects unknown shapes. The checked-in `.synthetic.json` files exercise this adapter contract; they are not provider captures. Confirm the discriminator values against a live sanitized capture before enabling persistent operation. The credentials needed for an actual provider connection were not supplied or used here.
+The official PumpPortal streaming reference verifies the WebSocket URL, `subscribeNewToken`, `subscribeMigration`, one-connection guidance, and that those two feeds are free. It does not publish the event payload schema or define `traderPublicKey` versus `creator`. The adapter preserves `traderPublicKey` as `launchInitiator` and `creator` as a separate provider-reported creator claim, but the semantic mapping remains unverified. The checked-in `.synthetic.json` files exercise that distinction; they are not provider captures. No live sanitized capture or provider credentials were available, so payload validation remains incomplete.
+
+PumpPortal does not document replay/cursor support on the public streaming page. A disconnect therefore creates a persisted gap record, and reconnection marks it `UNRECOVERED`. No complete-history claim is made. Helius can query known addresses/signatures, but a full missed-launch scan requires a verified program/event decoder and paging strategy that this foundation does not yet implement.
 
 Helius uses the documented mainnet RPC endpoint and standard Solana `getHealth`, `getGenesisHash`, `getAccountInfo`, and `getBlockTime` methods. `getBlockTime` is an estimated ledger timestamp, separate from local receipt time. `getAccountInfo` currently returns raw owner/data/slot only; mint layout and Token-2022 extension parsing are intentionally deferred to the security milestone. Without Helius credentials, chain timestamps and mint state remain unknown rather than inferred.
 
@@ -35,22 +39,22 @@ SQLite currently uses Node's built-in `node:sqlite` API. Node's official docs cl
 
 ## Validation record
 
-Verified on Node.js 26.8.1 / pnpm 11.3.0:
+Verified locally on Node.js 26.8.1 / pnpm 11.3.0:
 
-- `pnpm install --offline --ignore-scripts`: passed.
-- `pnpm typecheck`: passed with no TypeScript errors.
-- `pnpm test`: 14 passed, 0 failed.
+- `pnpm typecheck`: passed.
+- `pnpm test`: 21 passed, 0 failed. This includes storage/provider integration tests and deterministic failure-mode simulations.
 - `pnpm lint`: passed.
 - `pnpm format:check`: passed.
-- `DB_PATH=/tmp/sentinel-smoke.sqlite pnpm db:migrate`, `pnpm health`, and `pnpm tokens`: passed; fresh database reported zero events and no provider states.
-- `PUMPPORTAL_API_KEY` unset with `pnpm dev:worker`: exited nonzero with `PUMPPORTAL_API_KEY is required ... no feed was started`, as intended.
+- `pnpm docs:check`: passed; all README local links resolve.
+- `DB_PATH=/tmp/solana-sentinel-hardening-final2.sqlite pnpm db:migrate`: passed on a fresh database.
+- Migration tests cover version-one/version-two upgrades, partially applied columns, create/migration slot backfill, interrupted queue recovery, and idempotent reopen behavior.
 
-Provider connectivity, a long-running stream, container deployment, and mainnet account reads require external credentials/network and were not verified from fixtures.
+PumpPortal provider connectivity, a live payload capture, Helius mainnet reads, long-running reconnect behavior against the provider, GitHub Actions execution, and Docker deployment require external credentials/network or GitHub and were not verified. Synthetic fixtures are not production market data.
 
 ## Remaining milestones
 
-1. Verify PumpPortal discriminators/fields with a sanitized live capture and add a captured fixture.
-2. Reconcile gaps after reconnect from a documented Helius history method and persist source chain timestamps where available.
+1. Obtain a sanitized PumpPortal capture and verify discriminator/role semantics before treating event fields as provider-confirmed.
+2. Implement a Helius-backed gap reconciler only after selecting and validating the relevant program history and transaction decoder; current gaps remain explicitly unrecovered.
 3. Add creator intelligence, role/evidence classification, token program and Token-2022 mint decoding, test-token heuristics, and fail-closed risk reports.
 4. Add venue-specific current-state quotes before any paper execution. Missing or unsupported quote must never fill.
 5. Add dashboard after API contracts and user-visible states stabilize.

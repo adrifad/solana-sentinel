@@ -21,6 +21,12 @@ test("normalizes launch and migration fixtures with deterministic UTC identity",
   const first = parsePumpPortalMessage(created, 1793500000000);
   const duplicate = parsePumpPortalMessage(created, 1793500005000);
   assert.equal(first.kind, "TOKEN_CREATED");
+  assert.equal(
+    first.launchInitiator,
+    "So11111111111111111111111111111111111111112",
+  );
+  assert.equal(first.creator, "11111111111111111111111111111111");
+  assert.notEqual(first.launchInitiator, first.creator);
   assert.equal(first.receivedAtUtc, "2026-11-01T02:26:40.000Z");
   assert.equal(first.idempotencyKey, duplicate.idempotencyKey);
   assert.equal(parsePumpPortalMessage(migration).kind, "TOKEN_MIGRATED");
@@ -68,6 +74,13 @@ test("persists unique events, preserves migration phase on out-of-order launch, 
       store.getToken(launch.mint)?.marketPhase,
       "MIGRATED_UNKNOWN_VENUE",
     );
+    assert.equal(store.getToken(launch.mint)?.createdSlot, launch.slot);
+    assert.equal(store.getToken(launch.mint)?.migrationSlot, migrated.slot);
+    assert.equal(store.getDiscoveryCheckpoint()?.lastSlot, migrated.slot);
+    assert.equal(
+      store.getToken(launch.mint)?.launchInitiator,
+      launch.launchInitiator,
+    );
     assert.equal(store.getToken(launch.mint)?.eventCount, 2);
 
     const secondMint = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -75,9 +88,10 @@ test("persists unique events, preserves migration phase on out-of-order launch, 
       { txType: "create", mint: secondMint },
       1793500020000,
     );
-    const outcome = store.ingestEvent(second, 1);
+    const outcome = store.ingestEvent(second, 1, true);
     assert.equal(outcome.inserted, true);
     assert.equal(outcome.monitoringEligible, false);
+    assert.equal(store.claimEnrichmentJob(), null);
     store.close();
     currentStore = undefined;
     const reopened = new SentinelStore(join(dir, "sentinel.db"));
@@ -132,6 +146,85 @@ test("applies the mint-state migration to an existing version-one database", asy
         ?.mintStateStatus,
       "UNKNOWN",
     );
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("migration 003 repairs legacy creation slots from event kind and retains migration slots", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sentinel-slot-repair-"));
+  const dbPath = join(dir, "legacy-v2.db");
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(
+    "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_utc TEXT NOT NULL)",
+  );
+  legacy.exec(
+    await readFile("packages/storage/migrations/001-initial.sql", "utf8"),
+  );
+  legacy.exec(
+    await readFile(
+      "packages/storage/migrations/002-mint-state-and-provenance.sql",
+      "utf8",
+    ),
+  );
+  const now = new Date().toISOString();
+  legacy
+    .prepare(
+      "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+    )
+    .run(1, now);
+  legacy
+    .prepare(
+      "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+    )
+    .run(2, now);
+  legacy
+    .prepare(
+      `INSERT INTO tokens
+      (mint, first_seen_at_utc, last_seen_at_utc, created_slot, creator, market_phase, monitoring_eligible, event_count)
+      VALUES (?, ?, ?, ?, ?, 'MIGRATED_UNKNOWN_VENUE', 1, 2)`,
+    )
+    .run(
+      "So11111111111111111111111111111111111111112",
+      now,
+      now,
+      341197054,
+      "11111111111111111111111111111111",
+    );
+  for (const input of [created, migration]) {
+    const event = parsePumpPortalMessage(input, Date.parse(now));
+    legacy
+      .prepare(
+        `INSERT INTO market_events
+        (id, provider, kind, mint, signature, slot, observed_at_utc, received_at_utc, first_seen_at_utc,
+        idempotency_key, payload_ref, sanitized_payload, ingestion_latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.id,
+        event.provider,
+        event.kind,
+        event.mint,
+        event.txSignature ?? null,
+        event.slot ?? null,
+        null,
+        event.receivedAtUtc,
+        event.firstSeenAtUtc,
+        event.idempotencyKey,
+        event.rawPayloadRef,
+        event.sanitizedPayload,
+        0,
+      );
+  }
+  legacy.close();
+
+  const store = new SentinelStore(dbPath);
+  await store.open();
+  try {
+    const token = store.getToken("So11111111111111111111111111111111111111112");
+    assert.equal(token?.createdSlot, parsePumpPortalMessage(created).slot);
+    assert.equal(token?.migrationSlot, parsePumpPortalMessage(migration).slot);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });
