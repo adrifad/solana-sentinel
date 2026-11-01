@@ -11,23 +11,18 @@
 7. **Risk & Strategy:** config revisions and allowed hot-reload fields, pause switch, read-only locked caps.
 8. **System:** provider health, reconnects, stale data, costs/quotas, DB backups, current build and configuration version.
 
-## Proposed REST routes (to be implemented)
+## REST routes
 
 ```http
 GET    /api/health
-GET    /api/status
-GET    /api/tokens?status=WATCH&limit=50
+GET    /api/completeness
+GET    /ready
+GET    /api/tokens?limit=50
 GET    /api/tokens/:mint
 GET    /api/creators/:pubkey
-GET    /api/decisions?mint=<mint>
-GET    /api/portfolio/paper
-GET    /api/orders?mode=PAPER
-GET    /api/config
-PATCH  /api/config/strategy     # only safe allowlist fields
-POST   /api/control/pause      # requires admin auth
-POST   /api/control/resume     # after preflight, not LIVE arming
-GET    /api/events/stream      # SSE event updates
 ```
+
+The implemented API is read-only: token detail includes role evidence, latest security report, and decisions; creator detail includes reputation, historical launches, and wallet-link evidence. Portfolio, orders, config mutation, authentication, and push event streaming remain unimplemented. No endpoint can change mode or arm trading.
 
 ## Security / UX rules
 

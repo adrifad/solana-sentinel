@@ -55,7 +55,10 @@ export const AppConfigSchema = z
         concurrent_token_analysis: positiveInt,
         creator_history_cache_ttl_seconds: positiveInt,
         creator_history_max_transactions: positiveInt,
+        creator_history_page_size: z.number().int().min(1).max(1000),
         creator_tracing_max_depth: z.number().int().min(0).max(8),
+        suspicious_launch_count: z.number().int().min(2).max(100),
+        suspicious_launch_window_seconds: positiveInt,
         max_analysis_ms: positiveInt,
         token_observation_seconds: positiveInt,
         social_enabled: z.boolean(),
@@ -72,6 +75,8 @@ export const AppConfigSchema = z
         reject_unsupported_transfer_hooks: z.boolean(),
         require_sell_quote_for_buy: z.boolean(),
         max_snapshot_age_ms: z.number().int().nonnegative(),
+        max_holder_accounts: z.number().int().min(1).max(20),
+        max_snapshot_slot_skew: z.number().int().nonnegative().max(10000),
       })
       .strict(),
     strategy: z

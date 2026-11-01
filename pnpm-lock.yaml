@@ -17,12 +17,21 @@ importers:
       '@sentinel/domain':
         specifier: workspace:*
         version: link:packages/domain
+      '@sentinel/intelligence':
+        specifier: workspace:*
+        version: link:packages/intelligence
       '@sentinel/providers':
         specifier: workspace:*
         version: link:packages/providers
+      '@sentinel/security':
+        specifier: workspace:*
+        version: link:packages/security
       '@sentinel/storage':
         specifier: workspace:*
         version: link:packages/storage
+      '@sentinel/strategy':
+        specifier: workspace:*
+        version: link:packages/strategy
       '@types/node':
         specifier: ^24.10.0
         version: 24.19.2
@@ -65,12 +74,21 @@ importers:
       '@sentinel/domain':
         specifier: workspace:*
         version: link:../../packages/domain
+      '@sentinel/intelligence':
+        specifier: workspace:*
+        version: link:../../packages/intelligence
       '@sentinel/providers':
         specifier: workspace:*
         version: link:../../packages/providers
+      '@sentinel/security':
+        specifier: workspace:*
+        version: link:../../packages/security
       '@sentinel/storage':
         specifier: workspace:*
         version: link:../../packages/storage
+      '@sentinel/strategy':
+        specifier: workspace:*
+        version: link:../../packages/strategy
       yaml:
         specifier: ^2.8.1
         version: 2.9.1
@@ -96,6 +114,15 @@ importers:
         specifier: ^4.1.12
         version: 4.6.7
 
+  packages/intelligence:
+    dependencies:
+      '@sentinel/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@sentinel/providers':
+        specifier: workspace:*
+        version: link:../providers
+
   packages/providers:
     dependencies:
       '@sentinel/domain':
@@ -108,7 +135,19 @@ importers:
         specifier: ^4.1.12
         version: 4.6.7
 
+  packages/security:
+    dependencies:
+      '@sentinel/domain':
+        specifier: workspace:*
+        version: link:../domain
+
   packages/storage:
+    dependencies:
+      '@sentinel/domain':
+        specifier: workspace:*
+        version: link:../domain
+
+  packages/strategy:
     dependencies:
       '@sentinel/domain':
         specifier: workspace:*

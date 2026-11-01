@@ -36,6 +36,12 @@
 
 Token program semantics vary: a standard Pump.fun token and a custom Token-2022 mint must not be graded with identical assumptions.
 
+## Implemented DRY_RUN gate
+
+The current worker persists `SUPPORTED`, `UNSUPPORTED`, `MISSING`, or `UNSAFE` mint/security reports and `REJECT`, `QUARANTINE`, `WATCH`, or `BUY_ELIGIBLE` decisions with evidence references, config hash, timestamps, and analysis latency. The SPL base mint layout and a conservative Token-2022 TLV parser are implemented. Unknown/malformed extensions fail closed; active mint/freeze authorities are classified unsafe. Holder concentration is sampled and explicitly incomplete. Test-token metadata patterns are persisted with a separate heuristic confidence.
+
+The current pipeline cannot produce `BUY_ELIGIBLE`: full holder coverage and a current executable sell/exit validation are unavailable, and the exit check remains `UNKNOWN`. No order is submitted and no virtual portfolio is changed. A successful mint decode by itself does not imply the full security gate passed.
+
 ## Opportunity score (only after hard gate)
 
 Example initial score: `creator_history 30`, `token_security 25`, `launch_behavior 20`, `exit_liquidity 15`, `social_confidence 10`, total 100. If social disabled, re-normalize weights **only**; never turn missing critical security data into zero-risk.

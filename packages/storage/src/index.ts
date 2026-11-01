@@ -3,8 +3,22 @@ import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { MarketEventSchema, utcNow } from "@sentinel/domain";
-import type { MarketEvent, ProviderHealth } from "@sentinel/domain";
+import {
+  CreatorReputationSchema,
+  MarketEventSchema,
+  RiskDecisionSchema,
+  TokenRiskReportSchema,
+  WalletRoleEvidenceSchema,
+  utcNow,
+} from "@sentinel/domain";
+import type {
+  CreatorReputation,
+  MarketEvent,
+  ProviderHealth,
+  RiskDecision,
+  TokenRiskReport,
+  WalletRoleEvidence,
+} from "@sentinel/domain";
 
 type SqlRow = Record<
   string,
@@ -56,6 +70,7 @@ export class SentinelStore {
       "002-mint-state-and-provenance.sql",
       "003-discovery-hardening.sql",
       "004-enrichment-and-completeness.sql",
+      "005-intelligence-security-decisions.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -215,6 +230,16 @@ export class SentinelStore {
           )
           .run(event.id, event.mint, now, now, now);
       }
+      if (event.kind === "TOKEN_CREATED") {
+        const now = utcNow();
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO analysis_jobs
+            (event_id, mint, status, next_attempt_at_utc, created_at_utc, updated_at_utc)
+            VALUES (?, ?, 'PENDING', ?, ?, ?)`,
+          )
+          .run(event.id, event.mint, now, now, now);
+      }
       this.#db.exec("COMMIT");
       return {
         inserted: true,
@@ -240,6 +265,40 @@ export class SentinelStore {
       .prepare("SELECT * FROM tokens WHERE mint = ?")
       .get(mint) as SqlRow | undefined;
     return row ? mapToken(row) : null;
+  }
+
+  getMarketEventSummary(eventId: string): {
+    mint: string;
+    kind: MarketEvent["kind"];
+    signature: string | null;
+    slot: number | null;
+    receivedAtUtc: string;
+    creatorClaim: string | null;
+    initiatorClaim: string | null;
+    monitoringEligible: boolean;
+  } | null {
+    const row = this.#db
+      .prepare(
+        `SELECT e.mint, e.kind, e.signature, e.slot, e.received_at_utc, t.creator, t.launch_initiator, t.monitoring_eligible
+        FROM market_events e JOIN tokens t USING(mint) WHERE e.id = ?`,
+      )
+      .get(eventId) as SqlRow | undefined;
+    return row
+      ? {
+          mint: String(row["mint"]),
+          kind: row["kind"] as MarketEvent["kind"],
+          signature:
+            row["signature"] === null ? null : String(row["signature"]),
+          slot: row["slot"] === null ? null : Number(row["slot"]),
+          receivedAtUtc: String(row["received_at_utc"]),
+          creatorClaim: row["creator"] === null ? null : String(row["creator"]),
+          initiatorClaim:
+            row["launch_initiator"] === null
+              ? null
+              : String(row["launch_initiator"]),
+          monitoringEligible: row["monitoring_eligible"] === 1,
+        }
+      : null;
   }
 
   recordObservedTimestamp(eventId: string, observedAtUtc: string): void {
@@ -487,6 +546,548 @@ export class SentinelStore {
       .prepare("SELECT COUNT(*) AS count FROM provider_event_conflicts")
       .get() as SqlRow;
     return Number(row["count"] ?? 0);
+  }
+
+  claimAnalysisJob(): {
+    eventId: string;
+    mint: string;
+    attempts: number;
+  } | null {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const now = utcNow();
+      const row = this.#db
+        .prepare(
+          `SELECT event_id, mint, attempts FROM analysis_jobs
+          WHERE status = 'PENDING' AND next_attempt_at_utc <= ?
+          ORDER BY created_at_utc LIMIT 1`,
+        )
+        .get(now) as SqlRow | undefined;
+      if (!row) {
+        this.#db.exec("COMMIT");
+        return null;
+      }
+      const changed = this.#db
+        .prepare(
+          `UPDATE analysis_jobs SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
+          WHERE event_id = ? AND status = 'PENDING'`,
+        )
+        .run(now, String(row["event_id"]));
+      this.#db.exec("COMMIT");
+      return Number(changed.changes) === 1
+        ? {
+            eventId: String(row["event_id"]),
+            mint: String(row["mint"]),
+            attempts: Number(row["attempts"]) + 1,
+          }
+        : null;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishAnalysisJob(eventId: string, retryDelayMs = 0): void {
+    const now = utcNow();
+    this.#db
+      .prepare(
+        `UPDATE analysis_jobs SET status = ?, next_attempt_at_utc = ?, updated_at_utc = ?
+        WHERE event_id = ?`,
+      )
+      .run(
+        retryDelayMs > 0 ? "PENDING" : "COMPLETE",
+        new Date(Date.now() + retryDelayMs).toISOString(),
+        now,
+        eventId,
+      );
+  }
+
+  recoverInterruptedAnalysisJobs(): number {
+    const result = this.#db
+      .prepare(
+        `UPDATE analysis_jobs SET status = 'PENDING', updated_at_utc = ?
+        WHERE status = 'PROCESSING'`,
+      )
+      .run(utcNow());
+    return Number(result.changes);
+  }
+
+  saveWalletTransaction(input: {
+    wallet: string;
+    signature: string;
+    slot: number;
+    blockTimeSeconds: number | null;
+    fetchedAtUtc: string;
+    succeeded: boolean;
+    feeLamportsRaw: string;
+    confidenceBps: number;
+    reasonCode: string;
+    sanitizedTransactionJson: string;
+  }): void {
+    if (input.sanitizedTransactionJson.length > 32768)
+      throw new Error("TRANSACTION_EVIDENCE_TOO_LARGE");
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO wallet_transactions
+        (wallet_pubkey, signature, slot, block_time_seconds, fetched_at_utc, succeeded,
+        fee_lamports_raw, provenance, confidence_bps, reason_code, sanitized_transaction_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'helius:getTransaction', ?, ?, ?)`,
+      )
+      .run(
+        input.wallet,
+        input.signature,
+        input.slot,
+        input.blockTimeSeconds,
+        input.fetchedAtUtc,
+        input.succeeded ? 1 : 0,
+        input.feeLamportsRaw,
+        input.confidenceBps,
+        input.reasonCode,
+        input.sanitizedTransactionJson,
+      );
+  }
+
+  walletTransactionCount(wallet: string, asOfSlot: number): number {
+    const row = this.#db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM wallet_transactions WHERE wallet_pubkey = ? AND slot <= ?",
+      )
+      .get(wallet, asOfSlot) as SqlRow;
+    return Number(row["count"] ?? 0);
+  }
+
+  saveWalletRoleEvidence(input: WalletRoleEvidence): void {
+    const evidence = WalletRoleEvidenceSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO wallet_role_evidence
+        (id, mint, wallet_pubkey, role, source, signature, slot, observed_at_utc, confidence_bps, reason_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        evidence.id,
+        evidence.mint,
+        evidence.wallet,
+        evidence.role,
+        evidence.source,
+        evidence.signature,
+        evidence.slot,
+        evidence.observedAtUtc,
+        evidence.confidenceBps,
+        evidence.reasonCode,
+      );
+  }
+
+  listWalletRoleEvidence(mint: string): WalletRoleEvidence[] {
+    const rows = this.#db
+      .prepare(
+        "SELECT * FROM wallet_role_evidence WHERE mint = ? ORDER BY slot, role",
+      )
+      .all(mint) as SqlRow[];
+    return rows.map((row) =>
+      WalletRoleEvidenceSchema.parse({
+        id: row["id"],
+        mint: row["mint"],
+        wallet: row["wallet_pubkey"],
+        role: row["role"],
+        source: row["source"],
+        signature: row["signature"],
+        slot: row["slot"],
+        observedAtUtc: row["observed_at_utc"],
+        confidenceBps: row["confidence_bps"],
+        reasonCode: row["reason_code"],
+      }),
+    );
+  }
+
+  saveCreatorLaunch(input: {
+    creator: string;
+    mint: string;
+    signature: string;
+    slot: number;
+    blockTimeSeconds: number | null;
+    observedAtUtc: string;
+    confidenceBps: number;
+    idlRevision: string;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO creator_launches
+        (creator_pubkey, mint, signature, slot, block_time_seconds, observed_at_utc,
+        source, confidence_bps, idl_revision)
+        VALUES (?, ?, ?, ?, ?, ?, 'helius:pump-public-docs/idl/pump.json', ?, ?)`,
+      )
+      .run(
+        input.creator,
+        input.mint,
+        input.signature,
+        input.slot,
+        input.blockTimeSeconds,
+        input.observedAtUtc,
+        input.confidenceBps,
+        input.idlRevision,
+      );
+  }
+
+  listCreatorLaunches(
+    creator: string,
+    asOfSlot: number,
+  ): Array<{
+    mint: string;
+    signature: string;
+    slot: number;
+    blockTimeSeconds: number | null;
+    observedAtUtc: string;
+    confidenceBps: number;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT mint, signature, slot, block_time_seconds, observed_at_utc, confidence_bps
+        FROM creator_launches WHERE creator_pubkey = ? AND slot <= ? ORDER BY slot, signature`,
+      )
+      .all(creator, asOfSlot) as SqlRow[];
+    return rows.map((row) => ({
+      mint: String(row["mint"]),
+      signature: String(row["signature"]),
+      slot: Number(row["slot"]),
+      blockTimeSeconds:
+        row["block_time_seconds"] === null
+          ? null
+          : Number(row["block_time_seconds"]),
+      observedAtUtc: String(row["observed_at_utc"]),
+      confidenceBps: Number(row["confidence_bps"]),
+    }));
+  }
+
+  saveWalletLink(input: {
+    id: string;
+    sourceWallet: string;
+    destinationWallet: string;
+    relationType: "DIRECT_FUNDING" | "REPEATED_COSIGNER";
+    signature: string;
+    slot: number;
+    observedAtUtc: string;
+    amountLamportsRaw: string | null;
+    confidenceBps: number;
+    reasonCode: string;
+  }): void {
+    if (input.sourceWallet === input.destinationWallet) return;
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO wallet_links
+        (id, source_wallet, destination_wallet, relation_type, evidence_signature, slot,
+        observed_at_utc, amount_lamports_raw, confidence_bps, reason_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.sourceWallet,
+        input.destinationWallet,
+        input.relationType,
+        input.signature,
+        input.slot,
+        input.observedAtUtc,
+        input.amountLamportsRaw,
+        input.confidenceBps,
+        input.reasonCode,
+      );
+  }
+
+  countSharedCosignerEvidence(
+    wallet: string,
+    peer: string,
+    asOfSlot: number,
+  ): number {
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(DISTINCT evidence_signature) AS count FROM wallet_links
+        WHERE relation_type = 'REPEATED_COSIGNER' AND slot <= ?
+        AND ((source_wallet = ? AND destination_wallet = ?) OR
+        (source_wallet = ? AND destination_wallet = ?))`,
+      )
+      .get(asOfSlot, wallet, peer, peer, wallet) as SqlRow;
+    return Number(row["count"] ?? 0);
+  }
+
+  listLinkedWallets(
+    wallet: string,
+    asOfSlot: number,
+    minimumConfidenceBps = 8000,
+  ): string[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT DISTINCT CASE WHEN source_wallet = ? THEN destination_wallet ELSE source_wallet END AS peer
+        FROM wallet_links WHERE relation_type = 'REPEATED_COSIGNER' AND slot <= ? AND confidence_bps >= ?
+        AND (source_wallet = ? OR destination_wallet = ?)`,
+      )
+      .all(wallet, asOfSlot, minimumConfidenceBps, wallet, wallet) as SqlRow[];
+    return rows.map((row) => String(row["peer"]));
+  }
+
+  getWalletLinks(wallet: string): Array<Record<string, unknown>> {
+    const rows = this.#db
+      .prepare(
+        `SELECT id, source_wallet, destination_wallet, relation_type, evidence_signature,
+        slot, observed_at_utc, amount_lamports_raw, confidence_bps, reason_code
+        FROM wallet_links WHERE source_wallet = ? OR destination_wallet = ? ORDER BY slot`,
+      )
+      .all(wallet, wallet) as SqlRow[];
+    return rows.map((row) => ({
+      id: String(row["id"]),
+      sourceWallet: String(row["source_wallet"]),
+      destinationWallet: String(row["destination_wallet"]),
+      relationType: String(row["relation_type"]),
+      signature: String(row["evidence_signature"]),
+      slot: Number(row["slot"]),
+      observedAtUtc: String(row["observed_at_utc"]),
+      amountLamportsRaw:
+        row["amount_lamports_raw"] === null
+          ? null
+          : String(row["amount_lamports_raw"]),
+      confidenceBps: Number(row["confidence_bps"]),
+      reasonCode: String(row["reason_code"]),
+    }));
+  }
+
+  getWalletHistoryRefresh(
+    wallet: string,
+    asOfSlot: number,
+  ): {
+    asOfSlot: number;
+    beforeSignature: string | null;
+    scannedCount: number;
+    historyComplete: boolean;
+    lastFetchedAtUtc: string;
+    freshUntilUtc: string;
+    lastErrorCode: string | null;
+  } | null {
+    const row = this.#db
+      .prepare(
+        "SELECT * FROM wallet_history_refresh WHERE wallet_pubkey = ? AND as_of_slot = ?",
+      )
+      .get(wallet, asOfSlot) as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      asOfSlot: Number(row["as_of_slot"]),
+      beforeSignature:
+        row["next_before_signature"] === null
+          ? null
+          : String(row["next_before_signature"]),
+      scannedCount: Number(row["scanned_count"]),
+      historyComplete: row["history_complete"] === 1,
+      lastFetchedAtUtc: String(row["last_fetched_at_utc"]),
+      freshUntilUtc: String(row["fresh_until_utc"]),
+      lastErrorCode:
+        row["last_error_code"] === null ? null : String(row["last_error_code"]),
+    };
+  }
+
+  saveWalletHistoryRefresh(input: {
+    wallet: string;
+    asOfSlot: number;
+    beforeSignature: string | null;
+    scannedCount: number;
+    historyComplete: boolean;
+    fetchedAtUtc: string;
+    freshUntilUtc: string;
+    errorCode: string | null;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO wallet_history_refresh
+        (wallet_pubkey, as_of_slot, next_before_signature, scanned_count, history_complete,
+        last_fetched_at_utc, fresh_until_utc, last_error_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(wallet_pubkey, as_of_slot) DO UPDATE SET
+        next_before_signature = excluded.next_before_signature, scanned_count = excluded.scanned_count,
+        history_complete = excluded.history_complete, last_fetched_at_utc = excluded.last_fetched_at_utc,
+        fresh_until_utc = excluded.fresh_until_utc, last_error_code = excluded.last_error_code`,
+      )
+      .run(
+        input.wallet,
+        input.asOfSlot,
+        input.beforeSignature,
+        input.scannedCount,
+        input.historyComplete ? 1 : 0,
+        input.fetchedAtUtc,
+        input.freshUntilUtc,
+        input.errorCode,
+      );
+  }
+
+  saveCreatorReputation(input: CreatorReputation): void {
+    const reputation = CreatorReputationSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT INTO creator_reputation
+        (wallet_pubkey, status, launches_observed, suspicious_indicators_json, confidence_bps,
+        history_complete, as_of_slot, computed_at_utc, fresh_until_utc, evidence_refs_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(wallet_pubkey) DO UPDATE SET status = excluded.status,
+        launches_observed = excluded.launches_observed,
+        suspicious_indicators_json = excluded.suspicious_indicators_json,
+        confidence_bps = excluded.confidence_bps, history_complete = excluded.history_complete,
+        as_of_slot = excluded.as_of_slot, computed_at_utc = excluded.computed_at_utc,
+        fresh_until_utc = excluded.fresh_until_utc, evidence_refs_json = excluded.evidence_refs_json
+        WHERE creator_reputation.as_of_slot IS NULL OR
+        excluded.as_of_slot >= creator_reputation.as_of_slot`,
+      )
+      .run(
+        reputation.wallet,
+        reputation.status,
+        reputation.launchesObserved,
+        JSON.stringify(reputation.suspiciousIndicators),
+        reputation.confidenceBps,
+        reputation.historyComplete ? 1 : 0,
+        reputation.asOfSlot,
+        reputation.computedAtUtc,
+        reputation.freshUntilUtc,
+        JSON.stringify(reputation.evidenceRefs),
+      );
+    if (reputation.asOfSlot !== null)
+      this.#db
+        .prepare(
+          `INSERT INTO creator_reputation_history(wallet_pubkey, as_of_slot, report_json)
+          VALUES (?, ?, ?) ON CONFLICT(wallet_pubkey, as_of_slot)
+          DO UPDATE SET report_json = excluded.report_json`,
+        )
+        .run(
+          reputation.wallet,
+          reputation.asOfSlot,
+          JSON.stringify(reputation),
+        );
+  }
+
+  getCreatorReputation(
+    wallet: string,
+    asOfSlot?: number,
+  ): CreatorReputation | null {
+    if (asOfSlot !== undefined) {
+      const snapshot = this.#db
+        .prepare(
+          `SELECT report_json FROM creator_reputation_history
+          WHERE wallet_pubkey = ? AND as_of_slot <= ? ORDER BY as_of_slot DESC LIMIT 1`,
+        )
+        .get(wallet, asOfSlot) as SqlRow | undefined;
+      return snapshot
+        ? CreatorReputationSchema.parse(
+            JSON.parse(String(snapshot["report_json"])),
+          )
+        : null;
+    }
+    const row = this.#db
+      .prepare("SELECT * FROM creator_reputation WHERE wallet_pubkey = ?")
+      .get(wallet) as SqlRow | undefined;
+    if (!row) return null;
+    return CreatorReputationSchema.parse({
+      wallet: row["wallet_pubkey"],
+      status: row["status"],
+      launchesObserved: row["launches_observed"],
+      suspiciousIndicators: JSON.parse(
+        String(row["suspicious_indicators_json"]),
+      ),
+      confidenceBps: row["confidence_bps"],
+      historyComplete: row["history_complete"] === 1,
+      asOfSlot: row["as_of_slot"],
+      computedAtUtc: row["computed_at_utc"],
+      freshUntilUtc: row["fresh_until_utc"],
+      evidenceRefs: JSON.parse(String(row["evidence_refs_json"])),
+    });
+  }
+
+  saveTokenRiskReport(input: TokenRiskReport): void {
+    const report = TokenRiskReportSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO token_security_reports(id, mint, as_of_slot, observed_at_utc, report_json)
+        VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        report.id,
+        report.mint,
+        report.asOfSlot,
+        report.observedAtUtc,
+        JSON.stringify(report),
+      );
+  }
+
+  getLatestTokenRiskReport(mint: string): TokenRiskReport | null {
+    const row = this.#db
+      .prepare(
+        "SELECT report_json FROM token_security_reports WHERE mint = ? ORDER BY observed_at_utc DESC, id DESC LIMIT 1",
+      )
+      .get(mint) as SqlRow | undefined;
+    return row
+      ? TokenRiskReportSchema.parse(JSON.parse(String(row["report_json"])))
+      : null;
+  }
+
+  saveRiskDecision(input: RiskDecision): void {
+    const decision = RiskDecisionSchema.parse(input);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO risk_decisions
+        (id, mint, status, config_version, security_report_id, reason_codes_json,
+        evidence_refs_json, decided_at_utc, latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        decision.id,
+        decision.mint,
+        decision.status,
+        decision.configVersion,
+        decision.securityReportId,
+        JSON.stringify(decision.reasonCodes),
+        JSON.stringify(decision.evidenceRefs),
+        decision.decidedAtUtc,
+        decision.latencyMs,
+      );
+  }
+
+  listRiskDecisions(mint: string, limit = 50): RiskDecision[] {
+    const safeLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM risk_decisions WHERE mint = ? ORDER BY decided_at_utc DESC LIMIT ?`,
+      )
+      .all(mint, safeLimit) as SqlRow[];
+    return rows.map((row) =>
+      RiskDecisionSchema.parse({
+        id: row["id"],
+        mint: row["mint"],
+        status: row["status"],
+        configVersion: row["config_version"],
+        securityReportId: row["security_report_id"],
+        reasonCodes: JSON.parse(String(row["reason_codes_json"])),
+        evidenceRefs: JSON.parse(String(row["evidence_refs_json"])),
+        decidedAtUtc: row["decided_at_utc"],
+        latencyMs: row["latency_ms"],
+      }),
+    );
+  }
+
+  saveDryRunTradeIntent(input: {
+    id: string;
+    mint: string;
+    side: "BUY" | "SELL";
+    decisionId: string;
+    reasonCodes: string[];
+    createdAtUtc: string;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO dry_run_trade_intents
+        (id, mode, mint, side, decision_id, reason_codes_json, created_at_utc)
+        VALUES (?, 'DRY_RUN', ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.mint,
+        input.side,
+        input.decisionId,
+        JSON.stringify(input.reasonCodes),
+        input.createdAtUtc,
+      );
   }
 
   #recordEventConflict(existing: SqlRow, incoming: MarketEvent): void {

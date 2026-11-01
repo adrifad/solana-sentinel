@@ -22,8 +22,8 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 ## Config domains
 
 - `discovery`: source, subscriptions, concurrent analysis cap, supported token programs.
-- `intelligence`: max creator history depth, caching, wallet-graph confidence, external data cost limits.
-- `security`: mint authority/extension policy, unknown handling, creator blacklist/evidence requirements.
+- `analysis`: creator history page/transaction limits, cache TTL, tracing depth, refresh windows, analysis concurrency and timeout.
+- `security`: mint authority/extension policy, unknown handling, holder sampling size, snapshot freshness and slot-skew limits.
 - `strategy`: entry timing, opportunity score and scoring weights, min observations.
 - `paper`: initial SOL, latency simulation, quote stale window, fee model, conservative slippage.
 - `risk`: per-order max SOL, max exposure, position count, daily loss, max drawdown, maximum quote price impact.
@@ -49,10 +49,9 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 
 ```bash
 APP_MODE=DRY_RUN pnpm dev:worker
-APP_MODE=PAPER pnpm dev:worker
-# No direct example to launch LIVE: requires explicit runbook and guarded deployment.
+# PAPER and LIVE are rejected by this runtime.
 ```
 
-These commands are intended post-implementation; this blueprint contains no runnable application code.
+The current runtime accepts `DRY_RUN` only. The API is read-only and cannot arm or change execution mode.
 
 ---

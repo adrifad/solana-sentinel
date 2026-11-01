@@ -8,6 +8,7 @@ import {
 } from "@sentinel/providers";
 import { SentinelStore } from "@sentinel/storage";
 import { EnrichmentScheduler } from "./enrichment.ts";
+import { TokenAnalysisScheduler } from "./analysis.ts";
 import { log } from "./logger.ts";
 
 async function main(): Promise<void> {
@@ -95,6 +96,15 @@ async function main(): Promise<void> {
     : undefined;
   enrichment?.start();
 
+  const analysis = new TokenAnalysisScheduler({
+    store,
+    helius,
+    config: loaded.config,
+    configVersion: loaded.configVersion,
+    concurrency: loaded.config.analysis.concurrent_token_analysis,
+  });
+  analysis.start();
+
   const pump = new PumpPortalClient({
     apiKey: loaded.pumpPortalApiKey,
     enableNewTokens: loaded.config.providers.pumpportal.enable_new_tokens,
@@ -151,6 +161,7 @@ async function main(): Promise<void> {
     },
     async onEvent() {
       enrichment?.wake();
+      analysis.wake();
     },
   });
 
@@ -166,6 +177,7 @@ async function main(): Promise<void> {
           pumpStopError = error;
         }
         await enrichment?.stop();
+        await analysis.stop();
         if (pumpStopError) throw pumpStopError;
       } finally {
         store.close();

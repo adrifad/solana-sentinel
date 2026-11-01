@@ -6,7 +6,10 @@
   "dependencies": {
     "@sentinel/config": "workspace:*",
     "@sentinel/domain": "workspace:*",
+    "@sentinel/intelligence": "workspace:*",
     "@sentinel/providers": "workspace:*",
+    "@sentinel/security": "workspace:*",
+    "@sentinel/strategy": "workspace:*",
     "@sentinel/storage": "workspace:*",
     "yaml": "^2.8.1",
     "zod": "^4.1.12"

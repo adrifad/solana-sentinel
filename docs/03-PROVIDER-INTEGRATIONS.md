@@ -8,15 +8,16 @@
 - Creation/migration streaming is listed as free; trade/account streams are metered and may require linked wallet funding. Check provider pricing and enforce monthly event budgets.
 - Security note: PumpPortal **Lightning API key may control its linked wallet**. Even for read-only data, treat it as a signing-capable secret; never fund that wallet with trading capital for MVP.
 - Parse and validate event signatures, blockchain slot, mint, creator, tx type and amounts. Store unknown fields in redacted raw record for forward compatibility.
-- On reconnect: use jittered exponential backoff, restore subscriptions, reconcile gaps from Helius where possible. At-most-once receipt is not guaranteed.
+- On reconnect: use jittered exponential backoff and restore subscriptions. Each interruption is persisted as an unreconciled gap; a Helius missed-launch reconciler is not yet implemented. At-most-once receipt is not guaranteed.
 
 ## Helius — on-chain source of truth / transaction history
 
-- Use JSON-RPC and documented wallet/transaction APIs for: mint metadata, Token/Token-2022 state, parsed transactions, historic wallet actions, funding history, transactions for address, and account balance.
+- Implemented standard JSON-RPC reads: `getHealth`, `getGenesisHash`, `getAccountInfo`, `getBlockTime`, `getSignaturesForAddress`, `getTransaction`, `getTokenSupply`, `getTokenLargestAccounts`, and `getMultipleAccounts`. Wallet-history calls are paginated, finalized, and bounded by configured request budgets.
 - Enforce allowed methods/credits, pagination, timeouts, retry budgets, and backoff on 429/5xx.
 - For creator attribution, distinguish token creator claim vs deployer/transaction fee payer vs mint authority vs other wallet roles.
 - Keep provenance: `{rpc_method, endpoint_label, signature, slot, fetched_at, provider_version}`.
 - Prefer blockchain/decoded official program state over a third-party classification label.
+- RPC request counts are budgeted, but Helius plan credit costs have not been separately modeled or verified with credentials.
 
 ## DEX Screener — supplemental market/social metadata
 

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { PubkeySchema } from "@sentinel/domain";
+import { PubkeySchema, base58DecodedLength } from "@sentinel/domain";
 
 const RpcEnvelope = z
   .object({
@@ -24,6 +24,131 @@ const AccountInfoResult = z
       .nullable(),
   })
   .passthrough();
+const MultipleAccountInfoResult = z
+  .object({
+    context: z.object({ slot: z.number().int().nonnegative().safe() }),
+    value: z.array(
+      z
+        .object({
+          owner: PubkeySchema,
+          data: z.tuple([z.string(), z.literal("base64")]),
+          executable: z.boolean(),
+        })
+        .passthrough()
+        .nullable(),
+    ),
+  })
+  .passthrough();
+const SignatureSchema = z
+  .string()
+  .regex(/^[1-9A-HJ-NP-Za-km-z]{64,88}$/)
+  .refine((signature) => base58DecodedLength(signature) === 64);
+const SignaturePageItem = z
+  .object({
+    signature: SignatureSchema,
+    slot: z.number().int().nonnegative().safe(),
+    err: z.unknown(),
+    blockTime: z.number().int().nonnegative().safe().nullable(),
+  })
+  .passthrough();
+const ParsedAccountKey = z.union([
+  PubkeySchema,
+  z
+    .object({
+      pubkey: PubkeySchema,
+      signer: z.boolean(),
+      writable: z.boolean().optional(),
+      source: z.string().optional(),
+    })
+    .passthrough(),
+]);
+const ParsedInstruction = z
+  .object({
+    programId: PubkeySchema,
+    program: z.string().optional(),
+    accounts: z.array(z.unknown()).optional(),
+    data: z.string().optional(),
+    parsed: z.unknown().optional(),
+  })
+  .passthrough();
+const TransactionResult = z
+  .object({
+    slot: z.number().int().nonnegative().safe(),
+    blockTime: z.number().int().nonnegative().safe().nullable(),
+    transaction: z
+      .object({
+        signatures: z.array(SignatureSchema),
+        message: z
+          .object({
+            accountKeys: z.array(ParsedAccountKey),
+            instructions: z.array(ParsedInstruction),
+          })
+          .passthrough(),
+      })
+      .passthrough(),
+    meta: z
+      .object({
+        err: z.unknown(),
+        fee: z.number().int().nonnegative().safe(),
+        logMessages: z.array(z.string()).nullable().optional(),
+        preBalances: z.array(z.number().int().nonnegative().safe()).optional(),
+        postBalances: z.array(z.number().int().nonnegative().safe()).optional(),
+      })
+      .passthrough()
+      .nullable(),
+  })
+  .passthrough();
+const TokenSupplyResult = z
+  .object({
+    context: z.object({ slot: z.number().int().nonnegative().safe() }),
+    value: z.object({
+      amount: z.string().regex(/^\d+$/),
+      decimals: z.number().int().min(0).max(255),
+      uiAmountString: z.string().optional(),
+    }),
+  })
+  .passthrough();
+const LargestAccountsResult = z
+  .object({
+    context: z.object({ slot: z.number().int().nonnegative().safe() }),
+    value: z.array(
+      z.object({
+        address: PubkeySchema,
+        amount: z.string().regex(/^\d+$/),
+        decimals: z.number().int().min(0).max(255).optional(),
+      }),
+    ),
+  })
+  .passthrough();
+
+export type WalletSignature = {
+  signature: string;
+  slot: number;
+  succeeded: boolean;
+  blockTime: number | null;
+};
+export type WalletTransaction = {
+  signature: string;
+  slot: number;
+  blockTime: number | null;
+  succeeded: boolean;
+  feeLamports: number;
+  accountKeys: Array<{
+    pubkey: string;
+    signer: boolean;
+    writable: boolean | null;
+  }>;
+  instructions: Array<{
+    programId: string;
+    program: string | null;
+    parsed: unknown;
+    data: string | null;
+    accounts: unknown[];
+  }>;
+  logMessages: string[];
+  preBalances: number[];
+  postBalances: number[];
+};
 
 export type HeliusOptions = {
   apiKey: string;
@@ -112,6 +237,38 @@ export class HeliusRpcClient {
     };
   }
 
+  async getMultipleAccounts(addresses: string[]): Promise<{
+    slot: number;
+    accounts: HeliusAccount[];
+  }> {
+    if (addresses.length < 1 || addresses.length > 100)
+      throw new ProviderFailure("INVALID_BATCH_SIZE");
+    if (addresses.some((address) => !PubkeySchema.safeParse(address).success))
+      throw new ProviderFailure("INVALID_PUBKEY");
+    const parsed = MultipleAccountInfoResult.safeParse(
+      await this.#rpc("getMultipleAccounts", [
+        addresses,
+        { commitment: "confirmed", encoding: "base64" },
+      ]),
+    );
+    if (!parsed.success || parsed.data.value.length !== addresses.length)
+      throw new ProviderFailure("MALFORMED_RESPONSE");
+    return {
+      slot: parsed.data.context.slot,
+      accounts: parsed.data.value.map((value) =>
+        value
+          ? {
+              slot: parsed.data.context.slot,
+              owner: value.owner,
+              dataBase64: value.data[0],
+              encoding: value.data[1],
+              executable: value.executable,
+            }
+          : null,
+      ),
+    };
+  }
+
   async getBlockTime(slot: number): Promise<string | null> {
     if (!Number.isSafeInteger(slot) || slot < 0)
       throw new ProviderFailure("INVALID_SLOT");
@@ -124,6 +281,130 @@ export class HeliusRpcClient {
     )
       throw new ProviderFailure("MALFORMED_RESPONSE");
     return new Date(result * 1000).toISOString();
+  }
+
+  async getSignaturesForAddress(
+    address: string,
+    options: { limit: number; before?: string },
+  ): Promise<WalletSignature[]> {
+    if (!PubkeySchema.safeParse(address).success)
+      throw new ProviderFailure("INVALID_PUBKEY");
+    if (
+      !Number.isInteger(options.limit) ||
+      options.limit < 1 ||
+      options.limit > 1000
+    )
+      throw new ProviderFailure("INVALID_PAGE_SIZE");
+    if (options.before && !SignatureSchema.safeParse(options.before).success)
+      throw new ProviderFailure("INVALID_SIGNATURE");
+    const result = await this.#rpc("getSignaturesForAddress", [
+      address,
+      {
+        commitment: "finalized",
+        limit: options.limit,
+        ...(options.before ? { before: options.before } : {}),
+      },
+    ]);
+    const parsed = z
+      .array(SignaturePageItem)
+      .max(options.limit)
+      .safeParse(result);
+    if (!parsed.success) throw new ProviderFailure("MALFORMED_RESPONSE");
+    return parsed.data.map((item) => ({
+      signature: item.signature,
+      slot: item.slot,
+      succeeded: item.err === null,
+      blockTime: item.blockTime,
+    }));
+  }
+
+  async getTransaction(signature: string): Promise<WalletTransaction | null> {
+    if (!SignatureSchema.safeParse(signature).success)
+      throw new ProviderFailure("INVALID_SIGNATURE");
+    const result = await this.#rpc("getTransaction", [
+      signature,
+      {
+        commitment: "finalized",
+        encoding: "jsonParsed",
+        maxSupportedTransactionVersion: 0,
+      },
+    ]);
+    if (result === null) return null;
+    const parsed = TransactionResult.safeParse(result);
+    if (!parsed.success) throw new ProviderFailure("MALFORMED_RESPONSE");
+    const transaction = parsed.data;
+    const meta = transaction.meta;
+    if (!meta || transaction.transaction.signatures[0] !== signature)
+      throw new ProviderFailure("MALFORMED_RESPONSE");
+    const key = transaction.transaction.message.accountKeys.map((account) =>
+      typeof account === "string"
+        ? { pubkey: account, signer: false, writable: null }
+        : {
+            pubkey: account.pubkey,
+            signer: account.signer,
+            writable: account.writable ?? null,
+          },
+    );
+    return {
+      signature,
+      slot: transaction.slot,
+      blockTime: transaction.blockTime,
+      succeeded: meta.err === null,
+      feeLamports: meta.fee,
+      accountKeys: key,
+      instructions: transaction.transaction.message.instructions.map(
+        (instruction) => ({
+          programId: instruction.programId,
+          program: instruction.program ?? null,
+          parsed: instruction.parsed ?? null,
+          data: instruction.data ?? null,
+          accounts: instruction.accounts ?? [],
+        }),
+      ),
+      logMessages: meta.logMessages ?? [],
+      preBalances: meta.preBalances ?? [],
+      postBalances: meta.postBalances ?? [],
+    };
+  }
+
+  async getTokenSupply(mint: string): Promise<{
+    slot: number;
+    amountRaw: string;
+    decimals: number;
+  }> {
+    if (!PubkeySchema.safeParse(mint).success)
+      throw new ProviderFailure("INVALID_PUBKEY");
+    const parsed = TokenSupplyResult.safeParse(
+      await this.#rpc("getTokenSupply", [mint, { commitment: "confirmed" }]),
+    );
+    if (!parsed.success) throw new ProviderFailure("MALFORMED_RESPONSE");
+    return {
+      slot: parsed.data.context.slot,
+      amountRaw: parsed.data.value.amount,
+      decimals: parsed.data.value.decimals,
+    };
+  }
+
+  async getTokenLargestAccounts(mint: string): Promise<{
+    slot: number;
+    accounts: Array<{ address: string; amountRaw: string }>;
+  }> {
+    if (!PubkeySchema.safeParse(mint).success)
+      throw new ProviderFailure("INVALID_PUBKEY");
+    const parsed = LargestAccountsResult.safeParse(
+      await this.#rpc("getTokenLargestAccounts", [
+        mint,
+        { commitment: "confirmed" },
+      ]),
+    );
+    if (!parsed.success) throw new ProviderFailure("MALFORMED_RESPONSE");
+    return {
+      slot: parsed.data.context.slot,
+      accounts: parsed.data.value.map((account) => ({
+        address: account.address,
+        amountRaw: account.amount,
+      })),
+    };
   }
 
   async #rpc(method: string, params: unknown[]): Promise<unknown> {

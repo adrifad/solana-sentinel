@@ -49,4 +49,13 @@ Return `LIKELY_TEST`, `UNKNOWN` or `ORGANIC_CANDIDATE`. Each output carries evid
 
 Creator reputation updates require blockchain evidence/independent confirmation. Keep separate tables for raw observations and inferred labels. Never let a freshly minted token's own metadata declare the creator trustworthy.
 
+## Current implementation boundary
+
+- The worker reads finalized transaction history with `getSignaturesForAddress` pagination, then validates each transaction signature and slot before storing a bounded sanitized summary. History is explicitly incomplete when the configured transaction/page/time bound or a provider failure prevents a full scan.
+- Current Pump `CreateEvent` decoding uses the public IDL discriminator and field order. It distinguishes the event's `creator`, instruction/event `user` launch initiator, and first transaction signer fee payer. Provider claims remain lower-confidence evidence until checked against the finalized transaction.
+- Direct system transfers are stored as low-confidence funding edges only when the queried wallet participates. They do not create cluster membership. Cluster indicators currently use repeated co-signing evidence; a shared exchange funding address alone is not treated as shared control.
+- Reputation is versioned by observed slot and includes evidence references, completeness, confidence, computation time, and cache expiry. No profitability or historical token outcome score is generated.
+- Test-token detection currently matches explicit metadata markers (`test`, `testnet`, `devnet`, `sample`, `demo`, `fake`, `example`). This is a 70% heuristic indicator, not a scam finding; missing markers remain `UNKNOWN`.
+- PumpPortal migration payloads and historical CreateEvent IDL revisions have not been validated against sanitized mainnet captures. Stream-gap reconciliation is not implemented; completeness remains false unless reported as unknown/unreconciled.
+
 ---

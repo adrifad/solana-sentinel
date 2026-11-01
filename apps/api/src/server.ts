@@ -74,8 +74,33 @@ async function handleRequest(
       return send(response, 400, { error: "INVALID_MINT" });
     const token = options.store.getToken(mint);
     return token
-      ? send(response, 200, { token })
+      ? send(response, 200, {
+          token,
+          roleEvidence: options.store.listWalletRoleEvidence(mint),
+          securityReport: options.store.getLatestTokenRiskReport(mint),
+          decisions: options.store.listRiskDecisions(mint),
+        })
       : send(response, 404, { error: "NOT_FOUND" });
+  }
+  const creatorMatch = /^\/api\/creators\/([^/]+)$/.exec(url.pathname);
+  if (creatorMatch) {
+    let wallet: string;
+    try {
+      wallet = decodeURIComponent(creatorMatch[1] ?? "");
+    } catch {
+      return send(response, 400, { error: "INVALID_WALLET" });
+    }
+    if (!PubkeySchema.safeParse(wallet).success)
+      return send(response, 400, { error: "INVALID_WALLET" });
+    return send(response, 200, {
+      wallet,
+      reputation: options.store.getCreatorReputation(wallet),
+      launches: options.store.listCreatorLaunches(
+        wallet,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      walletLinks: options.store.getWalletLinks(wallet),
+    });
   }
   return send(response, 404, { error: "NOT_FOUND" });
 }

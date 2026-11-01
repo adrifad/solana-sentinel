@@ -1,6 +1,6 @@
 # Solana Sentinel — Early Launch Intelligence & Trading Bot
 
-**Status:** Foundation and read-only token discovery implementation; not a trading bot.  
+**Status:** Read-only discovery, creator-intelligence, token-security, and explainable `DRY_RUN` analysis foundation; no trading execution.
 **Language:** TypeScript, Node.js, SQLite; optional React dashboard.  
 **Network:** Solana **mainnet** data for all modes; no live trading until separately armed.  
 **Initial focus:** Pump.fun new-token detection, creator intelligence, anti-scam, test-token classification, and shadow trading.
@@ -47,7 +47,7 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The initial checkout was a documentation-only blueprint. The current implementation provides validated DRY_RUN configuration, SQLite event persistence, PumpPortal launch/migration discovery, a Helius read adapter, and read-only health/token endpoints. Paper execution, intelligence/security analysis, and the dashboard remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md).
+The initial checkout was a documentation-only blueprint. The current implementation provides validated `DRY_RUN` configuration, SQLite event persistence and migrations, PumpPortal launch/migration discovery, bounded Helius read adapters, creator-intelligence and token-security reports, explainable fail-closed decisions, and read-only APIs. PAPER execution, LIVE execution, and the dashboard remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md).
 
 ## Local implementation commands
 
@@ -61,7 +61,7 @@ pnpm typecheck
 pnpm lint
 ```
 
-Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables provider health and mint account reads. The worker accepts only `DRY_RUN`; it never signs or submits transactions. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
+Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables on-chain creator history and security analysis. The worker accepts only `DRY_RUN`; it never signs or submits transactions. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
 
 ## Non-negotiable invariants
 
@@ -75,4 +75,4 @@ Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_
 
 ## Definition of MVP
 
-A single host can run realtime token discovery, perform basic creator/security checks, record `DRY_RUN` decisions and `PAPER` fills with SOL-denominated ledger accounting, and show auditable dashboards. No wallet secret is needed. Live implementation is a separate gated milestone.
+The current milestone delivers realtime token discovery and persisted creator/security `DRY_RUN` decisions. PAPER fills, SOL ledger accounting, dashboards, and LIVE execution are future milestones. The current runtime uses no wallet secret and has no transaction-signing or submission capability.

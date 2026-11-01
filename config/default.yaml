@@ -27,7 +27,10 @@ analysis:
   concurrent_token_analysis: 6
   creator_history_cache_ttl_seconds: 3600
   creator_history_max_transactions: 200
+  creator_history_page_size: 50
   creator_tracing_max_depth: 2
+  suspicious_launch_count: 3
+  suspicious_launch_window_seconds: 3600
   max_analysis_ms: 10000
   token_observation_seconds: 60
   social_enabled: false
@@ -42,6 +45,8 @@ security:
   reject_unsupported_transfer_hooks: true
   require_sell_quote_for_buy: true
   max_snapshot_age_ms: 1500
+  max_holder_accounts: 10
+  max_snapshot_slot_skew: 32
 
 strategy:
   entry_mode: VALIDATED
