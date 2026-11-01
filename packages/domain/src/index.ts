@@ -329,7 +329,7 @@ export type RiskDecision = z.infer<typeof RiskDecisionSchema>;
 
 export const TradeIntentSchema = z.object({
   id: z.string().min(1),
-  mode: z.literal("DRY_RUN"),
+  mode: z.enum(["DRY_RUN", "PAPER"]),
   mint: PubkeySchema,
   side: z.enum(["BUY", "SELL"]),
   decisionId: z.string().min(1),
@@ -337,6 +337,24 @@ export const TradeIntentSchema = z.object({
   createdAtUtc: IsoUtcSchema,
 });
 export type TradeIntent = z.infer<typeof TradeIntentSchema>;
+
+export const PaperOrderIntentSchema = z.object({
+  id: z.string().min(1),
+  idempotencyKey: z.string().min(1),
+  walletId: z.string().min(1),
+  mode: z.literal("PAPER"),
+  mint: PubkeySchema,
+  side: z.enum(["BUY", "SELL"]),
+  exactInputAmountRaw: z
+    .string()
+    .regex(/^\d+$/)
+    .refine((v) => BigInt(v) > 0n),
+  decisionId: z.string().min(1),
+  reasonCodes: z.array(z.string().regex(/^[A-Z0-9_]+$/)),
+  createdAtUtc: IsoUtcSchema,
+  signalQuoteId: z.string().min(1).nullable(),
+});
+export type PaperOrderIntent = z.infer<typeof PaperOrderIntentSchema>;
 
 export type ProviderState =
   "DISABLED" | "STARTING" | "HEALTHY" | "DEGRADED" | "STOPPED";

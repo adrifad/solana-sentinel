@@ -9,7 +9,11 @@
 - Test token classifier with fixtures and uncertainty handling.
 - Full reason-code taxonomy and immutability.
 - Quote freshness, max slippage, fees (no double count), exact-in curves, pool migration.
-- Ledger balances and realized PnL exact across partial fills, partial exits, rejections, and unavailable liquidity.
+- Ledger balances and realized PnL exact across slippage-adjusted all-or-nothing paper fills, partial exits, rejections, and unavailable liquidity.
+- PAPER-only package: quote is requested after simulated arrival latency; exact amount/mint/direction, slot, timestamp, fee mint, freshness, impact and configured slippage are rechecked before atomic fill. Missing/stale/future quote and unavailable sell route produce no fill.
+- Double-entry paper journals balance per asset and ledger rows are immutable; duplicate concurrent intents settle once, pending orders can resume after restart, and partial sells allocate exact raw-unit cost basis.
+- Expired and future-dated persisted intents cannot be filled after recovery; quote timestamps are validated when state loading completes, not before RPC latency elapses.
+- Paper risk tests cover insufficient virtual SOL, open exposure/position caps, daily realized loss, drawdown, unpriceable marks, and fail-closed exit quotes. App configuration still refuses PAPER mode.
 
 ## Integration tests (mock providers + recorded responses)
 

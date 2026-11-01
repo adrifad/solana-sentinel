@@ -572,7 +572,11 @@ test("migration 006 persists quotes and behavior snapshots and reopens cleanly",
     });
     assert.equal(store.listQuoteResults(otherMint)[0]?.id, "stored-quote");
     const migrations = store.listAppliedMigrations();
-    assert.equal(migrations.at(-1)?.version, 6);
+    assert.equal(
+      migrations.some((item) => item.version === 6),
+      true,
+    );
+    assert.equal(migrations.at(-1)?.version, 7);
     assert.equal(store.tryConsumeJupiterRequest(1), true);
     assert.equal(store.tryConsumeJupiterRequest(1), false);
   } finally {

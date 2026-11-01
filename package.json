@@ -28,6 +28,7 @@
     "@sentinel/domain": "workspace:*",
     "@sentinel/intelligence": "workspace:*",
     "@sentinel/providers": "workspace:*",
+    "@sentinel/paper": "workspace:*",
     "@sentinel/security": "workspace:*",
     "@sentinel/storage": "workspace:*",
     "@sentinel/strategy": "workspace:*",

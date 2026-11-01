@@ -20,6 +20,9 @@ importers:
       '@sentinel/intelligence':
         specifier: workspace:*
         version: link:packages/intelligence
+      '@sentinel/paper':
+        specifier: workspace:*
+        version: link:packages/paper
       '@sentinel/providers':
         specifier: workspace:*
         version: link:packages/providers
@@ -116,6 +119,18 @@ importers:
 
   packages/intelligence:
     dependencies:
+      '@sentinel/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@sentinel/providers':
+        specifier: workspace:*
+        version: link:../providers
+
+  packages/paper:
+    dependencies:
+      '@sentinel/config':
+        specifier: workspace:*
+        version: link:../config
       '@sentinel/domain':
         specifier: workspace:*
         version: link:../domain

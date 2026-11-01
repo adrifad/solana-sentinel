@@ -32,13 +32,16 @@ Read-only Helius mainnet health, historical transaction, and account-state calls
 
 ## Sprint 3 — Paper execution
 
-- [ ] Price adapters for Pump curve and migrated PumpSwap; authoritative state+SDK.
-- [ ] Fresh exact-input buy and sell quotes, quote lifecycle + fee model.
-- [ ] Virtual SOL wallet, ledger and positions, no phantom sells.
-- [ ] Execution latency/slippage model; edge cases.
-- [ ] Strategy FAST vs VALIDATED, partial exit, time stop, confidence reporting.
+- [x] Price adapters for supported Pump curve and canonical PumpSwap using authoritative state+SDK (live quote-state vectors are limited to one recorded snapshot per venue).
+- [x] Fresh exact-input buy and sell quote provider contract, fee model and quote-at-arrival simulation.
+- [x] Virtual SOL wallet, immutable double-entry ledger, positions and no phantom sells in the standalone PAPER package.
+- [x] Configured execution latency/slippage, persistent order recovery, risk limits, and PnL/drawdown reporting with deterministic tests.
+- [x] Partial exits and time/stop/take-profit exit evaluation.
+- [ ] Integrate the package into an operational PAPER worker with live normalized trade observations, end-to-end mode isolation tests, and controlled quote budgets.
 
 **Done when:** 100 fixture scenarios pass; no paper trade changes chain balances.
+
+**Current status:** PAPER foundation tests exist, but application mode and automatic entries remain disabled. Milestone A has not passed because live PumpPortal trade observations and continuous stream coverage are unavailable. The isolated package is not yet readiness for live PAPER operation.
 
 ## Sprint 2.5 — Intelligence and quote foundation (partial)
 

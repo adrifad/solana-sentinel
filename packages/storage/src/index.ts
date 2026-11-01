@@ -8,6 +8,7 @@ import {
   MarketEventSchema,
   LaunchBehaviorSnapshotSchema,
   LaunchTradeObservationSchema,
+  PaperOrderIntentSchema,
   QuoteResultSchema,
   RiskDecisionSchema,
   TokenRiskReportSchema,
@@ -24,7 +25,10 @@ import type {
   RiskDecision,
   TokenRiskReport,
   WalletRoleEvidence,
+  PaperOrderIntent,
 } from "@sentinel/domain";
+
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 type SqlRow = Record<
   string,
@@ -90,6 +94,7 @@ export class SentinelStore {
       "004-enrichment-and-completeness.sql",
       "005-intelligence-security-decisions.sql",
       "006-market-intelligence.sql",
+      "007-paper-ledger.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -115,6 +120,16 @@ export class SentinelStore {
         throw error;
       }
     }
+    this.#db.exec(`
+      CREATE TRIGGER IF NOT EXISTS paper_ledger_no_update
+      BEFORE UPDATE ON paper_ledger_entries BEGIN
+        SELECT RAISE(ABORT, 'paper ledger entries are immutable');
+      END;
+      CREATE TRIGGER IF NOT EXISTS paper_ledger_no_delete
+      BEFORE DELETE ON paper_ledger_entries BEGIN
+        SELECT RAISE(ABORT, 'paper ledger entries are immutable');
+      END;
+    `);
   }
 
   ingestEvent(
@@ -1244,6 +1259,584 @@ export class SentinelStore {
       );
   }
 
+  initializePaperAccount(
+    walletId: string,
+    initialSolLamports: string,
+    createdAtUtc: string,
+  ): { walletId: string; initialSolLamports: string; createdAtUtc: string } {
+    if (!/^\d+$/.test(initialSolLamports) || BigInt(initialSolLamports) <= 0n)
+      throw new Error("PAPER_INITIAL_BALANCE_INVALID");
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const prior = this.#db
+        .prepare("SELECT * FROM paper_accounts WHERE wallet_id = ?")
+        .get(walletId) as SqlRow | undefined;
+      if (prior) {
+        this.#db.exec("COMMIT");
+        return {
+          walletId,
+          initialSolLamports: String(prior["initial_sol_lamports"]),
+          createdAtUtc: String(prior["created_at_utc"]),
+        };
+      }
+      this.#db
+        .prepare(
+          "INSERT INTO paper_accounts(wallet_id, initial_sol_lamports, created_at_utc) VALUES (?, ?, ?)",
+        )
+        .run(walletId, initialSolLamports, createdAtUtc);
+      const journalId = `paper-opening:${walletId}`;
+      this.#db
+        .prepare(
+          `INSERT INTO paper_journals(id, wallet_id, order_id, journal_type, created_at_utc, evidence_json)
+           VALUES (?, ?, NULL, 'OPENING_BALANCE', ?, '{}')`,
+        )
+        .run(journalId, walletId, createdAtUtc);
+      this.#insertPaperLedgerPair({
+        journalId,
+        walletId,
+        assetMint: WSOL_MINT,
+        leftAccount: "WALLET",
+        leftDelta: BigInt(initialSolLamports),
+        rightAccount: "OPENING_EQUITY",
+        rightDelta: -BigInt(initialSolLamports),
+        createdAtUtc,
+      });
+      this.#db.exec("COMMIT");
+      return { walletId, initialSolLamports, createdAtUtc };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  createPaperOrder(intentInput: PaperOrderIntent): {
+    id: string;
+    walletId: string;
+    idempotencyKey: string;
+    mint: string;
+    side: "BUY" | "SELL";
+    inputAmountRaw: string;
+    status:
+      "PENDING" | "SIMULATED_FILLED" | "REJECTED" | "UNFILLABLE" | "EXPIRED";
+    reasonCode: string | null;
+    createdAtUtc: string;
+  } {
+    const intent = PaperOrderIntentSchema.parse(intentInput);
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO paper_orders
+         (id, wallet_id, idempotency_key, mint, side, input_amount_raw, intent_json, status, created_at_utc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)`,
+      )
+      .run(
+        intent.id,
+        intent.walletId,
+        intent.idempotencyKey,
+        intent.mint,
+        intent.side,
+        intent.exactInputAmountRaw,
+        JSON.stringify(intent),
+        intent.createdAtUtc,
+      );
+    const row = this.#db
+      .prepare("SELECT * FROM paper_orders WHERE idempotency_key = ?")
+      .get(intent.idempotencyKey) as SqlRow | undefined;
+    if (!row || String(row["intent_json"]) !== JSON.stringify(intent))
+      throw new Error("PAPER_ORDER_IDEMPOTENCY_CONFLICT");
+    return mapPaperOrder(row);
+  }
+
+  getPaperOrder(orderId: string) {
+    const row = this.#db
+      .prepare("SELECT * FROM paper_orders WHERE id = ?")
+      .get(orderId) as SqlRow | undefined;
+    return row ? mapPaperOrder(row) : null;
+  }
+
+  listPendingPaperOrderIntents(limit = 100): PaperOrderIntent[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    const rows = this.#db
+      .prepare(
+        "SELECT intent_json FROM paper_orders WHERE status = 'PENDING' ORDER BY created_at_utc, id LIMIT ?",
+      )
+      .all(safeLimit) as SqlRow[];
+    return rows.map((row) =>
+      PaperOrderIntentSchema.parse(JSON.parse(String(row["intent_json"]))),
+    );
+  }
+
+  rejectPaperOrder(
+    orderId: string,
+    status: "REJECTED" | "UNFILLABLE" | "EXPIRED",
+    reasonCode: string,
+    completedAtUtc: string,
+    arrivalAtUtc: string | null = null,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE paper_orders SET status = ?, reason_code = ?, arrival_at_utc = COALESCE(?, arrival_at_utc), completed_at_utc = ?
+         WHERE id = ? AND status = 'PENDING'`,
+      )
+      .run(status, reasonCode, arrivalAtUtc, completedAtUtc, orderId);
+  }
+
+  applyPaperFill(input: {
+    orderId: string;
+    quote: QuoteResult;
+    outputAmountRaw: string;
+    venueFeeRaw: string;
+    networkFeeLamports: string;
+    extraSlippageBps: number;
+    maxSlippageBps: number;
+    maxPriceImpactBps: number;
+    arrivalAtUtc: string;
+    filledAtUtc: string;
+    maxTradeInputRaw: string;
+    maxExposureLamports: string;
+    maxOpenPositions: number;
+    maxDailyLossLamports: string;
+    maxDrawdownBps: number;
+    maxQuoteAgeMs: number;
+    emergencyStop: boolean;
+  }): { status: "SIMULATED_FILLED" | "REJECTED"; reasonCode: string | null } {
+    const quote = QuoteResultSchema.parse(input.quote);
+    if (
+      !/^\d+$/.test(input.outputAmountRaw) ||
+      !/^\d+$/.test(input.venueFeeRaw) ||
+      !/^\d+$/.test(input.networkFeeLamports) ||
+      input.extraSlippageBps < 0 ||
+      input.extraSlippageBps > 10000 ||
+      input.extraSlippageBps > input.maxSlippageBps
+    )
+      throw new Error("PAPER_FILL_AMOUNT_INVALID");
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db
+        .prepare("SELECT * FROM paper_orders WHERE id = ?")
+        .get(input.orderId) as SqlRow | undefined;
+      if (!row) throw new Error("PAPER_ORDER_NOT_FOUND");
+      if (row["status"] !== "PENDING") {
+        this.#db.exec("COMMIT");
+        return {
+          status:
+            row["status"] === "SIMULATED_FILLED"
+              ? "SIMULATED_FILLED"
+              : "REJECTED",
+          reasonCode:
+            row["reason_code"] === null ? null : String(row["reason_code"]),
+        };
+      }
+      const walletId = String(row["wallet_id"]);
+      const mint = String(row["mint"]);
+      const side = String(row["side"]) as "BUY" | "SELL";
+      const amount = BigInt(String(row["input_amount_raw"]));
+      const networkFee = BigInt(input.networkFeeLamports);
+      const output = BigInt(input.outputAmountRaw);
+      const venueFee = BigInt(input.venueFeeRaw);
+      const reject = (reasonCode: string) => {
+        this.#db
+          .prepare(
+            `UPDATE paper_orders SET status = 'REJECTED', reason_code = ?, arrival_at_utc = ?, completed_at_utc = ?
+             WHERE id = ? AND status = 'PENDING'`,
+          )
+          .run(
+            reasonCode,
+            input.arrivalAtUtc,
+            input.filledAtUtc,
+            input.orderId,
+          );
+        this.#db.exec("COMMIT");
+        return { status: "REJECTED" as const, reasonCode };
+      };
+      if (input.emergencyStop) return reject("PAPER_EMERGENCY_STOP");
+      const storedQuoteRow = this.#db
+        .prepare("SELECT quote_json FROM market_quotes WHERE id = ?")
+        .get(quote.id) as SqlRow | undefined;
+      if (
+        !storedQuoteRow ||
+        String(storedQuoteRow["quote_json"]) !== JSON.stringify(quote)
+      )
+        return reject("PAPER_QUOTE_NOT_PERSISTED");
+      if (
+        (side === "BUY" && amount > BigInt(input.maxTradeInputRaw)) ||
+        (side === "SELL" && output + venueFee > BigInt(input.maxTradeInputRaw))
+      )
+        return reject("PAPER_MAX_TRADE_EXCEEDED");
+      if (
+        quote.validationStatus !== "PASS" ||
+        quote.mint !== mint ||
+        quote.direction !== side ||
+        quote.exactInputAmountRaw !== amount.toString() ||
+        quote.inputMint !== (side === "BUY" ? WSOL_MINT : mint) ||
+        quote.outputMint !== (side === "BUY" ? mint : WSOL_MINT) ||
+        quote.venue === null ||
+        quote.priceImpactBps === null ||
+        quote.priceImpactBps > input.maxPriceImpactBps ||
+        quote.feeAmountRaw === null ||
+        quote.feeMint !== WSOL_MINT ||
+        BigInt(input.venueFeeRaw) !== BigInt(quote.feeAmountRaw) ||
+        (side === "BUY" && BigInt(quote.feeAmountRaw) > amount) ||
+        !quote.expectedOutputAmountRaw ||
+        output > BigInt(quote.expectedOutputAmountRaw) ||
+        quote.snapshotSlot === null ||
+        quote.snapshotAtUtc === null ||
+        Date.parse(quote.observedAtUtc) > Date.parse(input.filledAtUtc) ||
+        Date.parse(quote.snapshotAtUtc) > Date.parse(input.filledAtUtc) ||
+        (quote.freshnessMs ?? Number.MAX_SAFE_INTEGER) > input.maxQuoteAgeMs ||
+        Date.parse(input.filledAtUtc) - Date.parse(quote.snapshotAtUtc) >
+          input.maxQuoteAgeMs
+      )
+        return reject("PAPER_QUOTE_INVALID_OR_STALE");
+      if (output <= 0n) return reject("PAPER_OUTPUT_ZERO");
+      const balance = (assetMint: string) =>
+        this.#sumLedger(walletId, assetMint, "WALLET");
+      const position = this.#db
+        .prepare(
+          "SELECT token_amount_raw, cost_basis_lamports FROM paper_positions WHERE wallet_id = ? AND mint = ?",
+        )
+        .get(walletId, mint) as SqlRow | undefined;
+      if (side === "BUY") {
+        if (amount + networkFee > balance(WSOL_MINT))
+          return reject("PAPER_INSUFFICIENT_SOL");
+        const exposure = this.#sumOpenCostBasis(walletId);
+        if (exposure + amount + networkFee > BigInt(input.maxExposureLamports))
+          return reject("PAPER_MAX_EXPOSURE_EXCEEDED");
+        const positionExists =
+          position && BigInt(String(position["token_amount_raw"])) > 0n;
+        const openRows = this.#db
+          .prepare(
+            "SELECT token_amount_raw FROM paper_positions WHERE wallet_id = ?",
+          )
+          .all(walletId) as SqlRow[];
+        const openCount = openRows.filter(
+          (openRow) => BigInt(String(openRow["token_amount_raw"])) > 0n,
+        ).length;
+        if (!positionExists && openCount >= input.maxOpenPositions)
+          return reject("PAPER_MAX_OPEN_POSITIONS");
+        const day = input.filledAtUtc.slice(0, 10);
+        const dailyPnl = this.#sumRealizedSince(walletId, day);
+        if (dailyPnl <= -BigInt(input.maxDailyLossLamports))
+          return reject("PAPER_DAILY_LOSS_LIMIT");
+        const latestMark = this.#db
+          .prepare(
+            "SELECT * FROM paper_equity_marks WHERE wallet_id = ? ORDER BY marked_at_utc DESC LIMIT 1",
+          )
+          .get(walletId) as SqlRow | undefined;
+        if (openCount > 0 && !latestMark)
+          return reject("PAPER_RISK_MARK_UNAVAILABLE");
+        if (latestMark) {
+          if (
+            Date.parse(input.filledAtUtc) -
+              Date.parse(String(latestMark["marked_at_utc"])) >
+            input.maxQuoteAgeMs
+          )
+            return reject("PAPER_RISK_MARK_STALE");
+          if (Number(latestMark["unpriceable_positions"]) > 0)
+            return reject("PAPER_UNPRICEABLE_EXPOSURE");
+          if (Number(latestMark["drawdown_bps"]) >= input.maxDrawdownBps)
+            return reject("PAPER_DRAWDOWN_LIMIT");
+        }
+      } else if (
+        !position ||
+        BigInt(String(position["token_amount_raw"])) < amount
+      ) {
+        return reject("PAPER_INSUFFICIENT_TOKEN_BALANCE");
+      } else if (balance(WSOL_MINT) + output < networkFee) {
+        return reject("PAPER_INSUFFICIENT_SOL_FOR_NETWORK_FEE");
+      }
+
+      const journalId = `paper-fill:${input.orderId}`;
+      const fillEvidence = {
+        quoteId: quote.id,
+        quoteProvenance: quote.provenance,
+        snapshotSlot: quote.snapshotSlot,
+        snapshotAtUtc: quote.snapshotAtUtc,
+        venueFeeRaw: input.venueFeeRaw,
+        networkFeeLamports: input.networkFeeLamports,
+        extraSlippageBps: input.extraSlippageBps,
+      };
+      this.#db
+        .prepare(
+          `INSERT INTO paper_journals(id, wallet_id, order_id, journal_type, created_at_utc, evidence_json)
+           VALUES (?, ?, ?, 'TRADE_FILL', ?, ?)`,
+        )
+        .run(
+          journalId,
+          walletId,
+          input.orderId,
+          input.filledAtUtc,
+          JSON.stringify(fillEvidence),
+        );
+      const entries: Array<{ account: string; asset: string; delta: bigint }> =
+        [];
+      const add = (account: string, asset: string, delta: bigint) =>
+        entries.push({ account, asset, delta });
+      if (side === "BUY") {
+        add("WALLET", WSOL_MINT, -amount);
+        add("VENUE_CLEARING", WSOL_MINT, amount - venueFee);
+        if (venueFee > 0n) add("VENUE_FEE", WSOL_MINT, venueFee);
+        add("WALLET", WSOL_MINT, -networkFee);
+        if (networkFee > 0n) add("NETWORK_FEE", WSOL_MINT, networkFee);
+        add("WALLET", mint, output);
+        add("VENUE_CLEARING", mint, -output);
+      } else {
+        add("WALLET", mint, -amount);
+        add("VENUE_CLEARING", mint, amount);
+        add("WALLET", WSOL_MINT, output);
+        add("VENUE_CLEARING", WSOL_MINT, -(output + venueFee));
+        if (venueFee > 0n) add("VENUE_FEE", WSOL_MINT, venueFee);
+        add("WALLET", WSOL_MINT, -networkFee);
+        if (networkFee > 0n) add("NETWORK_FEE", WSOL_MINT, networkFee);
+      }
+      this.#insertPaperJournalEntries(
+        journalId,
+        walletId,
+        entries,
+        input.filledAtUtc,
+      );
+      let realizedOnSell: bigint | null = null;
+      if (side === "BUY") {
+        const nextTokens =
+          BigInt(String(position?.["token_amount_raw"] ?? "0")) + output;
+        const nextCostBasis =
+          BigInt(String(position?.["cost_basis_lamports"] ?? "0")) +
+          amount +
+          networkFee;
+        this.#db
+          .prepare(
+            `INSERT INTO paper_positions(wallet_id, mint, token_amount_raw, cost_basis_lamports, updated_at_utc)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(wallet_id, mint) DO UPDATE SET
+             token_amount_raw = excluded.token_amount_raw, cost_basis_lamports = excluded.cost_basis_lamports,
+             updated_at_utc = excluded.updated_at_utc`,
+          )
+          .run(
+            walletId,
+            mint,
+            nextTokens.toString(),
+            nextCostBasis.toString(),
+            input.filledAtUtc,
+          );
+      } else {
+        const currentTokens = BigInt(String(position!["token_amount_raw"]));
+        const currentCost = BigInt(String(position!["cost_basis_lamports"]));
+        const allocatedCost = (currentCost * amount) / currentTokens;
+        realizedOnSell = output - networkFee - allocatedCost;
+        const nextTokens = currentTokens - amount;
+        const nextCost = currentCost - allocatedCost;
+        this.#db
+          .prepare(
+            `UPDATE paper_positions SET token_amount_raw = ?, cost_basis_lamports = ?, updated_at_utc = ?
+             WHERE wallet_id = ? AND mint = ?`,
+          )
+          .run(
+            nextTokens.toString(),
+            nextCost.toString(),
+            input.filledAtUtc,
+            walletId,
+            mint,
+          );
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO paper_fills
+           (order_id, wallet_id, mint, side, input_amount_raw, output_amount_raw, venue_fee_raw,
+            network_fee_lamports, extra_slippage_bps, quote_id, venue, snapshot_slot,
+            snapshot_at_utc, arrival_at_utc, filled_at_utc, evidence_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.orderId,
+          walletId,
+          mint,
+          side,
+          amount.toString(),
+          output.toString(),
+          venueFee.toString(),
+          networkFee.toString(),
+          input.extraSlippageBps,
+          quote.id,
+          quote.venue,
+          quote.snapshotSlot,
+          quote.snapshotAtUtc,
+          input.arrivalAtUtc,
+          input.filledAtUtc,
+          JSON.stringify(fillEvidence),
+        );
+      if (realizedOnSell !== null)
+        this.#db
+          .prepare(
+            "INSERT INTO paper_realized_pnl(order_id, wallet_id, mint, pnl_lamports, filled_at_utc) VALUES (?, ?, ?, ?, ?)",
+          )
+          .run(
+            input.orderId,
+            walletId,
+            mint,
+            realizedOnSell.toString(),
+            input.filledAtUtc,
+          );
+      this.#db
+        .prepare(
+          `UPDATE paper_orders SET status = 'SIMULATED_FILLED', reason_code = NULL,
+           arrival_at_utc = ?, completed_at_utc = ? WHERE id = ? AND status = 'PENDING'`,
+        )
+        .run(input.arrivalAtUtc, input.filledAtUtc, input.orderId);
+      this.#db.exec("COMMIT");
+      return { status: "SIMULATED_FILLED", reasonCode: null };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getPaperPortfolioState(walletId: string): {
+    solBalanceRaw: string;
+    positions: Array<{
+      mint: string;
+      tokenAmountRaw: string;
+      costBasisLamports: string;
+    }>;
+    realizedPnl: Array<{ pnlLamports: string; filledAtUtc: string }>;
+    latestMark: {
+      markedAtUtc: string;
+      equityLamports: string;
+      peakEquityLamports: string;
+      drawdownBps: number;
+      unpriceablePositions: number;
+    } | null;
+  } {
+    const positions = this.#db
+      .prepare(
+        "SELECT mint, token_amount_raw, cost_basis_lamports FROM paper_positions WHERE wallet_id = ? AND token_amount_raw != '0'",
+      )
+      .all(walletId) as SqlRow[];
+    const realizedPnl = this.#db
+      .prepare(
+        "SELECT pnl_lamports, filled_at_utc FROM paper_realized_pnl WHERE wallet_id = ? ORDER BY filled_at_utc",
+      )
+      .all(walletId) as SqlRow[];
+    const mark = this.#db
+      .prepare(
+        "SELECT * FROM paper_equity_marks WHERE wallet_id = ? ORDER BY marked_at_utc DESC LIMIT 1",
+      )
+      .get(walletId) as SqlRow | undefined;
+    return {
+      solBalanceRaw: this.#sumLedger(walletId, WSOL_MINT, "WALLET").toString(),
+      positions: positions.map((row) => ({
+        mint: String(row["mint"]),
+        tokenAmountRaw: String(row["token_amount_raw"]),
+        costBasisLamports: String(row["cost_basis_lamports"]),
+      })),
+      realizedPnl: realizedPnl.map((row) => ({
+        pnlLamports: String(row["pnl_lamports"]),
+        filledAtUtc: String(row["filled_at_utc"]),
+      })),
+      latestMark: mark
+        ? {
+            markedAtUtc: String(mark["marked_at_utc"]),
+            equityLamports: String(mark["equity_lamports"]),
+            peakEquityLamports: String(mark["peak_equity_lamports"]),
+            drawdownBps: Number(mark["drawdown_bps"]),
+            unpriceablePositions: Number(mark["unpriceable_positions"]),
+          }
+        : null,
+    };
+  }
+
+  recordPaperEquityMark(
+    walletId: string,
+    equityLamports: string,
+    unpriceablePositions: number,
+    markedAtUtc: string,
+  ): {
+    peakEquityLamports: string;
+    drawdownBps: number;
+  } {
+    if (!/^\d+$/.test(equityLamports) || unpriceablePositions < 0)
+      throw new Error("PAPER_EQUITY_MARK_INVALID");
+    const prior = this.#db
+      .prepare(
+        "SELECT peak_equity_lamports FROM paper_equity_marks WHERE wallet_id = ? ORDER BY marked_at_utc DESC LIMIT 1",
+      )
+      .get(walletId) as SqlRow | undefined;
+    const initial = this.#db
+      .prepare(
+        "SELECT initial_sol_lamports FROM paper_accounts WHERE wallet_id = ?",
+      )
+      .get(walletId) as SqlRow | undefined;
+    if (!initial) throw new Error("PAPER_ACCOUNT_NOT_FOUND");
+    const priorPeak = BigInt(
+      String(
+        prior?.["peak_equity_lamports"] ?? initial["initial_sol_lamports"],
+      ),
+    );
+    const equity = BigInt(equityLamports);
+    const peak = equity > priorPeak ? equity : priorPeak;
+    const drawdown =
+      peak === 0n ? 0 : Number(((peak - equity) * 10000n) / peak);
+    this.#db
+      .prepare(
+        `INSERT OR REPLACE INTO paper_equity_marks
+         (wallet_id, marked_at_utc, equity_lamports, peak_equity_lamports, drawdown_bps, unpriceable_positions)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        walletId,
+        markedAtUtc,
+        equityLamports,
+        peak.toString(),
+        drawdown,
+        unpriceablePositions,
+      );
+    return { peakEquityLamports: peak.toString(), drawdownBps: drawdown };
+  }
+
+  getPaperFill(orderId: string): Record<string, string | number> | null {
+    const row = this.#db
+      .prepare("SELECT * FROM paper_fills WHERE order_id = ?")
+      .get(orderId) as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      orderId: String(row["order_id"]),
+      walletId: String(row["wallet_id"]),
+      mint: String(row["mint"]),
+      side: String(row["side"]),
+      inputAmountRaw: String(row["input_amount_raw"]),
+      outputAmountRaw: String(row["output_amount_raw"]),
+      venueFeeRaw: String(row["venue_fee_raw"]),
+      networkFeeLamports: String(row["network_fee_lamports"]),
+      extraSlippageBps: Number(row["extra_slippage_bps"]),
+      quoteId: String(row["quote_id"]),
+      venue: String(row["venue"]),
+      snapshotSlot: Number(row["snapshot_slot"]),
+      snapshotAtUtc: String(row["snapshot_at_utc"]),
+      arrivalAtUtc: String(row["arrival_at_utc"]),
+      filledAtUtc: String(row["filled_at_utc"]),
+    };
+  }
+
+  listPaperLedgerEntries(walletId: string): Array<{
+    journalId: string;
+    account: string;
+    assetMint: string;
+    deltaRaw: string;
+    createdAtUtc: string;
+  }> {
+    return (
+      this.#db
+        .prepare(
+          `SELECT journal_id, account, asset_mint, delta_raw, created_at_utc
+         FROM paper_ledger_entries WHERE wallet_id = ? ORDER BY created_at_utc, id`,
+        )
+        .all(walletId) as SqlRow[]
+    ).map((row) => ({
+      journalId: String(row["journal_id"]),
+      account: String(row["account"]),
+      assetMint: String(row["asset_mint"]),
+      deltaRaw: String(row["delta_raw"]),
+      createdAtUtc: String(row["created_at_utc"]),
+    }));
+  }
+
   listQuoteResults(mint: string, limit = 50): QuoteResult[] {
     const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
     const rows = this.#db
@@ -1334,6 +1927,115 @@ export class SentinelStore {
         JSON.stringify(input.reasonCodes),
         input.createdAtUtc,
       );
+  }
+
+  #sumLedger(walletId: string, assetMint: string, account: string): bigint {
+    const rows = this.#db
+      .prepare(
+        "SELECT delta_raw FROM paper_ledger_entries WHERE wallet_id = ? AND asset_mint = ? AND account = ?",
+      )
+      .all(walletId, assetMint, account) as SqlRow[];
+    return rows.reduce(
+      (total, row) => total + BigInt(String(row["delta_raw"])),
+      0n,
+    );
+  }
+
+  #sumOpenCostBasis(walletId: string): bigint {
+    const rows = this.#db
+      .prepare(
+        "SELECT cost_basis_lamports FROM paper_positions WHERE wallet_id = ? AND token_amount_raw != '0'",
+      )
+      .all(walletId) as SqlRow[];
+    return rows.reduce(
+      (total, row) => total + BigInt(String(row["cost_basis_lamports"])),
+      0n,
+    );
+  }
+
+  #sumRealizedSince(walletId: string, utcDate: string): bigint {
+    const rows = this.#db
+      .prepare(
+        "SELECT pnl_lamports FROM paper_realized_pnl WHERE wallet_id = ? AND substr(filled_at_utc, 1, 10) = ?",
+      )
+      .all(walletId, utcDate) as SqlRow[];
+    return rows.reduce(
+      (total, row) => total + BigInt(String(row["pnl_lamports"])),
+      0n,
+    );
+  }
+
+  #insertPaperLedgerPair(input: {
+    journalId: string;
+    walletId: string;
+    assetMint: string;
+    leftAccount: string;
+    leftDelta: bigint;
+    rightAccount: string;
+    rightDelta: bigint;
+    createdAtUtc: string;
+  }): void {
+    this.#insertPaperJournalEntries(
+      input.journalId,
+      input.walletId,
+      [
+        {
+          account: input.leftAccount,
+          asset: input.assetMint,
+          delta: input.leftDelta,
+        },
+        {
+          account: input.rightAccount,
+          asset: input.assetMint,
+          delta: input.rightDelta,
+        },
+      ],
+      input.createdAtUtc,
+    );
+  }
+
+  #insertPaperJournalEntries(
+    journalId: string,
+    walletId: string,
+    sourceEntries: Array<{ account: string; asset: string; delta: bigint }>,
+    createdAtUtc: string,
+  ): void {
+    const aggregated = new Map<
+      string,
+      { account: string; asset: string; delta: bigint }
+    >();
+    for (const entry of sourceEntries) {
+      const key = `${entry.account}:${entry.asset}`;
+      const current = aggregated.get(key);
+      aggregated.set(key, {
+        ...entry,
+        delta: (current?.delta ?? 0n) + entry.delta,
+      });
+    }
+    const byAsset = new Map<string, bigint>();
+    for (const entry of aggregated.values())
+      byAsset.set(entry.asset, (byAsset.get(entry.asset) ?? 0n) + entry.delta);
+    if ([...byAsset.values()].some((sum) => sum !== 0n))
+      throw new Error("PAPER_JOURNAL_NOT_BALANCED");
+    let index = 0;
+    for (const entry of aggregated.values()) {
+      if (entry.delta === 0n) continue;
+      this.#db
+        .prepare(
+          `INSERT INTO paper_ledger_entries
+           (id, journal_id, wallet_id, account, asset_mint, delta_raw, created_at_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `${journalId}:${index++}`,
+          journalId,
+          walletId,
+          entry.account,
+          entry.asset,
+          entry.delta.toString(),
+          createdAtUtc,
+        );
+    }
   }
 
   #recordEventConflict(existing: SqlRow, incoming: MarketEvent): void {
@@ -1529,6 +2231,21 @@ function mapToken(row: SqlRow): StoredToken {
         : String(row["mint_state_error_code"]),
     monitoringEligible: row["monitoring_eligible"] === 1,
     eventCount: Number(row["event_count"]),
+  };
+}
+
+function mapPaperOrder(row: SqlRow) {
+  return {
+    id: String(row["id"]),
+    walletId: String(row["wallet_id"]),
+    idempotencyKey: String(row["idempotency_key"]),
+    mint: String(row["mint"]),
+    side: String(row["side"]) as "BUY" | "SELL",
+    inputAmountRaw: String(row["input_amount_raw"]),
+    status: String(row["status"]) as
+      "PENDING" | "SIMULATED_FILLED" | "REJECTED" | "UNFILLABLE" | "EXPIRED",
+    reasonCode: row["reason_code"] === null ? null : String(row["reason_code"]),
+    createdAtUtc: String(row["created_at_utc"]),
   };
 }
 

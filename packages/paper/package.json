@@ -1,0 +1,12 @@
+{
+  "name": "@sentinel/paper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@sentinel/config": "workspace:*",
+    "@sentinel/domain": "workspace:*",
+    "@sentinel/providers": "workspace:*"
+  }
+}

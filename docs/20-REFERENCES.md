@@ -4,8 +4,10 @@ Sources checked against official documentation during preparation of this bluepr
 
 ## Core sources
 
-- PumpPortal real-time streaming: https://pumpportal.fun/data-api/real-time/
+- PumpPortal real-time streaming: https://pumpportal.fun/data-api/bonk-fun-data-api/
   - Documented `subscribeNewToken`, `subscribeMigration`, `subscribeTokenTrade`, `subscribeAccountTrade`; one WebSocket recommendation; trade stream metering.
+- PumpPortal fee schedule: https://pumpportal.fun/fees/
+  - Current data-stream price and linked-wallet balance requirement; re-check before enabling paid streams.
 - PumpPortal setup/security: https://pumpportal.fun/trading-api/setup/
   - Lightning wallet and API key can grant trade access to linked funds; treat as secret.
 - Helius docs: https://www.helius.dev/docs

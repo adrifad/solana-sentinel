@@ -57,4 +57,6 @@ Migration `005-intelligence-security-decisions.sql` adds the persisted analysis 
 
 Migration `006-market-intelligence.sql` adds queried-wallet token outflow evidence, normalized time-indexed launch trade observations, launch behavior snapshots with explicit completeness/gap status, quote results with venue/source/snapshot fields, and a persistent Jupiter UTC-day request budget. Raw trade observations are not currently populated from PumpPortal because its trade event payload has not been validated in a sanitized capture.
 
+Migration `007-paper-ledger.sql` adds isolated paper accounts, idempotent paper orders, atomic fills, double-entry journals, raw-amount positions, realized PnL, and portfolio equity/drawdown marks. Ledger updates and deletes are rejected by SQLite triggers. The schema exists for the standalone `@sentinel/paper` library; the application mode remains `DRY_RUN`, and the worker/API do not have a paper settlement path.
+
 ---

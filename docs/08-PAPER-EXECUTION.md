@@ -1,5 +1,9 @@
 # 08 — Real-Time Paper Trading: Fill Model & Ledger
 
+## Implemented foundation status
+
+The standalone `@sentinel/paper` package now contains a quote-at-arrival simulator, conservative fill adjustment, persistent order recovery, atomic double-entry settlement, positions, portfolio marks/PnL, risk gates, and an exit-rule evaluator. It uses the validated Pump curve/PumpSwap read-only quote loaders through an injected provider. Unit/integration tests use deterministic quote fixtures. This is not yet an operational PAPER mode: the app config remains `DRY_RUN`, the worker/API do not import the package, and automatic entries stay disabled until the live trade-observation and DRY_RUN end-to-end acceptance gate passes. No simulated trade is a real fill.
+
 ## Objective
 
 Simulate trading using **mainnet state available when an order would arrive**, not an arbitrary last-traded price. Keep it conservative. A simulated success is not a guarantee of real execution.

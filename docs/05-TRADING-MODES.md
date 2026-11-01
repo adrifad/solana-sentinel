@@ -1,5 +1,9 @@
 # 05 — Trading Modes: DRY_RUN / PAPER / LIVE
 
+## Current implementation boundary
+
+The application currently validates `DRY_RUN` only. A signer-free `@sentinel/paper` library and SQLite ledger foundation are available for deterministic testing, but neither `APP_MODE=PAPER` nor worker entry execution is enabled. Do not select PAPER for operations until the live observation-to-decision Milestone A is demonstrated and the remaining execution safeguards are integrated.
+
 ## Safety matrix
 
 | Capability                           |        DRY_RUN |          PAPER |                     LIVE |
