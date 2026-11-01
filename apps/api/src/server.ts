@@ -83,6 +83,8 @@ async function handleRequest(
           roleEvidence: options.store.listWalletRoleEvidence(mint),
           securityReport: options.store.getLatestTokenRiskReport(mint),
           decisions: options.store.listRiskDecisions(mint),
+          launchBehavior: options.store.listLaunchBehaviorSnapshots(mint),
+          tradeCoverage: options.store.getLatestTradeObservationCoverage(mint),
           analysisJobs: options.store.getAnalysisOutcome(mint),
           migrationRecovery: options.store.getMigrationRecoveryStatus(mint),
         })
@@ -115,6 +117,9 @@ export function getOperationalReadiness(options: ApiOptions) {
   const providers = options.store.listProviderHealth();
   const pump = providers.find((provider) => provider.provider === "pumpportal");
   const helius = providers.find((provider) => provider.provider === "helius");
+  const heliusTradeStream = providers.find(
+    (provider) => provider.provider === "helius_trade_stream",
+  );
   const pumpFresh = Boolean(
     pump?.checkedAtUtc &&
     Date.now() - Date.parse(pump.checkedAtUtc) <=
@@ -124,6 +129,7 @@ export function getOperationalReadiness(options: ApiOptions) {
   const tokens = options.store.listTokens(200);
   const tradeObservationReady =
     options.tradeStreamEnabled &&
+    heliusTradeStream?.state === "HEALTHY" &&
     tokens.length > 0 &&
     tokens.every(
       (token) =>
@@ -139,9 +145,11 @@ export function getOperationalReadiness(options: ApiOptions) {
         options.store.listRiskDecisions(token.mint, 1).length > 0,
     );
   const blockers: string[] = [];
-  if (!pumpFresh || pump?.state !== "HEALTHY")
-    blockers.push("PUMPPORTAL_DISCOVERY_NOT_HEALTHY");
+  const discoveryReady = pumpFresh && pump?.state === "HEALTHY";
+  if (!discoveryReady) blockers.push("PUMPPORTAL_DISCOVERY_NOT_HEALTHY");
   if (!options.tradeStreamEnabled) blockers.push("TRADE_STREAM_DISABLED");
+  if (options.tradeStreamEnabled && heliusTradeStream?.state !== "HEALTHY")
+    blockers.push("HELIUS_TRADE_STREAM_NOT_HEALTHY");
   if (!tradeObservationReady) blockers.push("TRADE_STREAM_COVERAGE_UNVERIFIED");
   if (!analysisReady) blockers.push("ANALYSIS_NOT_READY");
   let paperAccount: ReturnType<SentinelStore["getPaperPortfolioState"]> | null =
@@ -161,7 +169,9 @@ export function getOperationalReadiness(options: ApiOptions) {
     analysisReady &&
     tradeObservationReady &&
     Boolean(helius?.state === "HEALTHY") &&
+    Boolean(heliusTradeStream?.state === "HEALTHY") &&
     (paperAccount?.latestMark?.unpriceablePositions ?? 0) === 0;
+  const paperRuntimeReady = options.mode === "PAPER" && paperAccount !== null;
   if (options.mode !== "PAPER") blockers.push("MODE_IS_NOT_PAPER");
   if (options.mode === "PAPER" && !options.automaticEntriesEnabled)
     blockers.push("AUTOMATIC_ENTRIES_DISABLED");
@@ -170,16 +180,19 @@ export function getOperationalReadiness(options: ApiOptions) {
   return {
     mode: options.mode,
     processHealth: true,
+    discoveryReady,
     providerConnectivity: {
       pumpPortal: pump?.state === "HEALTHY" && pumpFresh,
       heliusRpc: helius?.state === "HEALTHY",
       heliusTradeStream:
-        options.tradeStreamEnabled && helius?.state === "HEALTHY",
+        options.tradeStreamEnabled && heliusTradeStream?.state === "HEALTHY",
     },
     dataCompleteness: completeness,
     analysisReadiness: analysisReady,
     tradeObservationReady,
+    paperRuntimeReady,
     paperExecutionReady,
+    paperAutomaticEntryReady: paperExecutionReady,
     automaticEntriesEnabled: options.automaticEntriesEnabled,
     paper: paperAccount
       ? {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { parseArgs } from "../scripts/validate-providers.ts";
+import { parseTradeValidationArgs } from "../scripts/validate-trade-events.ts";
 import { parsePumpPortalMessage } from "@sentinel/providers";
 
 test("provider validation uses a bounded duration and safe capture directory", () => {
@@ -32,6 +33,36 @@ test("provider validation uses a bounded duration and safe capture directory", (
     /CAPTURE_PATH_MUST_BE_UNDER_TEST_FIXTURES_CAPTURES/,
   );
   assert.throws(() => parseArgs(["--unknown"]), /UNKNOWN_ARGUMENT/);
+});
+
+test("trade validation harness enforces bounded RPC and capture arguments", () => {
+  assert.deepEqual(
+    parseTradeValidationArgs([
+      "--mint=So11111111111111111111111111111111111111112",
+      "--max-signatures=5",
+    ]),
+    {
+      mint: "So11111111111111111111111111111111111111112",
+      maxSignatures: 5,
+      capture: null,
+    },
+  );
+  assert.throws(
+    () => parseTradeValidationArgs(["--max-signatures=21"]),
+    /MAX_SIGNATURES_MUST_BE_1_TO_20/,
+  );
+  assert.throws(
+    () =>
+      parseTradeValidationArgs([
+        "--mint=So11111111111111111111111111111111111111112",
+        "--capture=.env",
+      ]),
+    /CAPTURE_PATH_MUST_BE_UNDER_TEST_FIXTURES_CAPTURES/,
+  );
+  assert.throws(
+    () => parseTradeValidationArgs(["--unknown"]),
+    /UNKNOWN_ARGUMENT/,
+  );
 });
 
 test("public provider capture keeps only sanitized launch event fields", () => {

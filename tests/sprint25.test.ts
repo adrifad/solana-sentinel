@@ -37,13 +37,20 @@ function trade(
     signature: input.signature ?? "sig-1",
     slot: input.slot ?? 100,
     blockTimeUtc: input.blockTimeUtc ?? utc,
+    eventTimeUtc: input.eventTimeUtc ?? utc,
+    eventTimeSource: input.eventTimeSource ?? "PUMP_TRADE_EVENT_TIMESTAMP",
     receivedAtUtc: input.receivedAtUtc ?? utc,
+    ingestedAtUtc: input.ingestedAtUtc ?? input.receivedAtUtc ?? utc,
     side: input.side ?? "BUY",
     traderWallet: input.traderWallet ?? otherMint,
     tokenAmountRaw: input.tokenAmountRaw ?? "1000",
     quoteAmountRaw: input.quoteAmountRaw ?? "100",
+    quoteMint: input.quoteMint ?? "So11111111111111111111111111111111111111112",
     venue: input.venue ?? "PUMP_BONDING_CURVE",
     source: input.source ?? "SANITIZED_FIXTURE",
+    validationStatus: input.validationStatus ?? "VERIFIED",
+    validationConfidenceBps: input.validationConfidenceBps ?? 10000,
+    decoderVersion: input.decoderVersion ?? "SYNTHETIC_TEST_IDL",
     payloadRef: input.payloadRef ?? `sha256:${"a".repeat(64)}`,
   };
 }
@@ -434,6 +441,64 @@ test("launch behavior excludes trades observed after the decision timestamp", ()
   assert.equal(snapshot.independentBuyerEstimate, 1);
 });
 
+test("later reconciliation ingestion cannot rewrite an earlier behavior snapshot", () => {
+  const snapshot = analyzeLaunchBehavior({
+    mint,
+    observations: [
+      trade({
+        id: "late-reconciliation",
+        blockTimeUtc: utc,
+        receivedAtUtc: utc,
+        ingestedAtUtc: "2026-11-01T00:00:31.000Z",
+      }),
+    ],
+    creatorWallets: [],
+    linkedWallets: [],
+    windowStartedAtUtc: utc,
+    observedAtUtc: "2026-11-01T00:00:30.000Z",
+    windowSeconds: 30,
+    throughSlot: 100,
+    complete: true,
+    gapReason: null,
+    minIndependentBuyers: 1,
+  });
+  assert.equal(snapshot.buyCount, 0);
+  assert.equal(snapshot.independentBuyerEstimate, 0);
+  assert.equal(snapshot.classification, "UNKNOWN");
+});
+
+test("mixed market phases retain per-venue metrics and do not classify a pooled window", () => {
+  const snapshot = analyzeLaunchBehavior({
+    mint,
+    observations: [
+      trade({ id: "curve", quoteAmountRaw: "70" }),
+      trade({
+        id: "pool",
+        signature: "pool-sig",
+        venue: "PUMPSWAP",
+        quoteAmountRaw: "30",
+      }),
+    ],
+    creatorWallets: [],
+    linkedWallets: [],
+    windowStartedAtUtc: utc,
+    observedAtUtc: utc,
+    windowSeconds: 30,
+    throughSlot: 100,
+    complete: true,
+    gapReason: null,
+    minIndependentBuyers: 1,
+  });
+  assert.equal(snapshot.venueMetrics.PUMP_BONDING_CURVE.buyVolumeRaw, "70");
+  assert.equal(snapshot.venueMetrics.PUMPSWAP.buyVolumeRaw, "30");
+  assert.equal(snapshot.classification, "UNKNOWN");
+  assert.ok(
+    snapshot.reasonCodes.includes(
+      "MULTI_VENUE_WINDOW_REQUIRES_SEPARATE_ANALYSIS",
+    ),
+  );
+});
+
 test("launch behavior marks a complete independent-buyer window as candidate", () => {
   const snapshot = analyzeLaunchBehavior({
     mint,
@@ -523,7 +588,7 @@ test("wallet outflow evidence is an indicator and does not assert a sell", () =>
   assert.equal(outflows[0]?.afterAmountRaw, "400");
 });
 
-test("migration 009 persists quotes and behavior snapshots and reopens cleanly", async () => {
+test("migration 010 persists trade evidence and prior state reopens cleanly", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sentinel-sprint25-"));
   const path = join(dir, "state.db");
   const store = new SentinelStore(path);
@@ -577,7 +642,7 @@ test("migration 009 persists quotes and behavior snapshots and reopens cleanly",
       migrations.some((item) => item.version === 6),
       true,
     );
-    assert.equal(migrations.at(-1)?.version, 9);
+    assert.equal(migrations.at(-1)?.version, 10);
     assert.equal(store.tryConsumeJupiterRequest(1), true);
     assert.equal(store.tryConsumeJupiterRequest(1), false);
   } finally {

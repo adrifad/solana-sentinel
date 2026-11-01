@@ -232,6 +232,20 @@ test("risk decision cannot be BUY_ELIGIBLE with unknown security or incomplete h
     throughSlot: 10,
     buyCount: 3,
     sellCount: 0,
+    venueMetrics: {
+      PUMP_BONDING_CURVE: {
+        buyCount: 3,
+        sellCount: 0,
+        buyVolumeRaw: "300",
+        sellVolumeRaw: "0",
+      },
+      PUMPSWAP: {
+        buyCount: 0,
+        sellCount: 0,
+        buyVolumeRaw: "0",
+        sellVolumeRaw: "0",
+      },
+    },
     uniqueBuyers: 3,
     independentBuyerEstimate: 3,
     creatorAssociatedBuys: 0,

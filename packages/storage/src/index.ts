@@ -97,6 +97,7 @@ export class SentinelStore {
       "007-paper-ledger.sql",
       "008-runtime-hardening.sql",
       "009-paper-runtime.sql",
+      "010-trade-evidence.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -1440,9 +1441,11 @@ export class SentinelStore {
     this.#db
       .prepare(
         `INSERT OR IGNORE INTO launch_trade_observations
-        (id, event_index, mint, signature, slot, block_time_utc, received_at_utc, side, trader_wallet,
-        token_amount_raw, quote_amount_raw, venue, source, payload_ref)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, event_index, mint, signature, slot, block_time_utc, event_time_utc,
+        event_time_source, received_at_utc, ingested_at_utc, side, trader_wallet,
+        token_amount_raw, quote_amount_raw, quote_mint, venue, source, decoder_version,
+        validation_status, validation_confidence_bps, payload_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         observation.id,
@@ -1451,13 +1454,20 @@ export class SentinelStore {
         observation.signature,
         observation.slot,
         observation.blockTimeUtc,
+        observation.eventTimeUtc,
+        observation.eventTimeSource,
         observation.receivedAtUtc,
+        observation.ingestedAtUtc,
         observation.side,
         observation.traderWallet,
         observation.tokenAmountRaw,
         observation.quoteAmountRaw,
+        observation.quoteMint,
         observation.venue,
         observation.source,
+        observation.decoderVersion,
+        observation.validationStatus,
+        observation.validationConfidenceBps,
         observation.payloadRef,
       );
   }
@@ -1561,13 +1571,20 @@ export class SentinelStore {
         signature: row["signature"],
         slot: row["slot"],
         blockTimeUtc: row["block_time_utc"],
+        eventTimeUtc: row["event_time_utc"],
+        eventTimeSource: row["event_time_source"],
         receivedAtUtc: row["received_at_utc"],
+        ingestedAtUtc: row["ingested_at_utc"],
         side: row["side"],
         traderWallet: row["trader_wallet"],
         tokenAmountRaw: row["token_amount_raw"],
         quoteAmountRaw: row["quote_amount_raw"],
+        quoteMint: row["quote_mint"],
         venue: row["venue"],
         source: row["source"],
+        decoderVersion: row["decoder_version"],
+        validationStatus: row["validation_status"],
+        validationConfidenceBps: row["validation_confidence_bps"],
         payloadRef: row["payload_ref"],
       }),
     );

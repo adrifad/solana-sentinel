@@ -47,13 +47,15 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Default automatic entries and the Helius trade observation stream are disabled. The optional Helius `logsSubscribe` path decodes the pinned Pump SDK 4.1.0 trade event layout, but no real trade payload has been validated in this change and it never upgrades observed coverage to `COMPLETE`. The PAPER entry gate therefore remains closed until verified complete behavior evidence exists. PAPER has no signer or transaction submission path; LIVE, the dashboard, and profitability claims remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for evidence and remaining gates.
+The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Default automatic entries and Helius trade observation are disabled. Optional Pump and PumpSwap `logsSubscribe` decoders validate event structure against pinned SDK IDLs and correlate finalized transactions, but automated coverage is synthetic; the bounded live validation attempt was blocked by `PROVIDER_UNAVAILABLE`. No stream window is upgraded to `COMPLETE`, so the PAPER entry gate remains closed. PAPER has no signer or transaction submission path; LIVE, the dashboard, and profitability claims remain unimplemented. See [implementation status](docs/IMPLEMENTATION-STATUS.md) and the [Sprint 3.2 validation report](SPRINT32_VALIDATION_REPORT.md) for current evidence and gates.
 
 ## Local implementation commands
 
 With Node.js 24 or 26 and pnpm 11 installed:
 
 Provider validation is available with `pnpm validate:providers --seconds=45`. The default live check makes at most four Helius RPC requests, listens only to free PumpPortal create/migration feeds, and never enables metered trade subscriptions. Optional state-capture flags run additional bounded Helius account requests for Pump curve or PumpSwap snapshots. Sanitized public evidence can be written under `tests/fixtures/captures`; see `--help` in the script for the supported capture flags.
+
+The read-only trade-event harness is `pnpm validate:trade-events -- --mint=<MINT> --max-signatures=5`. It examines at most 20 finalized address signatures and makes at most eight Helius RPC requests, without opening the application database. It does not prove exhaustive observation coverage; only a verified trade can be written as a sanitized fixture under `tests/fixtures/captures/`.
 
 ```bash
 pnpm install

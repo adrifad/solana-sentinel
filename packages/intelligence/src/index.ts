@@ -7,6 +7,15 @@ import type { WalletTransaction } from "@sentinel/providers";
 import { PUMP_PROGRAM_ID } from "./pump-constants.ts";
 export { PUMP_PROGRAM_ID } from "./pump-constants.ts";
 export { decodePumpTradeEvents } from "./pump-trades.ts";
+export {
+  decodePumpSwapTradeEvents,
+  PUMPSWAP_PROGRAM_ID,
+} from "./pumpswap-trades.ts";
+export { validateTradeTransaction } from "./trade-validation.ts";
+export type {
+  TradeTransactionValidation,
+  VerifiedTradeObservation,
+} from "./trade-validation.ts";
 
 const CREATE_EVENT_DISCRIMINATOR = Buffer.from([
   27, 114, 169, 77, 222, 235, 99, 118,
@@ -59,18 +68,34 @@ export function analyzeLaunchBehavior(input: {
   const startMs = Date.parse(input.windowStartedAtUtc);
   const creators = new Set(input.creatorWallets);
   const linked = new Set(input.linkedWallets);
-  const observations = input.observations
-    .filter((item) => {
-      const at = Date.parse(item.blockTimeUtc ?? item.receivedAtUtc);
-      return (
-        item.mint === input.mint &&
-        at >= startMs &&
-        at <= endMs &&
-        (input.throughSlot === null ||
-          item.slot === null ||
-          item.slot <= input.throughSlot)
-      );
-    })
+  const inWindowObservations = input.observations.filter((item) => {
+    const at = Date.parse(item.blockTimeUtc ?? item.receivedAtUtc);
+    const receivedAt = Date.parse(item.receivedAtUtc);
+    const ingestedAt = Date.parse(item.ingestedAtUtc);
+    return (
+      item.mint === input.mint &&
+      at >= startMs &&
+      at <= endMs &&
+      receivedAt <= endMs &&
+      ingestedAt <= endMs &&
+      (input.throughSlot === null ||
+        item.slot === null ||
+        item.slot <= input.throughSlot)
+    );
+  });
+  const unverifiedTradeCount = inWindowObservations.filter(
+    (item) => item.validationStatus !== "VERIFIED",
+  ).length;
+  const unknownVenueCount = inWindowObservations.filter(
+    (item) => item.validationStatus === "VERIFIED" && item.venue === "UNKNOWN",
+  ).length;
+  const observations = inWindowObservations
+    .filter(
+      (item) =>
+        item.validationStatus === "VERIFIED" &&
+        item.venue !== "UNKNOWN" &&
+        item.quoteMint === "So11111111111111111111111111111111111111112",
+    )
     .sort((a, b) => {
       const slotA = a.slot ?? Number.MAX_SAFE_INTEGER;
       const slotB = b.slot ?? Number.MAX_SAFE_INTEGER;
@@ -78,6 +103,20 @@ export function analyzeLaunchBehavior(input: {
     });
   const buys = observations.filter((item) => item.side === "BUY");
   const sells = observations.filter((item) => item.side === "SELL");
+  const venueMetrics = {
+    PUMP_BONDING_CURVE: {
+      buyCount: 0,
+      sellCount: 0,
+      buyVolumeRaw: 0n,
+      sellVolumeRaw: 0n,
+    },
+    PUMPSWAP: {
+      buyCount: 0,
+      sellCount: 0,
+      buyVolumeRaw: 0n,
+      sellVolumeRaw: 0n,
+    },
+  };
   const buyerCounts = new Map<string, number>();
   const walletVolumes = new Map<string, bigint>();
   const walletSides = new Map<string, Set<"BUY" | "SELL">>();
@@ -86,6 +125,20 @@ export function analyzeLaunchBehavior(input: {
   let creatorAssociatedBuys = 0;
   for (const item of observations) {
     const amount = BigInt(item.quoteAmountRaw ?? "0");
+    const metric =
+      item.venue === "PUMPSWAP"
+        ? venueMetrics.PUMPSWAP
+        : item.venue === "PUMP_BONDING_CURVE"
+          ? venueMetrics.PUMP_BONDING_CURVE
+          : null;
+    if (!metric) continue;
+    if (item.side === "BUY") {
+      metric.buyCount += 1;
+      metric.buyVolumeRaw += amount;
+    } else {
+      metric.sellCount += 1;
+      metric.sellVolumeRaw += amount;
+    }
     const wallet = item.traderWallet;
     if (wallet) {
       buyerCounts.set(wallet, (buyerCounts.get(wallet) ?? 0) + 1);
@@ -127,14 +180,26 @@ export function analyzeLaunchBehavior(input: {
       ? null
       : Number((maxWalletVolume * 10000n) / totalVolume);
   const reasons = new Set<string>();
+  const complete =
+    input.complete && unverifiedTradeCount === 0 && unknownVenueCount === 0;
+  const gapReason =
+    input.gapReason ??
+    (unverifiedTradeCount > 0
+      ? "UNVERIFIED_TRADE_EVIDENCE_PRESENT"
+      : unknownVenueCount > 0
+        ? "TRADE_VENUE_UNSUPPORTED"
+        : null);
+  const observedVenues = new Set(observations.map((item) => item.venue));
   let classification: LaunchBehaviorSnapshot["classification"] = "UNKNOWN";
   let confidenceBps = 0;
   if (input.metadataLikelyTest) {
     classification = "LIKELY_TEST";
     confidenceBps = 7000;
     reasons.add("TEST_TOKEN_METADATA_PATTERN");
-  } else if (!input.complete) {
-    reasons.add(input.gapReason ?? "OBSERVATION_WINDOW_INCOMPLETE");
+  } else if (!complete) {
+    reasons.add(gapReason ?? "OBSERVATION_WINDOW_INCOMPLETE");
+  } else if (observedVenues.size > 1) {
+    reasons.add("MULTI_VENUE_WINDOW_REQUIRES_SEPARATE_ANALYSIS");
   } else if (suspectedWashPattern) {
     classification = "UNKNOWN";
     confidenceBps = 4000;
@@ -162,6 +227,20 @@ export function analyzeLaunchBehavior(input: {
     throughSlot: input.throughSlot,
     buyCount: buys.length,
     sellCount: sells.length,
+    venueMetrics: {
+      PUMP_BONDING_CURVE: {
+        buyCount: venueMetrics.PUMP_BONDING_CURVE.buyCount,
+        sellCount: venueMetrics.PUMP_BONDING_CURVE.sellCount,
+        buyVolumeRaw: venueMetrics.PUMP_BONDING_CURVE.buyVolumeRaw.toString(),
+        sellVolumeRaw: venueMetrics.PUMP_BONDING_CURVE.sellVolumeRaw.toString(),
+      },
+      PUMPSWAP: {
+        buyCount: venueMetrics.PUMPSWAP.buyCount,
+        sellCount: venueMetrics.PUMPSWAP.sellCount,
+        buyVolumeRaw: venueMetrics.PUMPSWAP.buyVolumeRaw.toString(),
+        sellVolumeRaw: venueMetrics.PUMPSWAP.sellVolumeRaw.toString(),
+      },
+    },
     uniqueBuyers: new Set(buys.map((item) => item.traderWallet).filter(Boolean))
       .size,
     independentBuyerEstimate: independentWallets.size,
@@ -178,8 +257,8 @@ export function analyzeLaunchBehavior(input: {
     classification,
     reasonCodes: [...reasons].sort(),
     confidenceBps,
-    complete: input.complete,
-    gapReason: input.gapReason,
+    complete,
+    gapReason,
     evidenceRefs: uniqueEvidenceRefs,
   };
   return LaunchBehaviorSnapshotSchema.parse(candidate);

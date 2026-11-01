@@ -135,10 +135,20 @@ function decodeTradeEvent(
     const shareholderLengthBytes = take(4);
     if (!shareholderLengthBytes) return null;
     const shareholderCount = shareholderLengthBytes.readUInt32LE(0);
-    if (shareholderCount > 100 || !take(shareholderCount * 40)) return null;
+    // The pinned Pump SDK IDL defines Shareholder as pubkey + u16 share_bps.
+    if (shareholderCount > 100 || !take(shareholderCount * 34)) return null;
     const quoteMint = pubkey();
     const quoteAmount = u64();
-    if (!quoteMint || quoteAmount === null) return null;
+    // Pump SDK 4.1.0 TradeEvent suffix after quote_amount:
+    // virtual_quote_reserves, real_quote_reserves, holder_rewards_bps,
+    // holder_rewards, creator_fee_unclaimed.
+    if (
+      !quoteMint ||
+      quoteAmount === null ||
+      !skipU64s(5) ||
+      offset !== data.length
+    )
+      return null;
 
     // The supported quote engines only price native SOL/WSOL routes.
     if (quoteMint !== SYSTEM_PROGRAM_ID && quoteMint !== WSOL_MINT) return null;

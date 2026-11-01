@@ -19,7 +19,8 @@
     "dev:api": "node --env-file-if-exists=.env --experimental-strip-types apps/api/src/main.ts",
     "tokens": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts tokens",
     "health": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts health",
-    "validate:providers": "node --env-file-if-exists=.env --experimental-strip-types scripts/validate-providers.ts"
+    "validate:providers": "node --env-file-if-exists=.env --experimental-strip-types scripts/validate-providers.ts",
+    "validate:trade-events": "node --env-file-if-exists=.env --experimental-strip-types scripts/validate-trade-events.ts"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

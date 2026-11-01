@@ -12,6 +12,8 @@ providers:
     enable_trade_stream: false
     max_active_trade_subscriptions: 20
     max_trade_events_per_day: 5000
+    trade_verification_concurrency: 2
+    max_pending_trade_verifications: 128
   pumpportal:
     enable_new_tokens: true
     enable_migrations: true

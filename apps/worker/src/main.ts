@@ -7,13 +7,18 @@ import {
   HeliusRpcClient,
   JupiterQuoteClient,
   PumpPortalClient,
+  PumpSwapStateLoader,
   pumpPortalHealth,
 } from "@sentinel/providers";
-import { decodePumpTradeEvents } from "@sentinel/intelligence";
+import {
+  decodePumpSwapTradeEvents,
+  validateTradeTransaction,
+} from "@sentinel/intelligence";
 import { SentinelStore } from "@sentinel/storage";
 import { EnrichmentScheduler } from "./enrichment.ts";
 import { TokenAnalysisScheduler } from "./analysis.ts";
 import { PaperRuntime } from "./paper-runtime.ts";
+import { BoundedTradeVerificationQueue } from "./trade-verification.ts";
 import { log } from "./logger.ts";
 
 async function main(): Promise<void> {
@@ -138,9 +143,144 @@ async function main(): Promise<void> {
       : undefined;
   if (paper) await paper.start();
 
+  const tradeCoverageSource = "helius_logs:pump-sdk-4.1.0+pump-swap-sdk-2.1.0";
+  const pumpSwapStateLoader = helius
+    ? new PumpSwapStateLoader({ helius })
+    : undefined;
+  const pumpSwapIdentityByMint = new Map<
+    string,
+    { poolAddress: string; baseMint: string; quoteMint: string }
+  >();
+  const tradeVerifier =
+    loaded.config.providers.helius.enable_trade_stream && helius
+      ? new BoundedTradeVerificationQueue({
+          maxPending:
+            loaded.config.providers.helius.max_pending_trade_verifications,
+          concurrency:
+            loaded.config.providers.helius.trade_verification_concurrency,
+          async process(input) {
+            const transaction = await helius!.getTransaction(input.signature);
+            let pumpSwapPools:
+              Map<string, { baseMint: string; quoteMint: string }> | undefined;
+            if (
+              transaction &&
+              decodePumpSwapTradeEvents(transaction.logMessages).length > 0
+            ) {
+              let identity = pumpSwapIdentityByMint.get(input.mint);
+              if (!identity && pumpSwapStateLoader) {
+                const state = await pumpSwapStateLoader.load(input.mint);
+                if (state.status === "SUPPORTED") {
+                  identity = {
+                    poolAddress: state.poolAddress,
+                    baseMint: state.state.pool.baseMint.toBase58(),
+                    quoteMint: state.state.pool.quoteMint.toBase58(),
+                  };
+                  pumpSwapIdentityByMint.set(input.mint, identity);
+                }
+              }
+              if (identity)
+                pumpSwapPools = new Map([[identity.poolAddress, identity]]);
+            }
+            const validated = validateTradeTransaction({
+              mint: input.mint,
+              signature: input.signature,
+              providerSlot: input.slot,
+              receivedAtUtc: input.observedAtUtc,
+              transaction,
+              ...(pumpSwapPools ? { pumpSwapPools } : {}),
+            });
+            if (validated.status !== "VERIFIED") {
+              store.recordTradeObservationCoverage({
+                mint: input.mint,
+                source: tradeCoverageSource,
+                status: "UNVERIFIED",
+                windowStartedAtUtc: input.windowStartedAtUtc,
+                windowExpiresAtUtc: input.windowExpiresAtUtc,
+                lastEventAtUtc: input.observedAtUtc,
+                reconnectCount: input.reconnectCount,
+                reasonCode: validated.reasonCode ?? "TRADE_VALIDATION_UNKNOWN",
+                updatedAtUtc: utcNow(),
+              });
+              return;
+            }
+            const transactionPayloadRef = `sha256:${createHash("sha256")
+              .update(
+                JSON.stringify({
+                  signature: transaction?.signature,
+                  slot: transaction?.slot,
+                  logs: transaction?.logMessages,
+                }),
+              )
+              .digest("hex")}`;
+            for (const event of validated.observations) {
+              const id = createHash("sha256")
+                .update(`${event.signature}:${event.eventIndex}:${event.mint}`)
+                .digest("hex");
+              store.saveLaunchTradeObservation({
+                id,
+                eventIndex: event.eventIndex,
+                mint: event.mint,
+                signature: event.signature,
+                slot: event.slot,
+                blockTimeUtc: event.blockTimeUtc,
+                eventTimeUtc: event.eventTimeUtc,
+                eventTimeSource:
+                  event.venue === "PUMPSWAP"
+                    ? "PUMPSWAP_TRADE_EVENT_TIMESTAMP"
+                    : "PUMP_TRADE_EVENT_TIMESTAMP",
+                receivedAtUtc: event.receivedAtUtc,
+                ingestedAtUtc: utcNow(),
+                side: event.side,
+                traderWallet: event.traderWallet,
+                tokenAmountRaw: event.tokenAmountRaw,
+                quoteAmountRaw: event.quoteAmountRaw,
+                quoteMint: event.quoteMint,
+                venue: event.venue,
+                source: event.source,
+                decoderVersion: event.decoderVersion,
+                validationStatus: "VERIFIED",
+                validationConfidenceBps: event.validationConfidenceBps,
+                payloadRef: transactionPayloadRef,
+              });
+            }
+            store.recordTradeObservationCoverage({
+              mint: input.mint,
+              source: tradeCoverageSource,
+              status: "UNVERIFIED",
+              windowStartedAtUtc: input.windowStartedAtUtc,
+              windowExpiresAtUtc: input.windowExpiresAtUtc,
+              lastEventAtUtc: input.observedAtUtc,
+              reconnectCount: input.reconnectCount,
+              reasonCode: "TRADE_EVENTS_VALIDATED_WINDOW_NOT_RECONCILED",
+              updatedAtUtc: utcNow(),
+            });
+            analysis.wake();
+          },
+          onFailure(input, error) {
+            const code =
+              error && typeof error === "object" && "code" in error
+                ? String(error.code)
+                : "TRADE_TRANSACTION_VALIDATION_FAILED";
+            store.recordTradeObservationCoverage({
+              mint: input.mint,
+              source: tradeCoverageSource,
+              status: "GAP_DETECTED",
+              windowStartedAtUtc: input.windowStartedAtUtc,
+              windowExpiresAtUtc: input.windowExpiresAtUtc,
+              lastEventAtUtc: input.observedAtUtc,
+              reconnectCount: input.reconnectCount,
+              reasonCode: code,
+              updatedAtUtc: utcNow(),
+            });
+            store.recordProviderIssue("helius", code);
+          },
+        })
+      : undefined;
+
   const tradeStream =
     loaded.config.providers.helius.enable_trade_stream &&
-    heliusApiKeyPresent(loaded.heliusApiKey)
+    heliusApiKeyPresent(loaded.heliusApiKey) &&
+    tradeVerifier
       ? new HeliusTradeStream({
           apiKey: loaded.heliusApiKey!,
           maxActiveSubscriptions:
@@ -154,7 +294,7 @@ async function main(): Promise<void> {
           onCoverage(input) {
             store.recordTradeObservationCoverage({
               mint: input.mint,
-              source: "helius_logs:pump-sdk-4.1.0",
+              source: tradeCoverageSource,
               status: input.status,
               windowStartedAtUtc: input.windowStartedAtUtc,
               windowExpiresAtUtc: input.windowExpiresAtUtc,
@@ -171,7 +311,7 @@ async function main(): Promise<void> {
           },
           onHealth(state, errorCode, reconnectCount) {
             store.setProviderHealth({
-              provider: "helius",
+              provider: "helius_trade_stream",
               state,
               checkedAtUtc: utcNow(),
               lastEventAtUtc: null,
@@ -181,55 +321,24 @@ async function main(): Promise<void> {
             if (errorCode) store.recordProviderIssue("helius", errorCode);
           },
           onLogs(input) {
-            const decoded = decodePumpTradeEvents(input.logs).filter(
-              (event) => event.mint === input.mint,
-            );
-            const token = store.getToken(input.mint);
-            const venue =
-              token?.marketPhase === "MIGRATED_PUMPSWAP"
-                ? "UNKNOWN"
-                : "PUMP_BONDING_CURVE";
-            for (const event of decoded) {
-              const eventBlockTimeMs = Number(event.timestampSeconds) * 1000;
-              const blockTimeUtc =
-                Number.isSafeInteger(eventBlockTimeMs) && eventBlockTimeMs > 0
-                  ? new Date(eventBlockTimeMs).toISOString()
-                  : null;
-              const id = createHash("sha256")
-                .update(`${input.signature}:${event.eventIndex}:${event.mint}`)
-                .digest("hex");
-              store.saveLaunchTradeObservation({
-                id,
-                eventIndex: event.eventIndex,
-                mint: event.mint,
-                signature: input.signature,
-                slot: input.slot,
-                blockTimeUtc,
-                receivedAtUtc: input.observedAtUtc,
-                side: event.side,
-                traderWallet: event.traderWallet,
-                tokenAmountRaw: event.tokenAmountRaw,
-                quoteAmountRaw: event.quoteAmountRaw,
-                venue,
-                source: "helius_logs:pump-sdk-4.1.0",
-                payloadRef: input.payloadRef,
-              });
-            }
+            const outcome = tradeVerifier?.enqueue(input) ?? "STOPPED";
+            if (outcome === "DUPLICATE") return;
             store.recordTradeObservationCoverage({
               mint: input.mint,
-              source: "helius_logs:pump-sdk-4.1.0",
-              status: "UNVERIFIED",
+              source: tradeCoverageSource,
+              status: outcome === "ACCEPTED" ? "UNVERIFIED" : "GAP_DETECTED",
               windowStartedAtUtc: input.windowStartedAtUtc,
               windowExpiresAtUtc: input.windowExpiresAtUtc,
               lastEventAtUtc: input.observedAtUtc,
               reconnectCount: input.reconnectCount,
               reasonCode:
-                decoded.length > 0
-                  ? "TRADE_EVENT_OBSERVED_BUT_WINDOW_NOT_RECONCILED"
-                  : "NO_SUPPORTED_PUMP_TRADE_EVENT_DECODED",
-              updatedAtUtc: input.observedAtUtc,
+                outcome === "ACCEPTED"
+                  ? "TRADE_TRANSACTION_VALIDATION_PENDING"
+                  : outcome === "FULL"
+                    ? "TRADE_VERIFICATION_QUEUE_FULL"
+                    : "TRADE_VERIFIER_STOPPED",
+              updatedAtUtc: utcNow(),
             });
-            if (decoded.length > 0) analysis.wake();
           },
         })
       : undefined;
@@ -343,6 +452,7 @@ async function main(): Promise<void> {
         await analysis.stop();
         await paper?.stop();
         await tradeStream?.stop();
+        await tradeVerifier?.stop();
         if (pumpStopError) throw pumpStopError;
       } finally {
         store.close();

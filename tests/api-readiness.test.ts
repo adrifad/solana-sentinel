@@ -37,9 +37,15 @@ test("PAPER readiness remains blocked when stream coverage is unverified", () =>
     paperWalletId: "test-wallet",
   });
   assert.equal(readiness.processHealth, true);
+  assert.equal(readiness.discoveryReady, true);
   assert.equal(readiness.providerConnectivity.pumpPortal, true);
+  assert.equal(readiness.providerConnectivity.heliusRpc, true);
+  assert.equal(readiness.providerConnectivity.heliusTradeStream, false);
   assert.equal(readiness.analysisReadiness, true);
   assert.equal(readiness.tradeObservationReady, false);
+  assert.equal(readiness.paperRuntimeReady, true);
   assert.equal(readiness.paperExecutionReady, false);
+  assert.equal(readiness.paperAutomaticEntryReady, false);
   assert.ok(readiness.blockers.includes("TRADE_STREAM_COVERAGE_UNVERIFIED"));
+  assert.ok(readiness.blockers.includes("HELIUS_TRADE_STREAM_NOT_HEALTHY"));
 });

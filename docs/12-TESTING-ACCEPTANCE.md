@@ -22,9 +22,10 @@
 - Jupiter quote-only requests omit `taker`, reject transaction-bearing responses, and honor the persistent provider budget before network access.
 - Launch-window look-ahead exclusion, incomplete-window behavior, and wallet token outflow evidence that does not claim a proven sell.
 - Helius standard logsSubscribe subscription lifecycle, event-budget limits, reconnect gaps, Pump SDK 4.1.0 TradeEvent synthetic decoder vectors, and persisted coverage that is never upgraded without reconciliation.
+- PumpSwap SDK 2.1.0 BuyEvent/SellEvent synthetic IDL vectors, successful-program nesting, signer/token-delta correlation, canonical pool/WSOL validation, and capped read-only live validation harness argument/capture rules. Synthetic fixtures do not pass the live-trade acceptance gate.
 - PAPER runtime virtual wallet initialization and restart recovery without a quote provider; no virtual fill is generated when quote state is missing.
 - Repeated same-wallet buy/sell activity remains `UNKNOWN` with a possible wash-pattern reason code.
-- Version 6 migration persistence for quote and time-indexed behavior evidence.
+- Versioned migration persistence through version 10, including quote/behavior evidence and trade event-time, ingestion, quote mint, decoder, and validation provenance; fresh database integrity check.
 - DEX Screener missing pool data not classified as scam by itself.
 - Jupiter quote-only returns no route and paper does not sign or call execute.
 - Subscriptions automatically unsubscribe after expiration/analysis cap.

@@ -34,6 +34,8 @@ export const AppConfigSchema = z
             enable_trade_stream: z.boolean(),
             max_active_trade_subscriptions: z.number().int().min(1).max(5000),
             max_trade_events_per_day: positiveInt,
+            trade_verification_concurrency: z.number().int().min(1).max(16),
+            max_pending_trade_verifications: z.number().int().min(1).max(10000),
           })
           .strict(),
         pumpportal: z

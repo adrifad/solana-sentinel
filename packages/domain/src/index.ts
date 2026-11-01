@@ -273,6 +273,20 @@ export const LaunchBehaviorSnapshotSchema = z.object({
   throughSlot: z.number().int().nonnegative().safe().nullable(),
   buyCount: z.number().int().nonnegative(),
   sellCount: z.number().int().nonnegative(),
+  venueMetrics: z.object({
+    PUMP_BONDING_CURVE: z.object({
+      buyCount: z.number().int().nonnegative(),
+      sellCount: z.number().int().nonnegative(),
+      buyVolumeRaw: z.string().regex(/^\d+$/),
+      sellVolumeRaw: z.string().regex(/^\d+$/),
+    }),
+    PUMPSWAP: z.object({
+      buyCount: z.number().int().nonnegative(),
+      sellCount: z.number().int().nonnegative(),
+      buyVolumeRaw: z.string().regex(/^\d+$/),
+      sellVolumeRaw: z.string().regex(/^\d+$/),
+    }),
+  }),
   uniqueBuyers: z.number().int().nonnegative(),
   independentBuyerEstimate: z.number().int().nonnegative(),
   creatorAssociatedBuys: z.number().int().nonnegative(),
@@ -302,13 +316,26 @@ export const LaunchTradeObservationSchema = z.object({
   signature: z.string().min(1),
   slot: z.number().int().nonnegative().safe().nullable(),
   blockTimeUtc: IsoUtcSchema.nullable(),
+  eventTimeUtc: IsoUtcSchema.nullable().default(null),
+  eventTimeSource: z
+    .enum([
+      "PUMP_TRADE_EVENT_TIMESTAMP",
+      "PUMPSWAP_TRADE_EVENT_TIMESTAMP",
+      "UNKNOWN",
+    ])
+    .default("UNKNOWN"),
   receivedAtUtc: IsoUtcSchema,
+  ingestedAtUtc: IsoUtcSchema.default("1970-01-01T00:00:00.000Z"),
   side: z.enum(["BUY", "SELL"]),
   traderWallet: PubkeySchema.nullable(),
   tokenAmountRaw: z.string().regex(/^\d+$/).nullable(),
   quoteAmountRaw: z.string().regex(/^\d+$/).nullable(),
+  quoteMint: PubkeySchema.nullable().default(null),
   venue: z.enum(["PUMP_BONDING_CURVE", "PUMPSWAP", "UNKNOWN"]),
   source: z.string().min(1),
+  decoderVersion: z.string().min(1).default("UNKNOWN"),
+  validationStatus: z.enum(["VERIFIED", "UNVERIFIED"]).default("UNVERIFIED"),
+  validationConfidenceBps: z.number().int().min(0).max(10000).default(0),
   payloadRef: z.string().regex(/^sha256:[a-f0-9]{64}$/),
 });
 export type LaunchTradeObservation = z.infer<
@@ -360,7 +387,7 @@ export type PaperOrderIntent = z.infer<typeof PaperOrderIntentSchema>;
 export type ProviderState =
   "DISABLED" | "STARTING" | "HEALTHY" | "DEGRADED" | "STOPPED";
 export type ProviderHealth = {
-  provider: "pumpportal" | "helius";
+  provider: "pumpportal" | "helius" | "helius_trade_stream";
   state: ProviderState;
   checkedAtUtc: string | null;
   lastEventAtUtc: string | null;
