@@ -250,6 +250,9 @@ export const QuoteResultSchema = z.object({
   evidenceRefs: z.array(z.string().min(1)),
   provenance: z.record(z.string(), z.unknown()),
   observedAtUtc: IsoUtcSchema,
+  arrivalAtUtc: IsoUtcSchema.optional(),
+  requestStartedAtUtc: IsoUtcSchema.optional(),
+  responseCompletedAtUtc: IsoUtcSchema.optional(),
 });
 export type QuoteResult = z.infer<typeof QuoteResultSchema>;
 
@@ -382,6 +385,7 @@ export const PaperOrderIntentSchema = z.object({
   createdAtUtc: IsoUtcSchema,
   signalQuoteId: z.string().min(1).nullable(),
   entrySource: z.enum(["AUTOMATIC", "MANUAL"]).optional(),
+  expiresAtUtc: IsoUtcSchema.nullable().optional(),
 });
 export type PaperOrderIntent = z.infer<typeof PaperOrderIntentSchema>;
 

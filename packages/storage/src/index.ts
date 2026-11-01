@@ -55,6 +55,7 @@ export type ManualPaperRequest = {
   executionOrderId: string | null;
   attempts: number;
   createdAtUtc: string;
+  expiresAtUtc: string | null;
   updatedAtUtc: string;
   completedAtUtc: string | null;
 };
@@ -121,6 +122,7 @@ export class SentinelStore {
       "009-paper-runtime.sql",
       "010-trade-evidence.sql",
       "011-manual-paper-requests.sql",
+      "012-manual-paper-request-expiry.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -1898,6 +1900,28 @@ export class SentinelStore {
     return row ? mapPaperOrder(row) : null;
   }
 
+  synchronizePendingManualOrderExpiry(
+    orderId: string,
+    expiresAtUtc: string,
+  ): void {
+    const row = this.#db
+      .prepare(
+        "SELECT intent_json, status, entry_source FROM paper_orders WHERE id = ?",
+      )
+      .get(orderId) as SqlRow | undefined;
+    if (!row || row["status"] !== "PENDING" || row["entry_source"] !== "MANUAL")
+      return;
+    const intent = PaperOrderIntentSchema.parse(
+      JSON.parse(String(row["intent_json"])),
+    );
+    if (intent.expiresAtUtc) return;
+    this.#db
+      .prepare(
+        "UPDATE paper_orders SET intent_json = ? WHERE id = ? AND status = 'PENDING'",
+      )
+      .run(JSON.stringify({ ...intent, expiresAtUtc }), orderId);
+  }
+
   listPendingPaperOrderIntents(
     limit = 100,
     excludeManual = false,
@@ -1926,19 +1950,27 @@ export class SentinelStore {
     coverageExceptionReason?: string | null;
     evidence?: Record<string, unknown>;
     createdAtUtc: string;
+    expiresAtUtc?: string | null;
   }): ManualPaperRequest {
     if (
       !/^\d+$/.test(input.requestedAmountRaw) ||
       BigInt(input.requestedAmountRaw) <= 0n
     )
       throw new Error("MANUAL_PAPER_AMOUNT_INVALID");
+    if (
+      input.expiresAtUtc &&
+      (!Number.isFinite(Date.parse(input.expiresAtUtc)) ||
+        Date.parse(input.expiresAtUtc) <= Date.parse(input.createdAtUtc))
+    )
+      throw new Error("MANUAL_PAPER_EXPIRY_INVALID");
     this.#db
       .prepare(
         `INSERT OR IGNORE INTO manual_paper_requests
         (id, idempotency_key, request_type, wallet_id, mint, position_id,
          requested_amount_raw, requested_size_sol, status, original_coverage_status,
-         coverage_exception_reason, evidence_json, created_at_utc, updated_at_utc)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)`,
+         coverage_exception_reason, evidence_json, created_at_utc, updated_at_utc,
+         expires_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -1954,6 +1986,7 @@ export class SentinelStore {
         JSON.stringify(input.evidence ?? {}),
         input.createdAtUtc,
         input.createdAtUtc,
+        input.expiresAtUtc ?? null,
       );
     const row = this.#db
       .prepare("SELECT * FROM manual_paper_requests WHERE idempotency_key = ?")
@@ -3178,6 +3211,10 @@ function mapManualPaperRequest(row: SqlRow): ManualPaperRequest {
         : String(row["execution_order_id"]),
     attempts: Number(row["attempts"]),
     createdAtUtc: String(row["created_at_utc"]),
+    expiresAtUtc:
+      row["expires_at_utc"] === null || row["expires_at_utc"] === undefined
+        ? null
+        : String(row["expires_at_utc"]),
     updatedAtUtc: String(row["updated_at_utc"]),
     completedAtUtc:
       row["completed_at_utc"] === null ? null : String(row["completed_at_utc"]),

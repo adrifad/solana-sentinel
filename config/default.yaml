@@ -95,6 +95,8 @@ paper:
   reject_when_sell_quote_missing: true
   wallet_id: sentinel-paper-default
   automatic_entries_enabled: false
+  manual_entry_request_expiry_ms: 5000
+  manual_exit_request_expiry_ms: 300000
   order_size_sol: '0.01'
   stop_loss_bps: 1500
   take_profit_bps: 3000

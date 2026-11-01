@@ -18,6 +18,15 @@ const server = createApiServer({
   maxTradeSol: config.config.risk.max_trade_sol,
   maxQuoteAgeMs: config.config.paper.max_quote_age_ms,
   initialSol: config.config.paper.initial_sol,
+  manualEntryRequestExpiryMs:
+    config.config.paper.manual_entry_request_expiry_ms,
+  manualExitRequestExpiryMs: config.config.paper.manual_exit_request_expiry_ms,
+  minHolderSampleCoverageBps:
+    config.config.analysis.min_holder_sample_coverage_bps,
+  minIndependentBuyers: Math.max(
+    config.config.analysis.min_independent_buyers,
+    config.config.strategy.min_independent_buyers,
+  ),
 });
 server.listen(config.apiPort, config.apiHost, () => {
   process.stdout.write(

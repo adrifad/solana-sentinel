@@ -26,6 +26,8 @@ export function paperExecutionConfigFromAppConfig(
     executionLatencyMs: config.paper.execution_latency_ms,
     maxQuoteAgeMs: config.paper.max_quote_age_ms,
     maxIntentAgeMs: config.strategy.max_signal_age_ms,
+    manualEntryMaxAgeMs: config.paper.manual_entry_request_expiry_ms,
+    manualExitMaxAgeMs: config.paper.manual_exit_request_expiry_ms,
     conservativeExtraSlippageBps: config.paper.conservative_extra_slippage_bps,
     modeledNetworkFeeLamports: config.paper.modeled_network_fee_lamports,
     risk: {
@@ -50,6 +52,7 @@ export type PaperQuoteRequest = {
   side: "BUY" | "SELL";
   exactInputAmountRaw: string;
   requestedAtUtc: string;
+  arrivalAtUtc?: string;
   maxAgeMs: number;
 };
 
@@ -72,6 +75,8 @@ export type PaperExecutionConfig = {
   executionLatencyMs: number;
   maxQuoteAgeMs: number;
   maxIntentAgeMs: number;
+  manualEntryMaxAgeMs?: number;
+  manualExitMaxAgeMs?: number;
   conservativeExtraSlippageBps: number;
   modeledNetworkFeeLamports: string;
   risk: PaperRiskLimits;
@@ -246,11 +251,26 @@ export class PaperTradingEngine {
     }
 
     const nowAtStart = this.#clock.now();
-    const signalAt = Date.parse(intent.createdAtUtc);
+    const effectiveIntent =
+      intent.entrySource === "MANUAL" && !intent.expiresAtUtc
+        ? {
+            ...intent,
+            expiresAtUtc: new Date(
+              Date.parse(intent.createdAtUtc) +
+                (intent.side === "BUY"
+                  ? (this.#config.manualEntryMaxAgeMs ??
+                    this.#config.maxIntentAgeMs)
+                  : (this.#config.manualExitMaxAgeMs ??
+                    this.#config.maxIntentAgeMs)),
+            ).toISOString(),
+          }
+        : intent;
     if (
-      !Number.isFinite(signalAt) ||
-      signalAt > nowAtStart ||
-      nowAtStart - signalAt > this.#config.maxIntentAgeMs
+      isPaperIntentExpired(
+        effectiveIntent,
+        nowAtStart,
+        this.#config.maxIntentAgeMs,
+      )
     ) {
       this.#repository.rejectPaperOrder(
         order.id,
@@ -263,19 +283,37 @@ export class PaperTradingEngine {
 
     await this.#clock.wait(this.#config.executionLatencyMs);
     const arrivalAtUtc = new Date(this.#clock.now()).toISOString();
+    const quoteRequestedAtUtc = new Date(this.#clock.now()).toISOString();
     let quote: QuoteResult | null;
     try {
       quote = await this.#quotes.quoteAtArrival({
         mint: intent.mint,
         side: intent.side,
         exactInputAmountRaw: intent.exactInputAmountRaw,
-        requestedAtUtc: arrivalAtUtc,
+        requestedAtUtc: quoteRequestedAtUtc,
+        arrivalAtUtc,
         maxAgeMs: this.#config.maxQuoteAgeMs,
       });
     } catch {
       quote = null;
     }
     const quoteReadyAtUtc = new Date(this.#clock.now()).toISOString();
+    if (
+      isPaperIntentExpired(
+        effectiveIntent,
+        this.#clock.now(),
+        this.#config.maxIntentAgeMs,
+      )
+    ) {
+      this.#repository.rejectPaperOrder(
+        order.id,
+        "EXPIRED",
+        "PAPER_INTENT_EXPIRED",
+        quoteReadyAtUtc,
+        arrivalAtUtc,
+      );
+      return this.#result(order.id);
+    }
     if (!quote) {
       this.#repository.rejectPaperOrder(
         order.id,
@@ -498,10 +536,10 @@ export class PaperRiskManager {
   validateQuote(
     quote: QuoteResult,
     intent: PaperOrderIntent,
-    arrivalAtUtc: string,
+    settledAtUtc: string,
     config: PaperExecutionConfig,
   ): string | null {
-    return validateQuoteAtArrival(quote, intent, arrivalAtUtc, config);
+    return validateQuoteAtArrival(quote, intent, settledAtUtc, config);
   }
 
   canOpenRisk(input: {
@@ -621,6 +659,7 @@ export class PumpVenuePaperQuoteProvider implements PaperQuoteProvider {
   async quoteAtArrival(
     request: PaperQuoteRequest,
   ): Promise<QuoteResult | null> {
+    const requestStartedAtUtc = request.requestedAtUtc;
     const phase = await this.#marketPhase(request.mint);
     const direction = request.side;
     const inputMint = direction === "BUY" ? PAPER_SOL_MINT : request.mint;
@@ -642,23 +681,44 @@ export class PumpVenuePaperQuoteProvider implements PaperQuoteProvider {
     });
     if (phase === "PUMP_CURVE") {
       const loaded = await this.#curveState.load(request.mint);
-      return loaded.status === "SUPPORTED"
-        ? this.#curveQuotes.quote(
-            makeQuoteRequest(loaded.state.snapshot.observedAtUtc),
-            loaded.state,
-          )
-        : null;
+      if (loaded.status !== "SUPPORTED") return null;
+      return this.#stampQuote(
+        this.#curveQuotes.quote(
+          makeQuoteRequest(loaded.state.snapshot.observedAtUtc),
+          loaded.state,
+        ),
+        request,
+        requestStartedAtUtc,
+      );
     }
     if (phase === "MIGRATED_PUMPSWAP") {
       const loaded = await this.#swapState.load(request.mint);
-      return loaded.status === "SUPPORTED"
-        ? this.#swapQuotes.quote(
-            makeQuoteRequest(loaded.state.snapshot.observedAtUtc),
-            loaded.state,
-          )
-        : null;
+      if (loaded.status !== "SUPPORTED") return null;
+      return this.#stampQuote(
+        this.#swapQuotes.quote(
+          makeQuoteRequest(loaded.state.snapshot.observedAtUtc),
+          loaded.state,
+        ),
+        request,
+        requestStartedAtUtc,
+      );
     }
     return null;
+  }
+
+  #stampQuote(
+    quote: QuoteResult,
+    request: PaperQuoteRequest,
+    requestStartedAtUtc: string,
+  ): QuoteResult {
+    const completedAtUtc = new Date(this.#now()).toISOString();
+    return QuoteResultSchema.parse({
+      ...quote,
+      observedAtUtc: completedAtUtc,
+      arrivalAtUtc: request.arrivalAtUtc ?? requestStartedAtUtc,
+      requestStartedAtUtc,
+      responseCompletedAtUtc: completedAtUtc,
+    });
   }
 }
 
@@ -670,6 +730,12 @@ function validateExecutionConfig(config: PaperExecutionConfig): void {
     config.maxQuoteAgeMs < 0 ||
     !Number.isSafeInteger(config.maxIntentAgeMs) ||
     config.maxIntentAgeMs < 0 ||
+    (config.manualEntryMaxAgeMs !== undefined &&
+      (!Number.isSafeInteger(config.manualEntryMaxAgeMs) ||
+        config.manualEntryMaxAgeMs < 1000)) ||
+    (config.manualExitMaxAgeMs !== undefined &&
+      (!Number.isSafeInteger(config.manualExitMaxAgeMs) ||
+        config.manualExitMaxAgeMs < 1000)) ||
     !Number.isSafeInteger(config.conservativeExtraSlippageBps) ||
     config.conservativeExtraSlippageBps < 0 ||
     config.conservativeExtraSlippageBps > 10000 ||
@@ -687,7 +753,7 @@ function validateExecutionConfig(config: PaperExecutionConfig): void {
 function validateQuoteAtArrival(
   quote: QuoteResult,
   intent: PaperOrderIntent,
-  arrivalAtUtc: string,
+  settledAtUtc: string,
   config: PaperExecutionConfig,
 ): string | null {
   const inputMint = intent.side === "BUY" ? PAPER_SOL_MINT : intent.mint;
@@ -706,11 +772,23 @@ function validateQuoteAtArrival(
     return "PAPER_QUOTE_CONTRACT_INVALID";
   if (
     quote.snapshotSlot === null ||
+    quote.snapshotSlot <= 0 ||
     quote.snapshotAtUtc === null ||
     quote.freshnessMs === null ||
-    Date.parse(quote.snapshotAtUtc) > Date.parse(arrivalAtUtc) ||
-    Date.parse(quote.observedAtUtc) > Date.parse(arrivalAtUtc) ||
-    Date.parse(arrivalAtUtc) - Date.parse(quote.snapshotAtUtc) >
+    Date.parse(quote.snapshotAtUtc) > Date.parse(settledAtUtc) ||
+    Date.parse(quote.observedAtUtc) > Date.parse(settledAtUtc) ||
+    (quote.responseCompletedAtUtc !== undefined &&
+      (Date.parse(quote.responseCompletedAtUtc) > Date.parse(settledAtUtc) ||
+        Date.parse(quote.snapshotAtUtc) >
+          Date.parse(quote.responseCompletedAtUtc))) ||
+    (quote.arrivalAtUtc !== undefined &&
+      Date.parse(quote.arrivalAtUtc) > Date.parse(settledAtUtc)) ||
+    (quote.requestStartedAtUtc !== undefined &&
+      (Date.parse(quote.requestStartedAtUtc) <
+        Date.parse(quote.arrivalAtUtc ?? quote.requestStartedAtUtc) ||
+        Date.parse(quote.requestStartedAtUtc) >
+          Date.parse(quote.responseCompletedAtUtc ?? quote.observedAtUtc))) ||
+    Date.parse(settledAtUtc) - Date.parse(quote.snapshotAtUtc) >
       config.maxQuoteAgeMs ||
     quote.freshnessMs > config.maxQuoteAgeMs
   )
@@ -731,4 +809,21 @@ function validateQuoteAtArrival(
   )
     return "PAPER_FEE_EXCEEDS_INPUT";
   return null;
+}
+
+function isPaperIntentExpired(
+  intent: PaperOrderIntent,
+  now: number,
+  automaticMaxAgeMs: number,
+): boolean {
+  const createdAt = Date.parse(intent.createdAtUtc);
+  if (!Number.isFinite(createdAt) || createdAt > now) return true;
+  if (intent.entrySource === "MANUAL") {
+    const expiresAt = intent.expiresAtUtc
+      ? Date.parse(intent.expiresAtUtc)
+      : createdAt +
+        (intent.side === "BUY" ? automaticMaxAgeMs : automaticMaxAgeMs);
+    return !Number.isFinite(expiresAt) || now >= expiresAt;
+  }
+  return now - createdAt > automaticMaxAgeMs;
 }

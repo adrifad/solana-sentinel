@@ -140,7 +140,11 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
     id: "synthetic-quarantine-coverage-only",
     mint: event.mint,
     status: "QUARANTINE",
-    reasonCodes: ["LAUNCH_BEHAVIOR_INCOMPLETE"],
+    reasonCodes: [
+      "BUY_AND_SELL_QUOTES_VALIDATED",
+      "LAUNCH_BEHAVIOR_INCOMPLETE",
+      "VALIDATED_HOLDER_SAMPLE_COVERAGE_POLICY_PASSED",
+    ],
     configVersion: loaded.configVersion,
     evidenceRefs: [
       `launch_behavior:${behavior.id}`,
@@ -163,6 +167,7 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
       requestedAtUtc: string;
     }): Promise<QuoteResult | null> {
       if (!this.quoteAvailable) return null;
+      await new Promise((resolve) => setTimeout(resolve, 200));
       const time = Date.parse(request.requestedAtUtc);
       const quote: QuoteResult = {
         id: `synthetic-quote-${request.side}-${request.exactInputAmountRaw}-${time}`,
@@ -187,7 +192,7 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
         failureReason: null,
         evidenceRefs: ["synthetic:market-snapshot"],
         provenance: { fixture: "synthetic" },
-        observedAtUtc: request.requestedAtUtc,
+        observedAtUtc: new Date().toISOString(),
       };
       if (this.rateLimitOnce) {
         this.rateLimitOnce = false;
@@ -312,6 +317,113 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
       "MANUAL",
     );
     assert.equal(store.listPaperLedgerEntries(walletId).length % 2, 0);
+
+    const queueAnotherManualEntry = (id: string) => {
+      const createdAtUtc = new Date().toISOString();
+      return store.createManualPaperRequest({
+        id,
+        idempotencyKey: `${id}-idempotency`,
+        requestType: "ENTRY",
+        walletId,
+        mint: event.mint,
+        requestedAmountRaw: solToLamports("0.01"),
+        requestedSizeSol: "0.01",
+        originalCoverageStatus: "UNVERIFIED",
+        createdAtUtc,
+        expiresAtUtc: new Date(Date.now() + 5000).toISOString(),
+      });
+    };
+    store.saveCreatorReputation({
+      wallet: creator,
+      status: "SUSPICIOUS",
+      launchesObserved: 2,
+      suspiciousIndicators: ["REPEATED_SUSPICIOUS_LAUNCH_PATTERN"],
+      confidenceBps: 9000,
+      historyComplete: true,
+      asOfSlot: 104,
+      computedAtUtc: new Date().toISOString(),
+      freshUntilUtc: new Date(Date.now() + 60_000).toISOString(),
+      evidenceRefs: ["synthetic:creator-history"],
+    });
+    const unsafeCreatorRequest = queueAnotherManualEntry(
+      "manual-unsafe-creator",
+    );
+    await waitForRequest(store, unsafeCreatorRequest.id, "REJECTED");
+    assert.equal(
+      store.getManualPaperRequest(unsafeCreatorRequest.id)?.reasonCode,
+      "CREATOR_REPUTATION_UNSAFE_OR_INCOMPLETE",
+    );
+
+    store.saveCreatorReputation({
+      wallet: creator,
+      status: "KNOWN",
+      launchesObserved: 1,
+      suspiciousIndicators: [],
+      confidenceBps: 9000,
+      historyComplete: true,
+      asOfSlot: 105,
+      computedAtUtc: new Date().toISOString(),
+      freshUntilUtc: new Date(Date.now() + 60_000).toISOString(),
+      evidenceRefs: ["synthetic:creator-history"],
+    });
+    const validSecurity = store.getLatestTokenRiskReport(event.mint)!;
+    const incompleteHolderSecurity = {
+      ...validSecurity,
+      id: "synthetic-security-incomplete-holder",
+      asOfSlot: 104,
+      holderSampleValidated: false,
+      holderSampleCoverageBps: 0,
+      observedAtUtc: new Date().toISOString(),
+    };
+    store.saveTokenRiskReport(incompleteHolderSecurity);
+    const beforeHolderDecision = store.listRiskDecisions(event.mint, 1)[0]!;
+    store.saveRiskDecision({
+      ...beforeHolderDecision,
+      id: "synthetic-incomplete-holder-decision",
+      securityReportId: incompleteHolderSecurity.id,
+      decidedAtUtc: new Date(Date.now() - 100).toISOString(),
+      reasonCodes: [
+        "LAUNCH_BEHAVIOR_INCOMPLETE",
+        "BUY_AND_SELL_QUOTES_VALIDATED",
+      ],
+    });
+    const incompleteHolderRequest = queueAnotherManualEntry(
+      "manual-incomplete-holder",
+    );
+    await waitForRequest(store, incompleteHolderRequest.id, "REJECTED");
+    assert.equal(
+      store.getManualPaperRequest(incompleteHolderRequest.id)?.reasonCode,
+      "HOLDER_EVIDENCE_INSUFFICIENT",
+    );
+
+    const restoredSecurity = {
+      ...validSecurity,
+      id: "synthetic-security-restored",
+      asOfSlot: 105,
+      observedAtUtc: new Date().toISOString(),
+    };
+    store.saveTokenRiskReport(restoredSecurity);
+    const beforeExitDecision = store.listRiskDecisions(event.mint, 1)[0]!;
+    store.saveRiskDecision({
+      ...beforeExitDecision,
+      id: "synthetic-failed-exit-decision",
+      securityReportId: restoredSecurity.id,
+      decidedAtUtc: new Date(Date.now() - 100).toISOString(),
+      reasonCodes: [
+        "BUY_AND_SELL_QUOTES_VALIDATED",
+        "LAUNCH_BEHAVIOR_INCOMPLETE",
+        "VALIDATED_HOLDER_SAMPLE_COVERAGE_POLICY_PASSED",
+        "EXIT_VALIDATION_FAILED",
+      ],
+    });
+    const failedExitRequest = queueAnotherManualEntry(
+      "manual-failed-exit-validation",
+    );
+    await waitForRequest(store, failedExitRequest.id, "REJECTED");
+    assert.equal(
+      store.getManualPaperRequest(failedExitRequest.id)?.reasonCode,
+      "RISK_DECISION_HAS_UNVERIFIED_REASON_CODES",
+    );
   } finally {
     await runtime.stop();
     store.close();
@@ -416,7 +528,9 @@ test("manual requests have durable atomic claims and idempotent recovery", async
       requestedAmountRaw: "1",
       requestedSizeSol: "0.000000001",
       createdAtUtc: new Date().toISOString(),
+      expiresAtUtc: new Date(Date.now() + 10_000).toISOString(),
     });
+    assert.ok(request.expiresAtUtc);
     const [first, second] = await Promise.all([
       Promise.resolve(
         store.claimManualPaperRequest("queue-wallet", new Date().toISOString()),

@@ -21,6 +21,8 @@ test("PAPER readiness remains blocked when stream coverage is unverified", () =>
     getLatestTradeObservationCoverage: () => ({ status: "UNVERIFIED" }),
     getAnalysisOutcome: () => [{ status: "COMPLETE" }],
     listRiskDecisions: () => [{ status: "WATCH" }],
+    getLatestTokenRiskReport: () => null,
+    getCreatorReputation: () => null,
     getPaperPortfolioState: () => ({
       solBalanceRaw: "0",
       positions: [],
@@ -44,6 +46,8 @@ test("PAPER readiness remains blocked when stream coverage is unverified", () =>
   assert.equal(readiness.analysisReadiness, true);
   assert.equal(readiness.tradeObservationReady, false);
   assert.equal(readiness.paperRuntimeReady, true);
+  assert.equal(readiness.paperManualEntryReady, false);
+  assert.equal(readiness.paperManualExitReady, false);
   assert.equal(readiness.paperExecutionReady, false);
   assert.equal(readiness.paperAutomaticEntryReady, false);
   assert.ok(readiness.blockers.includes("TRADE_STREAM_COVERAGE_UNVERIFIED"));

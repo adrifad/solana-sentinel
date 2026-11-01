@@ -17,6 +17,10 @@ export type ApiOptions = {
   maxTradeSol?: string;
   maxQuoteAgeMs?: number;
   initialSol?: string;
+  manualEntryRequestExpiryMs?: number;
+  manualExitRequestExpiryMs?: number;
+  minHolderSampleCoverageBps?: number;
+  minIndependentBuyers?: number;
 };
 
 const EntryRequestSchema = z
@@ -108,11 +112,15 @@ async function handleRequest(
               options.store.getLatestTradeObservationCoverage(parsed.data.mint)
                 ?.status ?? "UNVERIFIED",
             createdAtUtc: now,
+            expiresAtUtc: new Date(
+              Date.parse(now) + (options.manualEntryRequestExpiryMs ?? 5000),
+            ).toISOString(),
           });
         return send(response, existing ? 200 : 202, {
           requestId: result.id,
           status: result.status,
           reasonCode: result.reasonCode,
+          expiresAtUtc: result.expiresAtUtc,
         });
       } catch (error) {
         const code =
@@ -141,6 +149,7 @@ async function handleRequest(
           requestId: prior.id,
           status: prior.status,
           reasonCode: prior.reasonCode,
+          expiresAtUtc: prior.expiresAtUtc,
         });
       }
       const portfolio = options.store.getPaperPortfolioState(
@@ -163,11 +172,15 @@ async function handleRequest(
         positionId: parsed.data.positionId,
         requestedAmountRaw: position.tokenAmountRaw,
         createdAtUtc: now,
+        expiresAtUtc: new Date(
+          Date.parse(now) + (options.manualExitRequestExpiryMs ?? 300000),
+        ).toISOString(),
       });
       return send(response, 202, {
         requestId: result.id,
         status: result.status,
         reasonCode: result.reasonCode,
+        expiresAtUtc: result.expiresAtUtc,
       });
     } catch (error) {
       const code =
@@ -250,6 +263,11 @@ async function handleRequest(
           50,
         ),
         readinessBlockers: readiness.blockers,
+        paperManualEntryReady: readiness.paperManualEntryReady,
+        paperManualEntryBlockers: readiness.paperManualEntryBlockers,
+        paperManualExitReady: readiness.paperManualExitReady,
+        paperManualExitBlockers: readiness.paperManualExitBlockers,
+        paperAutomaticEntryReady: readiness.paperAutomaticEntryReady,
       });
     } catch {
       return send(response, 503, { error: "PAPER_WALLET_NOT_INITIALIZED" });
@@ -409,6 +427,138 @@ export function getOperationalReadiness(options: ApiOptions) {
     Boolean(heliusTradeStream?.state === "HEALTHY") &&
     (paperAccount?.latestMark?.unpriceablePositions ?? 0) === 0;
   const paperRuntimeReady = options.mode === "PAPER" && paperAccount !== null;
+  const walletReady = Boolean(
+    paperAccount && paperAccountInit && initialBalanceMatches,
+  );
+  const operatorAuthReady = Boolean(options.operatorToken);
+  const quoteInfrastructureReady = helius?.state === "HEALTHY";
+  const manualCandidateAvailable = tokens.some((token) => {
+    const decision = options.store.listRiskDecisions(token.mint, 1)[0];
+    const security = options.store.getLatestTokenRiskReport?.(token.mint);
+    const creatorWallet = options.store.getVerifiedCreatorWallet?.(token.mint);
+    const creator = creatorWallet
+      ? options.store.getCreatorReputation?.(creatorWallet)
+      : null;
+    const behavior = options.store.listLaunchBehaviorSnapshots?.(
+      token.mint,
+      1,
+    )[0];
+    const coverageStatus =
+      options.store.getLatestTradeObservationCoverage(token.mint)?.status ??
+      "UNVERIFIED";
+    const minimumBuyers = options.minIndependentBuyers ?? 3;
+    const observations = behavior
+      ? (options.store.listLaunchTradeObservations?.(
+          token.mint,
+          behavior.windowStartedAtUtc,
+          decision?.decidedAtUtc ?? utcNow(),
+          null,
+          5000,
+        ) ?? [])
+      : [];
+    const verifiedBuyers = new Set(
+      observations
+        .filter(
+          (item) =>
+            item.validationStatus === "VERIFIED" &&
+            item.side === "BUY" &&
+            item.traderWallet !== null &&
+            item.quoteMint === "So11111111111111111111111111111111111111112" &&
+            item.venue !== "UNKNOWN",
+        )
+        .map((item) => item.traderWallet),
+    );
+    const quarantineReasonsAllowed = new Set([
+      "LAUNCH_BEHAVIOR_INCOMPLETE",
+      "TRADE_STREAM_COMPLETENESS_UNVERIFIED",
+      "VALIDATED_HOLDER_SAMPLE_COVERAGE_POLICY_PASSED",
+      "BUY_AND_SELL_QUOTES_VALIDATED",
+      "INDEPENDENT_BUYER_THRESHOLD_MET",
+      "CREATOR_ASSOCIATED_BUY_ACTIVITY",
+    ]);
+    const coverageExceptionAvailable = Boolean(
+      decision?.status === "QUARANTINE" &&
+      decision.reasonCodes.includes("LAUNCH_BEHAVIOR_INCOMPLETE") &&
+      decision.reasonCodes.every((code) =>
+        quarantineReasonsAllowed.has(code),
+      ) &&
+      coverageStatus !== "COMPLETE" &&
+      behavior?.complete === false &&
+      behavior.gapReason === "TRADE_STREAM_COMPLETENESS_UNVERIFIED",
+    );
+    const behaviorValid = Boolean(
+      behavior &&
+      verifiedBuyers.size >= minimumBuyers &&
+      (behavior.complete
+        ? coverageStatus === "COMPLETE"
+        : coverageExceptionAvailable) &&
+      !behavior.reasonCodes.some((code) =>
+        [
+          "POSSIBLE_WASH_TRADING_PATTERN",
+          "EARLY_VOLUME_CONCENTRATION_HIGH",
+          "TEST_TOKEN_METADATA_PATTERN",
+          "MULTI_VENUE_WINDOW_REQUIRES_SEPARATE_ANALYSIS",
+        ].includes(code),
+      ),
+    );
+    return Boolean(
+      decision &&
+      (decision.status === "BUY_ELIGIBLE" ||
+        (decision.status === "QUARANTINE" &&
+          decision.reasonCodes.includes("LAUNCH_BEHAVIOR_INCOMPLETE") &&
+          decision.reasonCodes.every((code) =>
+            quarantineReasonsAllowed.has(code),
+          ))) &&
+      security?.status === "SUPPORTED" &&
+      security.holderSampleValidated === true &&
+      (security.holderSampleCoverageBps ?? -1) >=
+        (options.minHolderSampleCoverageBps ?? 9500) &&
+      creatorWallet !== null &&
+      creatorWallet !== undefined &&
+      token.creator === creatorWallet &&
+      Boolean(
+        options.store
+          .listWalletRoleEvidence?.(token.mint)
+          ?.some(
+            (evidence) =>
+              evidence.wallet === creatorWallet &&
+              evidence.source === "PUMP_IDL_CREATE_EVENT" &&
+              evidence.confidenceBps === 10000 &&
+              decision.evidenceRefs.includes(
+                `wallet_role_evidence:${evidence.id}`,
+              ),
+          ),
+      ) &&
+      creator?.historyComplete &&
+      creator.status !== "SUSPICIOUS" &&
+      creator.suspiciousIndicators.length === 0 &&
+      behaviorValid,
+    );
+  });
+  const paperManualEntryBlockers: string[] = [];
+  const paperManualExitBlockers: string[] = [];
+  if (options.mode !== "PAPER") {
+    paperManualEntryBlockers.push("MODE_IS_NOT_PAPER");
+    paperManualExitBlockers.push("MODE_IS_NOT_PAPER");
+  }
+  if (!walletReady) {
+    paperManualEntryBlockers.push("PAPER_WALLET_NOT_INITIALIZED_OR_MISMATCHED");
+    paperManualExitBlockers.push("PAPER_WALLET_NOT_INITIALIZED_OR_MISMATCHED");
+  }
+  if (!operatorAuthReady) {
+    paperManualEntryBlockers.push("PAPER_OPERATOR_AUTH_NOT_CONFIGURED");
+    paperManualExitBlockers.push("PAPER_OPERATOR_AUTH_NOT_CONFIGURED");
+  }
+  if (!quoteInfrastructureReady) {
+    paperManualEntryBlockers.push("QUOTE_PROVIDER_NOT_HEALTHY");
+    paperManualExitBlockers.push("QUOTE_PROVIDER_NOT_HEALTHY");
+  }
+  if (!manualCandidateAvailable)
+    paperManualEntryBlockers.push("NO_VERIFIED_MANUAL_ENTRY_CANDIDATE");
+  if (!paperAccount?.positions.length)
+    paperManualExitBlockers.push("NO_OPEN_POSITION");
+  const paperManualEntryReady = paperManualEntryBlockers.length === 0;
+  const paperManualExitReady = paperManualExitBlockers.length === 0;
   if (options.mode !== "PAPER") blockers.push("MODE_IS_NOT_PAPER");
   if (options.mode === "PAPER" && !options.automaticEntriesEnabled)
     blockers.push("AUTOMATIC_ENTRIES_DISABLED");
@@ -428,6 +578,10 @@ export function getOperationalReadiness(options: ApiOptions) {
     analysisReadiness: analysisReady,
     tradeObservationReady,
     paperRuntimeReady,
+    paperManualEntryReady,
+    paperManualEntryBlockers,
+    paperManualExitReady,
+    paperManualExitBlockers,
     paperExecutionReady:
       paperExecutionReady && (paperAccountInit ? initialBalanceMatches : false),
     paperAutomaticEntryReady:

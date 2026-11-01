@@ -138,6 +138,8 @@ export const AppConfigSchema = z
         reject_when_sell_quote_missing: z.boolean(),
         wallet_id: z.string().min(1).max(80),
         automatic_entries_enabled: z.boolean(),
+        manual_entry_request_expiry_ms: z.number().int().min(1000).max(600000),
+        manual_exit_request_expiry_ms: z.number().int().min(1000).max(3600000),
         order_size_sol: z.string().regex(/^\d+(\.\d+)?$/),
         stop_loss_bps: z.number().int().min(1).max(10000),
         take_profit_bps: z.number().int().positive(),

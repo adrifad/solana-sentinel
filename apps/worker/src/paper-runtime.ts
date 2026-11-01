@@ -354,14 +354,6 @@ export class PaperRuntime {
     try {
       request = this.#store.claimManualPaperRequest(this.#walletId, utcNow());
       if (!request) return;
-      if (!this.#initialBalanceMatches && request.requestType === "ENTRY") {
-        this.#finishManual(
-          request,
-          "REJECTED",
-          "PAPER_INITIAL_BALANCE_CONFIG_MISMATCH",
-        );
-        return;
-      }
       const recoveredOrder = request.executionOrderId
         ? this.#store.getPaperOrder(request.executionOrderId)
         : null;
@@ -380,6 +372,28 @@ export class PaperRuntime {
           recoveredOrder.reasonCode,
           { recoveredOrderId: recoveredOrder.id },
           recoveredOrder.id,
+        );
+        return;
+      }
+      if (this.#manualRequestExpired(request, Date.now())) {
+        if (recoveredOrder?.status === "PENDING")
+          this.#store.rejectPaperOrder(
+            recoveredOrder.id,
+            "EXPIRED",
+            "MANUAL_REQUEST_EXPIRED",
+            utcNow(),
+          );
+        this.#finishManual(request, "REJECTED", "MANUAL_REQUEST_EXPIRED", {
+          expiresAtUtc: request.expiresAtUtc,
+          createdAtUtc: request.createdAtUtc,
+        });
+        return;
+      }
+      if (!this.#initialBalanceMatches && request.requestType === "ENTRY") {
+        this.#finishManual(
+          request,
+          "REJECTED",
+          "PAPER_INITIAL_BALANCE_CONFIG_MISMATCH",
         );
         return;
       }
@@ -420,6 +434,10 @@ export class PaperRuntime {
   }
 
   async #manualEntry(request: ManualPaperRequest): Promise<void> {
+    if (this.#manualRequestExpired(request, Date.now())) {
+      this.#finishManual(request, "REJECTED", "MANUAL_REQUEST_EXPIRED");
+      return;
+    }
     const eligibility = this.#manualEntryEligibility(request);
     if (!eligibility.allowed) {
       this.#finishManual(
@@ -455,7 +473,7 @@ export class PaperRuntime {
             quoteRequest.mint,
             "BUY",
             quoteRequest.exactInputAmountRaw,
-            quoteRequest.requestedAtUtc,
+            utcNow(),
           )
         ) {
           pair.reasonCode = "BUY_QUOTE_UNAVAILABLE";
@@ -471,6 +489,9 @@ export class PaperRuntime {
             side: "SELL",
             exactInputAmountRaw: sellAmount,
             requestedAtUtc: quoteRequest.requestedAtUtc,
+            ...(quoteRequest.arrivalAtUtc
+              ? { arrivalAtUtc: quoteRequest.arrivalAtUtc }
+              : {}),
             maxAgeMs: quoteRequest.maxAgeMs,
           });
         } catch (error) {
@@ -483,7 +504,7 @@ export class PaperRuntime {
             quoteRequest.mint,
             "SELL",
             sellAmount,
-            quoteRequest.requestedAtUtc,
+            utcNow(),
           ) ||
           sell.venue !== buy.venue
         ) {
@@ -503,6 +524,14 @@ export class PaperRuntime {
       config: paperExecutionConfigFromAppConfig(this.#config),
     });
     const orderId = request.executionOrderId ?? manualOrderId(request);
+    this.#store.synchronizePendingManualOrderExpiry(
+      orderId,
+      request.expiresAtUtc ??
+        new Date(
+          Date.parse(request.createdAtUtc) +
+            this.#config.paper.manual_entry_request_expiry_ms,
+        ).toISOString(),
+    );
     this.#store.setManualPaperExecutionOrder(request.id, orderId);
     const result = await engine.execute({
       id: orderId,
@@ -522,7 +551,29 @@ export class PaperRuntime {
       createdAtUtc: request.createdAtUtc,
       signalQuoteId: null,
       entrySource: "MANUAL",
+      expiresAtUtc:
+        request.expiresAtUtc ??
+        new Date(
+          Date.parse(request.createdAtUtc) +
+            this.#config.paper.manual_entry_request_expiry_ms,
+        ).toISOString(),
     });
+    if (
+      result.order.status === "EXPIRED" ||
+      this.#manualRequestExpired(request, Date.now())
+    ) {
+      this.#finishManual(
+        request,
+        "REJECTED",
+        "MANUAL_REQUEST_EXPIRED",
+        {
+          executionOrderId: orderId,
+          orderStatus: result.order.status,
+        },
+        orderId,
+      );
+      return;
+    }
     if (result.order.status === "SIMULATED_FILLED") {
       this.#finishManual(
         request,
@@ -554,6 +605,10 @@ export class PaperRuntime {
   }
 
   async #manualExit(request: ManualPaperRequest): Promise<void> {
+    if (this.#manualRequestExpired(request, Date.now())) {
+      this.#finishManual(request, "REJECTED", "MANUAL_REQUEST_EXPIRED");
+      return;
+    }
     if (request.positionId !== paperPositionId(this.#walletId, request.mint)) {
       this.#finishManual(request, "REJECTED", "OPEN_POSITION_NOT_FOUND");
       return;
@@ -566,6 +621,14 @@ export class PaperRuntime {
       return;
     }
     const orderId = request.executionOrderId ?? manualOrderId(request);
+    this.#store.synchronizePendingManualOrderExpiry(
+      orderId,
+      request.expiresAtUtc ??
+        new Date(
+          Date.parse(request.createdAtUtc) +
+            this.#config.paper.manual_exit_request_expiry_ms,
+        ).toISOString(),
+    );
     this.#store.setManualPaperExecutionOrder(request.id, orderId);
     let transientQuoteError: string | null = null;
     const exitQuotes: PaperQuoteProvider = {
@@ -600,7 +663,29 @@ export class PaperRuntime {
       createdAtUtc: request.createdAtUtc,
       signalQuoteId: null,
       entrySource: "MANUAL",
+      expiresAtUtc:
+        request.expiresAtUtc ??
+        new Date(
+          Date.parse(request.createdAtUtc) +
+            this.#config.paper.manual_exit_request_expiry_ms,
+        ).toISOString(),
     });
+    if (
+      result.order.status === "EXPIRED" ||
+      this.#manualRequestExpired(request, Date.now())
+    ) {
+      this.#finishManual(
+        request,
+        "REJECTED",
+        "MANUAL_REQUEST_EXPIRED",
+        {
+          executionOrderId: orderId,
+          orderStatus: result.order.status,
+        },
+        orderId,
+      );
+      return;
+    }
     if (result.order.status === "SIMULATED_FILLED") {
       this.#saveMonitor(request.mint, "CLOSED", null, 0, null);
       this.#finishManual(
@@ -652,7 +737,7 @@ export class PaperRuntime {
       });
     if (
       Date.now() - Date.parse(decision.decidedAtUtc) >
-      this.#config.strategy.max_signal_age_ms
+      this.#config.paper.manual_entry_request_expiry_ms
     )
       return reject("RISK_DECISION_STALE", { decisionId: decision.id });
     const coverage = this.#store.getLatestTradeObservationCoverage(
@@ -685,6 +770,32 @@ export class PaperRuntime {
     if (security.testTokenClassification === "LIKELY_TEST")
       return reject("TOKEN_CLASSIFIED_LIKELY_TEST", {
         securityReportId: security.id,
+      });
+    if (
+      (this.#config.security.reject_unsafe_mint_authority &&
+        security.mintAuthority !== null) ||
+      (this.#config.security.reject_unsafe_freeze_authority &&
+        security.freezeAuthority !== null) ||
+      security.reasonCodes.some((code) =>
+        ["MINT_AUTHORITY_ACTIVE", "FREEZE_AUTHORITY_ACTIVE"].includes(code),
+      )
+    )
+      return reject("TOKEN_SECURITY_AUTHORITY_POLICY_FAILED", {
+        securityReportId: security.id,
+        reasonCodes: security.reasonCodes,
+      });
+    const unsupportedExtension = security.extensions.find(
+      (extension) =>
+        extension.classification === "UNSUPPORTED" ||
+        (this.#config.security.reject_untrusted_permanent_delegate &&
+          extension.name === "PERMANENT_DELEGATE") ||
+        (this.#config.security.reject_unsupported_transfer_hooks &&
+          extension.name === "TRANSFER_HOOK"),
+    );
+    if (unsupportedExtension)
+      return reject("TOKEN_SECURITY_EXTENSION_POLICY_FAILED", {
+        securityReportId: security.id,
+        extension: unsupportedExtension.name,
       });
     if (
       security.holderSampleValidated !== true ||
@@ -755,9 +866,11 @@ export class PaperRuntime {
 
     const coverageException =
       decision.status === "QUARANTINE" &&
-      decision.reasonCodes.length === 1 &&
-      decision.reasonCodes[0] === "LAUNCH_BEHAVIOR_INCOMPLETE" &&
-      coverageStatus !== "COMPLETE";
+      decision.reasonCodes.includes("LAUNCH_BEHAVIOR_INCOMPLETE") &&
+      coverageStatus !== "COMPLETE" &&
+      request.originalCoverageStatus !== "COMPLETE" &&
+      behavior?.complete === false &&
+      behavior.gapReason === "TRADE_STREAM_COMPLETENESS_UNVERIFIED";
     if (decision.status !== "BUY_ELIGIBLE" && !coverageException)
       return reject("RISK_DECISION_NOT_MANUALLY_ELIGIBLE", {
         decisionId: decision.id,
@@ -770,6 +883,11 @@ export class PaperRuntime {
     )
       return reject("LAUNCH_BEHAVIOR_EVIDENCE_UNAVAILABLE", {
         decisionId: decision.id,
+      });
+    if (!decision.evidenceRefs.includes(`launch_behavior:${behavior.id}`))
+      return reject("LAUNCH_BEHAVIOR_NOT_IN_RISK_EVIDENCE", {
+        decisionId: decision.id,
+        behaviorId: behavior.id,
       });
     if (
       coverageException &&
@@ -865,6 +983,36 @@ export class PaperRuntime {
         verifiedObservationIds: observations.map((event) => event.id),
       });
 
+    const unexplainedReasons = decision.reasonCodes.filter((code) => {
+      if (code === "BUY_AND_SELL_QUOTES_VALIDATED") return false;
+      if (
+        code === "VALIDATED_HOLDER_SAMPLE_COVERAGE_POLICY_PASSED" &&
+        security.holderSampleValidated === true &&
+        (security.holderSampleCoverageBps ?? -1) >=
+          this.#config.analysis.min_holder_sample_coverage_bps
+      )
+        return false;
+      if (code === "LAUNCH_BEHAVIOR_INCOMPLETE") return !coverageException;
+      if (code === "TRADE_STREAM_COMPLETENESS_UNVERIFIED")
+        return !coverageException;
+      if (
+        [
+          "INDEPENDENT_BUYER_THRESHOLD_MET",
+          "CREATOR_ASSOCIATED_BUY_ACTIVITY",
+        ].includes(code)
+      )
+        return !assessed.reasonCodes.includes(code);
+      if (code === "MANDATORY_CHECKS_PASSED")
+        return decision.status !== "BUY_ELIGIBLE";
+      return true;
+    });
+    if (unexplainedReasons.length > 0)
+      return reject("RISK_DECISION_HAS_UNVERIFIED_REASON_CODES", {
+        decisionId: decision.id,
+        reasonCodes: unexplainedReasons,
+        originalReasonCodes: decision.reasonCodes,
+      });
+
     return {
       allowed: true,
       reasonCode: "MANUAL_ELIGIBILITY_PASSED",
@@ -900,36 +1048,48 @@ export class PaperRuntime {
     mint: string,
     side: "BUY" | "SELL",
     amount: string,
-    requestedAtUtc: string,
+    settledAtUtc: string,
   ): quote is QuoteResult {
-    return Boolean(
-      quote &&
-      quote.validationStatus === "PASS" &&
-      quote.mint === mint &&
-      quote.direction === side &&
-      quote.exactInputAmountRaw === amount &&
-      quote.inputMint ===
-        (side === "BUY"
-          ? "So11111111111111111111111111111111111111112"
-          : mint) &&
-      quote.outputMint ===
-        (side === "BUY"
-          ? mint
-          : "So11111111111111111111111111111111111111112") &&
-      quote.venue !== null &&
-      quote.feeAmountRaw !== null &&
-      quote.expectedOutputAmountRaw !== null &&
-      quote.feeMint === "So11111111111111111111111111111111111111112" &&
-      quote.priceImpactBps !== null &&
-      quote.priceImpactBps <= this.#config.risk.max_price_impact_bps &&
-      quote.snapshotSlot !== null &&
-      quote.snapshotAtUtc !== null &&
-      Date.parse(quote.observedAtUtc) <= Date.parse(requestedAtUtc) &&
-      Date.parse(quote.snapshotAtUtc) <= Date.parse(requestedAtUtc) &&
-      Date.parse(requestedAtUtc) - Date.parse(quote.snapshotAtUtc) <=
-        this.#config.paper.max_quote_age_ms &&
-      (quote.freshnessMs ?? Number.MAX_SAFE_INTEGER) <=
-        this.#config.paper.max_quote_age_ms,
+    if (
+      !quote ||
+      !["PUMP_BONDING_CURVE", "PUMPSWAP"].includes(quote.venue ?? "")
+    )
+      return false;
+    const reason = this.#risk.validateQuote(
+      quote,
+      {
+        id: "manual-quote-validation",
+        idempotencyKey: "manual-quote-validation",
+        walletId: this.#walletId,
+        mode: "PAPER",
+        mint,
+        side,
+        exactInputAmountRaw: amount,
+        decisionId: "manual-quote-validation",
+        reasonCodes: [],
+        createdAtUtc: settledAtUtc,
+        signalQuoteId: null,
+        entrySource: "MANUAL",
+      },
+      settledAtUtc,
+      paperExecutionConfigFromAppConfig(this.#config),
+    );
+    return reason === null;
+  }
+
+  #manualRequestExpired(request: ManualPaperRequest, nowMs: number): boolean {
+    const createdAtMs = Date.parse(request.createdAtUtc);
+    const expiresAtMs = request.expiresAtUtc
+      ? Date.parse(request.expiresAtUtc)
+      : createdAtMs +
+        (request.requestType === "ENTRY"
+          ? this.#config.paper.manual_entry_request_expiry_ms
+          : this.#config.paper.manual_exit_request_expiry_ms);
+    return (
+      !Number.isFinite(createdAtMs) ||
+      !Number.isFinite(expiresAtMs) ||
+      createdAtMs > nowMs ||
+      nowMs >= expiresAtMs
     );
   }
 

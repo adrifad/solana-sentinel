@@ -134,6 +134,10 @@ function intent(input: Partial<PaperOrderIntent> = {}): PaperOrderIntent {
     reasonCodes: input.reasonCodes ?? ["TEST_SIGNAL"],
     createdAtUtc: input.createdAtUtc ?? "2026-11-01T00:00:00.000Z",
     signalQuoteId: input.signalQuoteId ?? null,
+    ...(input.entrySource ? { entrySource: input.entrySource } : {}),
+    ...(input.expiresAtUtc !== undefined
+      ? { expiresAtUtc: input.expiresAtUtc }
+      : {}),
   };
 }
 
@@ -170,13 +174,17 @@ test("paper buy uses a quote after arrival, applies costs, and deduplicates fill
     engine.initializeWallet("paper-wallet", "90");
     const order = intent();
     const result = await engine.execute(order);
-    assert.equal(result.order.status, "SIMULATED_FILLED");
+    assert.equal(
+      result.order.status,
+      "SIMULATED_FILLED",
+      result.reasonCode ?? "",
+    );
     assert.equal(result.fill?.["outputAmountRaw"], "99500");
     assert.equal(result.fill?.["networkFeeLamports"], "10000");
     assert.equal(result.fill?.["venueFeeRaw"], "10000");
     assert.equal(quoteProvider.calls[0]?.at, "2026-11-01T00:00:00.250Z");
     const state = store.getPaperPortfolioState("paper-wallet");
-    assert.equal(store.listAppliedMigrations().at(-1)?.version, 11);
+    assert.equal(store.listAppliedMigrations().at(-1)?.version, 12);
     assert.equal(state.solBalanceRaw, "999990000");
     assert.equal(state.positions[0]?.tokenAmountRaw, "99500");
     const quoteCount = quoteProvider.calls.length;
@@ -223,6 +231,106 @@ test("quote snapshots fetched during RPC are validated at quote-ready time", asy
     assert.equal(result.fill?.["arrivalAtUtc"], "2026-11-01T00:00:00.250Z");
     assert.equal(result.fill?.["snapshotAtUtc"], "2026-11-01T00:00:00.550Z");
     assert.equal(result.fill?.["filledAtUtc"], "2026-11-01T00:00:00.550Z");
+  });
+});
+
+test("manual quote timestamps accept 200ms, 500ms, and 1000ms provider latency", async () => {
+  for (const latency of [200, 500, 1000]) {
+    await withStore(async (store) => {
+      const clock = new TestClock();
+      const quotes = new TestQuotes();
+      quotes.clock = clock;
+      quotes.providerLatencyMs = latency;
+      const engine = new PaperTradingEngine({
+        repository: store,
+        quotes,
+        config: config({
+          executionLatencyMs: 0,
+          maxQuoteAgeMs: 1000,
+          maxIntentAgeMs: 5000,
+          manualEntryMaxAgeMs: 5000,
+        }),
+        clock,
+      });
+      engine.initializeWallet("paper-wallet", "2");
+      const result = await engine.execute(
+        intent({
+          id: `manual-provider-latency-${latency}`,
+          entrySource: "MANUAL",
+          expiresAtUtc: "2026-11-01T00:00:05.000Z",
+        }),
+      );
+      assert.equal(result.order.status, "SIMULATED_FILLED");
+      assert.equal(
+        result.fill?.["filledAtUtc"],
+        new Date(
+          Date.parse("2026-11-01T00:00:00.000Z") + latency,
+        ).toISOString(),
+      );
+    });
+  }
+});
+
+test("manual requests expiring after 1, 3, 5, or 10 seconds cannot fill after expiry", async () => {
+  for (const expirySeconds of [1, 3, 5, 10]) {
+    await withStore(async (store) => {
+      const clock = new TestClock();
+      const quotes = new TestQuotes();
+      quotes.clock = clock;
+      quotes.providerLatencyMs = expirySeconds * 1000 + 1;
+      const expiresAtUtc = new Date(
+        Date.parse("2026-11-01T00:00:00.000Z") + expirySeconds * 1000,
+      ).toISOString();
+      const engine = new PaperTradingEngine({
+        repository: store,
+        quotes,
+        config: config({
+          executionLatencyMs: 0,
+          maxIntentAgeMs: 1000,
+          manualEntryMaxAgeMs: 15000,
+        }),
+        clock,
+      });
+      engine.initializeWallet("paper-wallet", "2");
+      const before = store.getPaperPortfolioState("paper-wallet");
+      const result = await engine.execute(
+        intent({
+          id: `manual-expiry-${expirySeconds}`,
+          entrySource: "MANUAL",
+          expiresAtUtc,
+        }),
+      );
+      assert.equal(result.order.status, "EXPIRED");
+      const after = store.getPaperPortfolioState("paper-wallet");
+      assert.equal(after.solBalanceRaw, before.solBalanceRaw);
+      assert.equal(after.positions.length, 0);
+    });
+  }
+});
+
+test("manual PAPER order validity is separate from automatic signal freshness", async () => {
+  await withStore(async (store) => {
+    const clock = new TestClock();
+    const quotes = new TestQuotes();
+    const engine = new PaperTradingEngine({
+      repository: store,
+      quotes,
+      config: config({ maxIntentAgeMs: 1000, manualEntryMaxAgeMs: 5000 }),
+      clock,
+    });
+    engine.initializeWallet("paper-wallet", "2");
+    const result = await engine.execute(
+      intent({
+        id: "manual-older-than-automatic-signal",
+        createdAtUtc: "2026-10-31T23:59:56.000Z",
+        entrySource: "MANUAL",
+      }),
+    );
+    assert.equal(
+      result.order.status,
+      "SIMULATED_FILLED",
+      result.reasonCode ?? "",
+    );
   });
 });
 
