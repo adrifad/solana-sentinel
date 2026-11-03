@@ -71,3 +71,52 @@ test("read-only API serves health and token list, rejects writes and unknown pat
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("daily metrics endpoint returns a validated Jakarta date summary without writes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "sentinel-api-summary-"));
+  const store = new SentinelStore(join(dir, "sentinel.db"));
+  await store.open();
+  store.initializePaperAccount(
+    "summary-wallet",
+    "10000000000",
+    "2026-11-03T00:00:00.000Z",
+  );
+  const server = createApiServer({
+    store,
+    mode: "PAPER",
+    staleFeedSeconds: 30,
+    tradeStreamEnabled: false,
+    automaticEntriesEnabled: false,
+    paperWalletId: "summary-wallet",
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/metrics/daily-summary?date=2026-11-03`,
+    );
+    assert.equal(response.status, 200);
+    const summary = (await response.json()) as {
+      dateAsiaJakarta: string;
+      summary: { realizedPnlLamports: string; openPositions: number };
+    };
+    assert.equal(summary.dateAsiaJakarta, "2026-11-03");
+    assert.equal(summary.summary.realizedPnlLamports, "0");
+    assert.equal(summary.summary.openPositions, 0);
+    assert.equal(
+      (
+        await fetch(
+          `http://127.0.0.1:${address.port}/api/metrics/daily-summary?date=2026-02-30`,
+        )
+      ).status,
+      400,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

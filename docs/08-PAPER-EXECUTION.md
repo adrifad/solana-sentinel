@@ -1,5 +1,15 @@
 # 08 — Real-Time Paper Trading: Fill Model & Ledger
 
+## Independent Telegram monitoring
+
+The optional `apps/telegram-bot` container reads operational data through the internal API and delivers records from the SQLite Telegram outbox. It has no order, position, balance, or configuration API. `TELEGRAM_ENABLED` defaults to `false`; the Compose service also requires the `telegram` profile. BotFather credentials and explicit chat/user allowlists are environment-only. No bot credentials or Telegram requests are needed for DRY_RUN or PAPER trading.
+
+PAPER fill notifications are inserted in the same SQLite transaction as the fill and ledger settlement, so no message can be sent for an uncommitted or rejected fill. Outbox event IDs and unique deduplication keys prevent duplicate queue rows after worker recovery. Delivery uses a leased single update consumer, persistent Telegram update offsets, bounded retries, exponential backoff, and Telegram `retry_after` handling. Delivery is at-least-once/best-effort: if Telegram accepts a message but the network response is lost, the service cannot prove whether the message was delivered and a retry can duplicate it. It does not claim exactly-once delivery.
+
+Every buy/sell fill message is marked `PAPER / VIRTUAL`. Stop-loss/take-profit triggers are shown with a resulting committed sell fill or a separate exit-failed status; a trigger alone is never described as a sale. Unpriceable and exit-blocked states remain open virtual exposure. The bot also reports provider state transitions, Helius budget thresholds, worker starts, and a restart-safe daily summary at 23:59 `Asia/Jakarta`. All bot commands are read-only; there are no Telegram trade or configuration commands.
+
+Telegram long polling is incompatible with an active webhook. At startup the service reads `getWebhookInfo` and remains degraded when one is configured; it never calls `deleteWebhook` or changes bot setup on the operator's behalf.
+
 ## Implemented foundation status
 
 The `@sentinel/paper` package contains a quote-at-arrival simulator, conservative fill adjustment, persistent order recovery, atomic double-entry settlement, positions, portfolio marks/PnL, risk gates, and an exit-rule evaluator. The worker now composes it in `APP_MODE=PAPER`, initializes a virtual wallet, recovers pending intents, and monitors open positions for stop-loss, take-profit, or max-hold exits. Quotes use the read-only Pump curve/PumpSwap loaders through Helius. No simulated trade is a real fill. Automatic entries default off and require complete observation/behavior/security evidence; the current observer cannot establish complete coverage, so it cannot currently submit an entry intent.

@@ -17,6 +17,7 @@
     "db:migrate": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts migrate",
     "dev:worker": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts start",
     "dev:api": "node --env-file-if-exists=.env --experimental-strip-types apps/api/src/main.ts",
+    "dev:telegram-bot": "node --env-file-if-exists=.env --experimental-strip-types apps/telegram-bot/src/main.ts",
     "tokens": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts tokens",
     "health": "node --env-file-if-exists=.env --experimental-strip-types apps/worker/src/main.ts health",
     "validate:providers": "node --env-file-if-exists=.env --experimental-strip-types scripts/validate-providers.ts",

@@ -17,6 +17,7 @@
 GET    /api/health
 GET    /api/completeness
 GET    /api/metrics/latency
+GET    /api/metrics/daily-summary?date=YYYY-MM-DD
 GET    /ready
 GET    /api/tokens?limit=50
 GET    /api/tokens/:mint
@@ -27,6 +28,8 @@ POST   /api/paper/exit
 ```
 
 `GET /api/paper/status` is available only in PAPER mode and reports virtual balances, positions and fresh marks, realized PnL, fills, manual request lifecycle including `expiresAtUtc`, and readiness blockers. It separates `paperRuntimeReady`, `paperManualEntryReady`, `paperManualExitReady`, and `paperAutomaticEntryReady`; manual entry readiness requires an evidence-backed candidate and provider/auth/wallet checks, not just an initialized wallet. An open position is required for exit readiness. Readiness does not guarantee that an executable route will still exist at request time; the worker always fetches and validates a fresh quote. The two manual POST routes only enqueue durable requests; the worker owns eligibility, quote-at-arrival, and virtual settlement. Both require a bearer token from `PAPER_OPERATOR_TOKEN`, a unique `Idempotency-Key`, strict JSON bodies, and are rate limited. Missing operator token fails closed. Entry requests are bounded by configured `risk.max_trade_sol`; all other financial limits remain enforced by the worker and atomic ledger.
+
+The optional Telegram process uses only `GET /api/health`, `GET /api/paper/status`, and `GET /api/metrics/daily-summary`. The summary endpoint validates an ISO calendar date and aggregates discovery and PAPER fill/PnL information for that date in `Asia/Jakarta`; it does not mutate trading state. The API remains host-loopback published in Compose, with bot-to-API communication on the Compose network.
 
 Manual entry has one narrow coverage exception: structured evidence must show that incomplete stream coverage is the only substantive blocker, while verified observations independently satisfy the existing buyer and suspicious-activity policy. Informational reason codes are revalidated against their underlying evidence; an unexplained reason, unsafe creator, incomplete holder sample, missing behavior, or failed exit validation is rejected. Security, creator history, holder coverage, current quotes, exit route, exposure, wallet, drawdown, daily loss, and entry-pause checks are not bypassed. The request audit retains original reason codes, coverage state/reason, expiry, and the exception; the original risk decision remains unchanged. Manual SELL resolves a stable position ID against the configured PAPER wallet and remains available during entry pause when the fresh exit quote and held balance validate. Manual request expiry is independently configurable; automatic signal freshness is unchanged.
 

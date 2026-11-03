@@ -1,5 +1,15 @@
 # Solana Sentinel Implementation Status
 
+## Independent Telegram monitoring service — 2026-11-03
+
+- Added an optional `apps/telegram-bot` process and Compose profile. It is disabled by default, publishes no port, runs with a read-only container root, shares only the existing SQLite data volume, and uses internal API reads for status/portfolio data.
+- Migration 014 adds a durable notification outbox, persistent bot state/update offset, single-consumer lease, and alert cooldown records. Worker PAPER fills enqueue one uniquely keyed notification in the same transaction as fill/ledger settlement. Provider state changes, unpriceable/exit-blocked transitions, failed exits, Helius budget thresholds, and worker starts are also recorded without Telegram network calls in the worker path.
+- The bot supports read-only `/start`, `/help`, `/status`, `/portfolio`, `/positions`, `/trades`, `/pnl`, and `/health`. It requires an explicit chat ID and user ID allowlist, does not auto-register users, persists update offsets, handles Telegram `retry_after`, and retries delivery with bounded exponential backoff. Delivery is not exactly-once because Telegram may accept a message while the response is lost.
+- A read-only Jakarta-day summary API supports restart-safe daily summary deduplication at 23:59 WIB. All trade-fill messages explicitly identify `PAPER / VIRTUAL` and derive formatted SOL/token values from persisted integer units.
+- Bot activation, BotFather setup, real Telegram delivery, Docker runtime, and deployment were intentionally not performed. No bot token is configured or present in fixtures. See the Telegram setup and delivery limits in [README](../README.md), [paper execution](08-PAPER-EXECUTION.md), and [API contract](11-API-DASHBOARD.md).
+- Verification completed locally: `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm test` (115 passed), `pnpm lint`, `pnpm format:check`, `pnpm docs:check`, and `pnpm build` passed. A fresh isolated SQLite database applied schema version 14 and returned `PRAGMA integrity_check = ok`.
+- No real BotFather token was configured, no Telegram API messages were sent, and the Docker service was not activated or deployed. Runtime delivery and Telegram account behavior therefore remain unverified.
+
 ## Zero-trade diagnosis and runtime corrections — 2026-11-03
 
 - Confirmed from source: automatic entry scanning was nested in the same `tick()` as position monitoring. The configured monitor interval is 600,000 ms while `strategy.max_signal_age_ms` is 3,000 ms. Automatic PAPER entry remains disabled by default. The position loop therefore could not reliably evaluate freshly produced signals.

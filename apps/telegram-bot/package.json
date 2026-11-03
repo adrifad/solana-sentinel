@@ -1,0 +1,14 @@
+{
+  "name": "@sentinel/telegram-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts"
+  },
+  "dependencies": {
+    "@sentinel/config": "workspace:*",
+    "@sentinel/storage": "workspace:*",
+    "zod": "^4.1.12"
+  }
+}

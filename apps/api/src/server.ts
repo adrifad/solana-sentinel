@@ -221,6 +221,9 @@ async function handleRequest(
         );
         return {
           ...position,
+          tokenDecimals:
+            options.store.getLatestTokenRiskReport?.(position.mint)?.decimals ??
+            null,
           positionId: paperPositionId(options.paperWalletId, position.mint),
           unrealizedPnlLamports: markFresh
             ? (mark?.unrealizedPnlLamports ?? null)
@@ -232,6 +235,9 @@ async function handleRequest(
       const realized = portfolio.realizedPnl
         .reduce((sum, item) => sum + BigInt(item.pnlLamports), 0n)
         .toString();
+      const winningTrades = portfolio.realizedPnl.filter(
+        (item) => BigInt(item.pnlLamports) > 0n,
+      ).length;
       const readiness = getOperationalReadiness(options);
       return send(response, 200, {
         mode: options.mode,
@@ -245,6 +251,8 @@ async function handleRequest(
         solBalanceLamports: portfolio.solBalanceRaw,
         positions,
         realizedPnlLamports: realized,
+        winningTrades,
+        closedTradeCount: portfolio.realizedPnl.length,
         unrealizedPnlLamports:
           portfolio.latestMark &&
           portfolio.latestMark.unpriceablePositions === 0 &&
@@ -306,6 +314,27 @@ async function handleRequest(
       stages: options.store.getAnalysisLatencySummary(),
       checkedAtUtc: utcNow(),
     });
+  if (url.pathname === "/api/metrics/daily-summary") {
+    const date = url.searchParams.get("date") ?? "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
+      return send(response, 400, { error: "INVALID_SUMMARY_DATE" });
+    const [year, month, day] = date.split("-").map(Number);
+    const localDate = new Date(Date.UTC(year!, month! - 1, day!));
+    if (localDate.toISOString().slice(0, 10) !== date)
+      return send(response, 400, { error: "INVALID_SUMMARY_DATE" });
+    const start = new Date(localDate.getTime() - 7 * 60 * 60 * 1000);
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    return send(response, 200, {
+      dateAsiaJakarta: date,
+      mode: options.mode,
+      summary: options.store.getDailyTelegramSummary(
+        options.paperWalletId,
+        start.toISOString(),
+        end.toISOString(),
+      ),
+      checkedAtUtc: utcNow(),
+    });
+  }
   if (url.pathname === "/api/tokens") {
     const limit = Number(url.searchParams.get("limit") ?? "50");
     if (!Number.isInteger(limit) || limit < 1 || limit > 200)

@@ -41,5 +41,43 @@ services:
     tmpfs:
       - /tmp
 
+  telegram-bot:
+    profiles: ["telegram"]
+    build: .
+    command:
+      ["node", "--experimental-strip-types", "apps/telegram-bot/src/main.ts"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_CONFIG_PATH: config/default.yaml
+      DB_PATH: /app/data/sentinel.db
+      APP_MODE: ${APP_MODE:-DRY_RUN}
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-false}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
+      API_INTERNAL_URL: http://api:8787
+      TELEGRAM_HEALTH_PORT: "8788"
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - sentinel-data:/app/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8788/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
 volumes:
   sentinel-data:

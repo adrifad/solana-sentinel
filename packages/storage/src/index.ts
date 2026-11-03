@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,8 @@ import type {
   WalletRoleEvidence,
   PaperOrderIntent,
 } from "@sentinel/domain";
+export { TelegramOutboxRepository } from "./telegram.ts";
+export type { TelegramOutboxItem } from "./telegram.ts";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -82,9 +84,11 @@ export type StoredToken = {
 
 export class SentinelStore {
   #db!: DatabaseSync;
+  readonly #telegramEnabled: boolean;
 
-  constructor(path: string) {
+  constructor(path: string, options: { telegramEnabled?: boolean } = {}) {
     this.path = path;
+    this.#telegramEnabled = options.telegramEnabled ?? false;
   }
 
   readonly path: string;
@@ -124,6 +128,7 @@ export class SentinelStore {
       "011-manual-paper-requests.sql",
       "012-manual-paper-request-expiry.sql",
       "013-monitoring-leases.sql",
+      "014-telegram-outbox.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -509,6 +514,24 @@ export class SentinelStore {
         )
         .run(utcDay, admissionLimit);
       this.#db.exec("COMMIT");
+      if (this.#telegramEnabled) {
+        const used = this.getHeliusRequestBudget(
+          maxRequestsPerUtcDay,
+          exitReservedRequestsPerUtcDay,
+        ).used;
+        const threshold = used >= maxRequestsPerUtcDay ? 100 : 80;
+        if (used * 100 >= maxRequestsPerUtcDay * threshold)
+          this.#enqueueTelegramNotification(
+            "HELIUS_BUDGET_WARNING",
+            {
+              requestsUsed: used,
+              requestsRemaining: Math.max(0, maxRequestsPerUtcDay - used),
+              thresholdPercent: threshold,
+              observedAtUtc: utcNow(),
+            },
+            `helius-budget:${utcDay}:${threshold}`,
+          );
+      }
       return Number(result.changes) === 1;
     } catch (error) {
       this.#db.exec("ROLLBACK");
@@ -2243,12 +2266,29 @@ export class SentinelStore {
     completedAtUtc: string,
     arrivalAtUtc: string | null = null,
   ): void {
-    this.#db
-      .prepare(
-        `UPDATE paper_orders SET status = ?, reason_code = ?, arrival_at_utc = COALESCE(?, arrival_at_utc), completed_at_utc = ?
-         WHERE id = ? AND status = 'PENDING'`,
-      )
-      .run(status, reasonCode, arrivalAtUtc, completedAtUtc, orderId);
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const order = this.#db
+        .prepare("SELECT * FROM paper_orders WHERE id = ?")
+        .get(orderId) as SqlRow | undefined;
+      const result = this.#db
+        .prepare(
+          `UPDATE paper_orders SET status = ?, reason_code = ?, arrival_at_utc = COALESCE(?, arrival_at_utc), completed_at_utc = ?
+           WHERE id = ? AND status = 'PENDING'`,
+        )
+        .run(status, reasonCode, arrivalAtUtc, completedAtUtc, orderId);
+      if (Number(result.changes) === 1 && order?.["side"] === "SELL")
+        this.#enqueuePaperExitFailure(
+          order,
+          status,
+          reasonCode,
+          completedAtUtc,
+        );
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   applyPaperFill(input: {
@@ -2305,7 +2345,7 @@ export class SentinelStore {
       const output = BigInt(input.outputAmountRaw);
       const venueFee = BigInt(input.venueFeeRaw);
       const reject = (reasonCode: string) => {
-        this.#db
+        const result = this.#db
           .prepare(
             `UPDATE paper_orders SET status = 'REJECTED', reason_code = ?, arrival_at_utc = ?, completed_at_utc = ?
              WHERE id = ? AND status = 'PENDING'`,
@@ -2315,6 +2355,13 @@ export class SentinelStore {
             input.arrivalAtUtc,
             input.filledAtUtc,
             input.orderId,
+          );
+        if (Number(result.changes) === 1 && side === "SELL")
+          this.#enqueuePaperExitFailure(
+            row,
+            "REJECTED",
+            reasonCode,
+            input.filledAtUtc,
           );
         this.#db.exec("COMMIT");
         return { status: "REJECTED" as const, reasonCode };
@@ -2464,6 +2511,7 @@ export class SentinelStore {
         input.filledAtUtc,
       );
       let realizedOnSell: bigint | null = null;
+      let realizedPnlPercentBps: string | null = null;
       if (side === "BUY") {
         const nextTokens =
           BigInt(String(position?.["token_amount_raw"] ?? "0")) + output;
@@ -2492,6 +2540,10 @@ export class SentinelStore {
         const currentCost = BigInt(String(position!["cost_basis_lamports"]));
         const allocatedCost = (currentCost * amount) / currentTokens;
         realizedOnSell = output - networkFee - allocatedCost;
+        realizedPnlPercentBps =
+          allocatedCost > 0n
+            ? ((realizedOnSell * 10000n) / allocatedCost).toString()
+            : null;
         const nextTokens = currentTokens - amount;
         const nextCost = currentCost - allocatedCost;
         this.#db
@@ -2551,6 +2603,61 @@ export class SentinelStore {
            arrival_at_utc = ?, completed_at_utc = ? WHERE id = ? AND status = 'PENDING'`,
         )
         .run(input.arrivalAtUtc, input.filledAtUtc, input.orderId);
+      if (this.#telegramEnabled) {
+        const intent = JSON.parse(String(row["intent_json"])) as {
+          reasonCodes?: unknown;
+        };
+        const token = this.#db
+          .prepare("SELECT name, symbol FROM tokens WHERE mint = ?")
+          .get(mint) as SqlRow | undefined;
+        const security = this.#db
+          .prepare(
+            "SELECT report_json FROM token_security_reports WHERE mint = ? ORDER BY observed_at_utc DESC, id DESC LIMIT 1",
+          )
+          .get(mint) as SqlRow | undefined;
+        let tokenDecimals: number | null = null;
+        if (security) {
+          try {
+            const report = JSON.parse(String(security["report_json"])) as {
+              decimals?: unknown;
+            };
+            if (Number.isInteger(report.decimals))
+              tokenDecimals = Number(report.decimals);
+          } catch {
+            tokenDecimals = null;
+          }
+        }
+        this.#enqueueTelegramNotification(
+          "PAPER_FILL",
+          {
+            orderId: input.orderId,
+            walletId,
+            mint,
+            side,
+            tokenName: token?.["symbol"] ?? token?.["name"] ?? null,
+            tokenDecimals,
+            inputAmountRaw: amount.toString(),
+            outputAmountRaw: output.toString(),
+            venueFeeRaw: venueFee.toString(),
+            networkFeeLamports: networkFee.toString(),
+            realizedPnlLamports: realizedOnSell?.toString() ?? null,
+            realizedPnlPercentBps,
+            entryCostLamports:
+              side === "BUY" ? (amount + networkFee).toString() : null,
+            exitReasonCodes: Array.isArray(intent.reasonCodes)
+              ? intent.reasonCodes
+              : [],
+            entrySource: String(row["entry_source"] ?? "AUTOMATIC"),
+            venue: quote.venue,
+            snapshotSlot: quote.snapshotSlot,
+            snapshotAtUtc: quote.snapshotAtUtc,
+            filledAtUtc: input.filledAtUtc,
+            virtual: true,
+          },
+          `paper-fill:${input.orderId}`,
+          input.filledAtUtc,
+        );
+      }
       this.#db.exec("COMMIT");
       return { status: "SIMULATED_FILLED", reasonCode: null };
     } catch (error) {
@@ -2764,6 +2871,11 @@ export class SentinelStore {
   }): void {
     if (!Number.isSafeInteger(input.retryCount) || input.retryCount < 0)
       throw new Error("PAPER_MONITOR_RETRY_COUNT_INVALID");
+    const previous = this.#db
+      .prepare(
+        "SELECT status, reason_code FROM paper_position_monitor_state WHERE wallet_id = ? AND mint = ?",
+      )
+      .get(input.walletId, input.mint) as SqlRow | undefined;
     this.#db
       .prepare(
         `INSERT INTO paper_position_monitor_state
@@ -2782,6 +2894,35 @@ export class SentinelStore {
         input.nextRetryAtUtc,
         input.updatedAtUtc,
       );
+    if (
+      this.#telegramEnabled &&
+      (input.status === "UNPRICEABLE" || input.status === "EXIT_BLOCKED") &&
+      (previous?.["status"] !== input.status ||
+        previous?.["reason_code"] !== input.reasonCode)
+    ) {
+      const position = this.#db
+        .prepare(
+          "SELECT token_amount_raw, cost_basis_lamports FROM paper_positions WHERE wallet_id = ? AND mint = ?",
+        )
+        .get(input.walletId, input.mint) as SqlRow | undefined;
+      this.#enqueueTelegramNotification(
+        "POSITION_UNPRICEABLE",
+        {
+          walletId: input.walletId,
+          mint: input.mint,
+          status: input.status,
+          reasonCode: input.reasonCode,
+          tokenAmountRaw: position?.["token_amount_raw"] ?? null,
+          costBasisLamports: position?.["cost_basis_lamports"] ?? null,
+          retryCount: input.retryCount,
+          nextRetryAtUtc: input.nextRetryAtUtc,
+          observedAtUtc: input.updatedAtUtc,
+        },
+        `paper-position:${input.walletId}:${input.mint}:${input.status}:${input.reasonCode ?? "NONE"}`,
+        input.updatedAtUtc,
+        900,
+      );
+    }
   }
 
   recordPaperEquityMark(
@@ -2835,7 +2976,13 @@ export class SentinelStore {
   getPaperFill(orderId: string): Record<string, string | number> | null {
     const row = this.#db
       .prepare(
-        "SELECT f.*, o.entry_source FROM paper_fills f JOIN paper_orders o ON o.id = f.order_id WHERE f.order_id = ?",
+        `SELECT f.*, o.entry_source, p.pnl_lamports AS realized_pnl_lamports,
+          t.symbol AS token_symbol, t.name AS token_name,
+          (SELECT json_extract(r.report_json, '$.decimals') FROM token_security_reports r
+           WHERE r.mint = f.mint ORDER BY r.observed_at_utc DESC, r.id DESC LIMIT 1) AS token_decimals
+         FROM paper_fills f JOIN paper_orders o ON o.id = f.order_id
+         LEFT JOIN paper_realized_pnl p ON p.order_id = f.order_id
+         LEFT JOIN tokens t ON t.mint = f.mint WHERE f.order_id = ?`,
       )
       .get(orderId) as SqlRow | undefined;
     if (!row) return null;
@@ -2856,6 +3003,13 @@ export class SentinelStore {
       arrivalAtUtc: String(row["arrival_at_utc"]),
       filledAtUtc: String(row["filled_at_utc"]),
       entrySource: String(row["entry_source"] ?? "AUTOMATIC"),
+      realizedPnlLamports:
+        row["realized_pnl_lamports"] === null
+          ? ""
+          : String(row["realized_pnl_lamports"]),
+      tokenName: String(row["token_symbol"] ?? row["token_name"] ?? ""),
+      tokenDecimals:
+        row["token_decimals"] === null ? -1 : Number(row["token_decimals"]),
     };
   }
 
@@ -3130,6 +3284,11 @@ export class SentinelStore {
   }
 
   setProviderHealth(health: ProviderHealth): void {
+    const previous = this.#db
+      .prepare(
+        "SELECT state, connection_state FROM provider_health WHERE provider = ?",
+      )
+      .get(health.provider) as SqlRow | undefined;
     this.#db
       .prepare(
         `INSERT INTO provider_health(provider, state, checked_at_utc, last_event_at_utc, reconnect_count, error_code,
@@ -3154,6 +3313,42 @@ export class SentinelStore {
         health.processingLagMs ?? null,
         health.queueDepth ?? 0,
       );
+    const wasDisconnected =
+      previous?.["state"] === "DEGRADED" ||
+      previous?.["connection_state"] === "DISCONNECTED";
+    const isDisconnected =
+      health.state === "DEGRADED" || health.connectionState === "DISCONNECTED";
+    if (
+      this.#telegramEnabled &&
+      (wasDisconnected !== isDisconnected ||
+        previous?.["state"] !== health.state)
+    ) {
+      const checkedAtUtc = health.checkedAtUtc ?? utcNow();
+      if (isDisconnected && !wasDisconnected)
+        this.#enqueueTelegramNotification(
+          "PROVIDER_DISCONNECTED",
+          {
+            provider: health.provider,
+            reasonCode: health.errorCode,
+            observedAtUtc: checkedAtUtc,
+          },
+          `provider-transition:${health.provider}:DEGRADED:${checkedAtUtc.slice(0, 16)}`,
+          checkedAtUtc,
+          300,
+        );
+      else if (wasDisconnected && !isDisconnected && health.state === "HEALTHY")
+        this.#enqueueTelegramNotification(
+          "PROVIDER_RECOVERED",
+          {
+            provider: health.provider,
+            recoveryStatus: health.state,
+            observedAtUtc: checkedAtUtc,
+          },
+          `provider-transition:${health.provider}:HEALTHY:${checkedAtUtc.slice(0, 16)}`,
+          checkedAtUtc,
+          300,
+        );
+    }
   }
 
   listProviderHealth(): Array<
@@ -3203,6 +3398,74 @@ export class SentinelStore {
     return Number(row["count"] ?? 0);
   }
 
+  getDailyTelegramSummary(
+    walletId: string,
+    startAtUtc: string,
+    endAtUtc: string,
+  ): {
+    discoveries: number;
+    createdTokens: number;
+    migrations: number;
+    buys: number;
+    sells: number;
+    winningSells: number;
+    realizedPnlLamports: string;
+    openPositions: number;
+  } {
+    const events = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+          SUM(CASE WHEN kind = 'TOKEN_CREATED' THEN 1 ELSE 0 END) AS created,
+          SUM(CASE WHEN kind = 'TOKEN_MIGRATED' THEN 1 ELSE 0 END) AS migrations
+         FROM market_events WHERE received_at_utc >= ? AND received_at_utc < ?`,
+      )
+      .get(startAtUtc, endAtUtc) as SqlRow;
+    const fills = this.#db
+      .prepare(
+        `SELECT SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) AS buys,
+          SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) AS sells
+         FROM paper_fills WHERE wallet_id = ? AND filled_at_utc >= ? AND filled_at_utc < ?`,
+      )
+      .get(walletId, startAtUtc, endAtUtc) as SqlRow;
+    const pnlRows = this.#db
+      .prepare(
+        `SELECT pnl_lamports FROM paper_realized_pnl
+         WHERE wallet_id = ? AND filled_at_utc >= ? AND filled_at_utc < ?`,
+      )
+      .all(walletId, startAtUtc, endAtUtc) as SqlRow[];
+    const pnlTotal = pnlRows.reduce(
+      (sum, row) => sum + BigInt(String(row["pnl_lamports"])),
+      0n,
+    );
+    return {
+      discoveries: Number(events["total"] ?? 0),
+      createdTokens: Number(events["created"] ?? 0),
+      migrations: Number(events["migrations"] ?? 0),
+      buys: Number(fills["buys"] ?? 0),
+      sells: Number(fills["sells"] ?? 0),
+      winningSells: pnlRows.filter(
+        (row) => BigInt(String(row["pnl_lamports"])) > 0n,
+      ).length,
+      realizedPnlLamports: pnlTotal.toString(),
+      openPositions: this.getPaperPortfolioState(walletId).positions.length,
+    };
+  }
+
+  enqueueTelegramNotification(input: {
+    eventType: string;
+    dedupeKey: string;
+    payload: Record<string, unknown>;
+    createdAtUtc?: string;
+  }): boolean {
+    if (!this.#telegramEnabled) return false;
+    return this.#enqueueTelegramNotification(
+      input.eventType,
+      input.payload,
+      input.dedupeKey,
+      input.createdAtUtc,
+    );
+  }
+
   getDiscoveryCheckpoint(provider = "pumpportal"): {
     lastSlot: number | null;
     lastSignature: string | null;
@@ -3221,6 +3484,94 @@ export class SentinelStore {
         row["last_event_id"] === null ? null : String(row["last_event_id"]),
       updatedAtUtc: String(row["updated_at_utc"]),
     };
+  }
+
+  #enqueueTelegramNotification(
+    eventType: string,
+    payload: Record<string, unknown>,
+    dedupeKey: string,
+    createdAtUtc = utcNow(),
+    cooldownSeconds = 0,
+  ): boolean {
+    if (!this.#telegramEnabled) return false;
+    if (!/^[A-Z][A-Z0-9_]{1,63}$/.test(eventType))
+      throw new Error("TELEGRAM_EVENT_TYPE_INVALID");
+    if (!dedupeKey || dedupeKey.length > 300)
+      throw new Error("TELEGRAM_DEDUPE_KEY_INVALID");
+    if (cooldownSeconds > 0) {
+      const cooldown = this.#db
+        .prepare(
+          "SELECT allowed_after_utc FROM telegram_alert_cooldowns WHERE alert_key = ?",
+        )
+        .get(dedupeKey.split(":").slice(0, 3).join(":")) as SqlRow | undefined;
+      const alertKey = dedupeKey.split(":").slice(0, 3).join(":");
+      if (
+        cooldown &&
+        Date.parse(String(cooldown["allowed_after_utc"])) >
+          Date.parse(createdAtUtc)
+      )
+        return false;
+      this.#db
+        .prepare(
+          `INSERT INTO telegram_alert_cooldowns(alert_key, allowed_after_utc, updated_at_utc)
+           VALUES (?, ?, ?) ON CONFLICT(alert_key) DO UPDATE SET
+           allowed_after_utc = excluded.allowed_after_utc, updated_at_utc = excluded.updated_at_utc`,
+        )
+        .run(
+          alertKey,
+          new Date(
+            Date.parse(createdAtUtc) + cooldownSeconds * 1000,
+          ).toISOString(),
+          createdAtUtc,
+        );
+    }
+    const result = this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO telegram_outbox
+         (id, dedupe_key, event_type, payload_json, status, attempts, available_at_utc, created_at_utc)
+         VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?)`,
+      )
+      .run(
+        randomUUID(),
+        dedupeKey,
+        eventType,
+        JSON.stringify(payload),
+        createdAtUtc,
+        createdAtUtc,
+      );
+    return Number(result.changes) === 1;
+  }
+
+  #enqueuePaperExitFailure(
+    order: SqlRow,
+    status: string,
+    reasonCode: string,
+    observedAtUtc: string,
+  ): void {
+    if (!this.#telegramEnabled) return;
+    let exitReasonCodes: unknown[] = [];
+    try {
+      const intent = JSON.parse(String(order["intent_json"])) as {
+        reasonCodes?: unknown;
+      };
+      if (Array.isArray(intent.reasonCodes))
+        exitReasonCodes = intent.reasonCodes;
+    } catch {
+      exitReasonCodes = [];
+    }
+    this.#enqueueTelegramNotification(
+      "EXIT_FAILED",
+      {
+        mint: String(order["mint"]),
+        status,
+        reasonCode,
+        exitReasonCodes,
+        retryStatus: "POSITION_MONITOR_RETRY_POLICY",
+        observedAtUtc,
+      },
+      `paper-exit-failed:${String(order["id"])}`,
+      observedAtUtc,
+    );
   }
 
   close(): void {

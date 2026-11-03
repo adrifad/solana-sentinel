@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { loadConfig } from "@sentinel/config";
+import {
+  isTelegramConfigured,
+  loadConfig,
+  loadTelegramRuntimeConfig,
+} from "@sentinel/config";
 
 test("loads safe DRY_RUN defaults without wallet credentials", async () => {
   const loaded = await loadConfig({
@@ -48,4 +52,35 @@ test("rejects unsupported settings and bad ports", async () => {
   );
   await assert.rejects(() => loadConfig({ APP_CONFIG_PATH: capacityFile }));
   await rm(capacityPath, { recursive: true, force: true });
+});
+
+test("Telegram bot stays disabled by default and requires explicit secrets and allowlists", async () => {
+  await loadConfig({ APP_CONFIG_PATH: "config/default.yaml" });
+  assert.equal(loadTelegramRuntimeConfig({}).enabled, false);
+  assert.equal(
+    (await loadConfig({ TELEGRAM_ENABLED: "true" })).config.mode,
+    "DRY_RUN",
+  );
+  assert.equal(isTelegramConfigured({ TELEGRAM_ENABLED: "true" }), false);
+  assert.throws(
+    () => loadTelegramRuntimeConfig({ TELEGRAM_ENABLED: "true" }),
+    /TELEGRAM_BOT_TOKEN is required/,
+  );
+  const enabled = loadTelegramRuntimeConfig({
+    TELEGRAM_ENABLED: "true",
+    TELEGRAM_BOT_TOKEN: "123456:abcdefghijklmnopqrstuvwxyz123456789",
+    TELEGRAM_CHAT_ID: "-1001234567890",
+    TELEGRAM_ALLOWED_USER_IDS: "12345, 67890,12345",
+  });
+  assert.deepEqual(enabled.allowedUserIds, ["12345", "67890"]);
+  assert.equal(enabled.chatId, "-1001234567890");
+  assert.throws(
+    () =>
+      loadTelegramRuntimeConfig({
+        TELEGRAM_ENABLED: "true",
+        TELEGRAM_BOT_TOKEN: "123456:abcdefghijklmnopqrstuvwxyz123456789",
+        TELEGRAM_CHAT_ID: "-1001234567890",
+      }),
+    /TELEGRAM_ALLOWED_USER_IDS/,
+  );
 });

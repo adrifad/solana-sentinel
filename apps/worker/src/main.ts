@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { loadConfig } from "@sentinel/config";
+import { createHash, randomUUID } from "node:crypto";
+import { isTelegramConfigured, loadConfig } from "@sentinel/config";
 import { utcNow } from "@sentinel/domain";
 import type { ProviderHealth } from "@sentinel/domain";
 import {
@@ -24,7 +24,9 @@ import { log } from "./logger.ts";
 async function main(): Promise<void> {
   const command = process.argv[2] ?? "help";
   const loaded = await loadConfig();
-  const store = new SentinelStore(loaded.dbPath);
+  const store = new SentinelStore(loaded.dbPath, {
+    telegramEnabled: isTelegramConfigured(process.env),
+  });
   await store.open();
 
   if (command === "migrate") {
@@ -142,7 +144,18 @@ async function main(): Promise<void> {
           ...(helius ? { helius } : {}),
         })
       : undefined;
-  if (paper) await paper.start();
+  const paperRecovery = paper ? await paper.start() : null;
+  if (isTelegramConfigured(process.env))
+    store.enqueueTelegramNotification({
+      eventType: "WORKER_RESTART",
+      dedupeKey: `worker-start:${randomUUID()}`,
+      payload: {
+        mode: loaded.config.mode,
+        recoveredPaperOrders: paperRecovery?.recoveredOrderCount ?? 0,
+        openPositions: paperRecovery?.openPositionCount ?? 0,
+        observedAtUtc: utcNow(),
+      },
+    });
 
   const analysis = new TokenAnalysisScheduler({
     store,

@@ -67,6 +67,12 @@ pnpm lint
 
 Set `PUMPPORTAL_API_KEY` in the process environment to start discovery. `HELIUS_API_KEY` enables on-chain creator history, security analysis, and read-only quotes. `APP_MODE=PAPER` starts the virtual PAPER runtime; `LIVE` is rejected. `PAPER_OPERATOR_TOKEN` (minimum 32 characters) is required for manual entry/exit API writes. Compose passes the same `APP_MODE` to API and worker, defaults it to `DRY_RUN`, and publishes the API on loopback. `paper.automatic_entries_enabled` and `providers.helius.enable_trade_stream` default to `false`. Enabling the stream does not establish complete coverage or enable paid PumpPortal feeds. See [implementation status](docs/IMPLEMENTATION-STATUS.md) for startup and integration limits.
 
+## Optional Telegram monitoring bot
+
+`apps/telegram-bot` runs as a separate, read-only process. It reads status and portfolio data through the internal API and delivers persisted notifications from SQLite. Fill notifications are added in the same transaction as the virtual fill; delivery is retryable, but Telegram does not provide exactly-once delivery if a send succeeds and its response is lost. The bot cannot submit orders, change configuration, or access signing keys.
+
+Telegram is disabled by default and has no published port. To configure it, create a bot with BotFather, set `TELEGRAM_ENABLED=true`, `TELEGRAM_BOT_TOKEN`, one permitted `TELEGRAM_CHAT_ID`, and a comma-separated `TELEGRAM_ALLOWED_USER_IDS` list in `.env`. The bot rejects all users and chats outside those explicit lists and never auto-registers a first user. Start it explicitly with `docker compose --profile telegram up -d telegram-bot`; normal worker/API startup does not activate it. It checks `getWebhookInfo` before polling and will not remove an existing webhook; if a webhook is configured, resolve that operator-owned setting before starting long polling. Commands are read-only: `/status`, `/portfolio`, `/positions`, `/trades`, `/pnl`, and `/health`. `/start` and `/help` describe the service. Do not publish the bot's internal health endpoint or the API outside the protected host boundary.
+
 ## Non-negotiable invariants
 
 1. `DRY_RUN`/`PAPER` must have **zero capability** to sign or submit transactions.

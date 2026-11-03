@@ -205,7 +205,49 @@ export type RuntimeEnvironment = {
   API_HOST?: string;
   API_PORT?: string;
   PAPER_OPERATOR_TOKEN?: string;
+  TELEGRAM_ENABLED?: string;
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
+  TELEGRAM_ALLOWED_USER_IDS?: string;
+  API_INTERNAL_URL?: string;
 };
+
+export type TelegramRuntimeConfig = {
+  enabled: boolean;
+  botToken: string | undefined;
+  chatId: string | undefined;
+  allowedUserIds: string[];
+  apiInternalUrl: string;
+};
+
+const TelegramEnvironmentSchema = z
+  .object({
+    enabled: z.enum(["true", "false"]),
+    botToken: z.string().trim().max(256),
+    chatId: z
+      .string()
+      .trim()
+      .regex(/^(?:-?\d{1,20})?$/),
+    allowedUserIds: z
+      .string()
+      .trim()
+      .max(4096)
+      .regex(/^(?:\s*-?\d{1,20}\s*(?:,\s*-?\d{1,20}\s*)*)?$/),
+    apiInternalUrl: z
+      .string()
+      .url()
+      .refine((value) => {
+        const url = new URL(value);
+        return (
+          ["http:", "https:"].includes(url.protocol) &&
+          !url.username &&
+          !url.password &&
+          !url.search &&
+          !url.hash
+        );
+      }),
+  })
+  .strict();
 
 export type LoadedConfig = {
   config: AppConfig;
@@ -267,4 +309,60 @@ export async function loadConfig(
     apiPort: port,
     paperOperatorToken,
   };
+}
+
+function normalizeTelegramId(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  if (!/^-?\d{1,20}$/.test(normalized))
+    throw new Error("Telegram chat and user IDs must be decimal integers");
+  return normalized;
+}
+
+export function loadTelegramRuntimeConfig(
+  env: RuntimeEnvironment = process.env,
+): TelegramRuntimeConfig {
+  const parsed = TelegramEnvironmentSchema.safeParse({
+    enabled: env.TELEGRAM_ENABLED ?? "false",
+    botToken: env.TELEGRAM_BOT_TOKEN ?? "",
+    chatId: env.TELEGRAM_CHAT_ID ?? "",
+    allowedUserIds: env.TELEGRAM_ALLOWED_USER_IDS ?? "",
+    apiInternalUrl: env.API_INTERNAL_URL ?? "http://api:8787",
+  });
+  if (!parsed.success) throw new Error("TELEGRAM_CONFIGURATION_INVALID");
+  const enabled = parsed.data.enabled === "true";
+  const botToken = parsed.data.botToken || undefined;
+  const chatId = parsed.data.chatId || undefined;
+  const allowedUserIds = parsed.data.allowedUserIds
+    .split(",")
+    .map((value) => normalizeTelegramId(value))
+    .filter((value): value is string => value !== undefined);
+  const apiUrl = new URL(parsed.data.apiInternalUrl);
+  if (enabled) {
+    if (!botToken || botToken.length < 20)
+      throw new Error(
+        "TELEGRAM_BOT_TOKEN is required when Telegram is enabled",
+      );
+    if (!chatId)
+      throw new Error("TELEGRAM_CHAT_ID is required when Telegram is enabled");
+    if (allowedUserIds.length === 0)
+      throw new Error(
+        "TELEGRAM_ALLOWED_USER_IDS must contain at least one ID when Telegram is enabled",
+      );
+  }
+  return {
+    enabled,
+    botToken,
+    chatId,
+    allowedUserIds: [...new Set(allowedUserIds)],
+    apiInternalUrl: apiUrl.toString().replace(/\/$/, ""),
+  };
+}
+
+export function isTelegramConfigured(env: RuntimeEnvironment): boolean {
+  try {
+    return loadTelegramRuntimeConfig(env).enabled;
+  } catch {
+    return false;
+  }
 }

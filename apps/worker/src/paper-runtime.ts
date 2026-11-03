@@ -63,7 +63,10 @@ export class PaperRuntime {
     });
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<{
+    recoveredOrderCount: number;
+    openPositionCount: number;
+  }> {
     const wallet = this.#engine.initializeWallet(
       this.#walletId,
       this.#config.paper.initial_sol,
@@ -113,6 +116,11 @@ export class PaperRuntime {
       () => void this.#processManualRequest(),
       250,
     );
+    return {
+      recoveredOrderCount: recovered.length,
+      openPositionCount: this.#store.getPaperPortfolioState(this.#walletId)
+        .positions.length,
+    };
   }
 
   async stop(): Promise<void> {
