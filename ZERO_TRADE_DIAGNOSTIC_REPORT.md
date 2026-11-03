@@ -86,7 +86,9 @@
 ## Source revision and delivery
 
 - Base revision: `cb3ab1075716f246ee52531f4343cc0e73ac76f3` (`main` matched `origin/main` before edits).
-- New commit SHA: none. The workspace permissions expose `.git` as read-only, and the changes remain uncommitted in the worktree. The connected GitHub integration also rejected Git blob creation with HTTP 403 `Resource not accessible by integration`. No push or deployment was performed.
+- Implementation commit: `92baeb6475da463cfabe0b389cd38c8f9023a594`, pushed to `main`.
+- GitHub CI: not verified. The commit combined-status query returned no statuses, and the unauthenticated Actions API request was rate-limited. This does not prove that a workflow passed or failed.
+- Deployment: not performed. The deployment checkout and Docker Compose executable were unavailable; no production database or service was touched.
 
 ## Remaining actions before automatic PAPER entries
 
