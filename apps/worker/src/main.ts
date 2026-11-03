@@ -75,17 +75,28 @@ async function main(): Promise<void> {
       requestTimeoutMs: loaded.config.providers.helius.request_timeout_ms,
       maxRequestsPerSecond:
         loaded.config.providers.helius.max_requests_per_second,
-      consumeRequestBudget: () =>
+      consumeRequestBudget: ({ priority }) =>
         store.tryConsumeHeliusRequest(
           loaded.config.providers.helius.max_requests_per_utc_day,
+          loaded.config.providers.helius.exit_reserved_requests_per_utc_day,
+          priority,
         ),
+      recordRequestOutcome: (request) =>
+        store.recordHeliusRequestOutcome(request),
     });
     const health = await helius.getHealth();
     heliusState = health.ok ? "HEALTHY" : "DEGRADED";
     heliusError = health.errorCode;
+    const budget = store.getHeliusRequestBudget(
+      loaded.config.providers.helius.max_requests_per_utc_day,
+      loaded.config.providers.helius.exit_reserved_requests_per_utc_day,
+    );
     log(health.ok ? "info" : "warn", "provider.helius.health", {
       ok: health.ok,
       errorCode: health.errorCode,
+      internalRequestBudgetUsed: budget.used,
+      internalRequestBudgetRemaining: budget.remaining,
+      reservedForExitRequests: budget.reservedForExits,
     });
   }
   store.setProviderHealth({
@@ -122,16 +133,6 @@ async function main(): Promise<void> {
       errorCode: "JUPITER_API_KEY_MISSING",
     });
 
-  const analysis = new TokenAnalysisScheduler({
-    store,
-    helius,
-    jupiter,
-    config: loaded.config,
-    configVersion: loaded.configVersion,
-    concurrency: loaded.config.analysis.concurrent_token_analysis,
-  });
-  analysis.start();
-
   const paper =
     loaded.config.mode === "PAPER"
       ? new PaperRuntime({
@@ -142,6 +143,19 @@ async function main(): Promise<void> {
         })
       : undefined;
   if (paper) await paper.start();
+
+  const analysis = new TokenAnalysisScheduler({
+    store,
+    helius,
+    jupiter,
+    config: loaded.config,
+    configVersion: loaded.configVersion,
+    concurrency: loaded.config.analysis.concurrent_token_analysis,
+    onDecisionPersisted: () => {
+      if (paper) void paper.wakeEntries();
+    },
+  });
+  analysis.start();
 
   const tradeCoverageSource = "helius_logs:pump-sdk-4.1.0+pump-swap-sdk-2.1.0";
   const pumpSwapStateLoader = helius
@@ -412,6 +426,7 @@ async function main(): Promise<void> {
         event,
         loaded.config.providers.pumpportal.max_monitored_tokens,
         Boolean(helius),
+        loaded.config.providers.pumpportal.monitoring_duration_seconds,
       );
       log(
         "info",

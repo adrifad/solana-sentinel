@@ -60,6 +60,37 @@ test("PAPER runtime initializes and recovers only virtual wallet state without q
   }
 });
 
+test("automatic entry scheduler wakes independently from the position monitor", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-paper-entry-wake-"));
+  const store = new SentinelStore(join(directory, "paper.db"));
+  await store.open();
+  const config = (await loadConfig({ APP_MODE: "PAPER" })).config;
+  config.paper.automatic_entries_enabled = true;
+  let tokenScans = 0;
+  const listTokens = store.listTokens.bind(store);
+  store.listTokens = ((...args: Parameters<typeof store.listTokens>) => {
+    tokenScans += 1;
+    return listTokens(...args);
+  }) as typeof store.listTokens;
+  const runtime = new PaperRuntime({
+    store,
+    config,
+    configVersion: "c".repeat(64),
+  });
+  try {
+    await runtime.start();
+    tokenScans = 0;
+    await runtime.tick();
+    assert.equal(tokenScans, 0);
+    await runtime.wakeEntries("TEST_DECISION_PERSISTED");
+    assert.equal(tokenScans, 1);
+  } finally {
+    await runtime.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("PAPER runtime monitors a fixture-backed position and settles a virtual take-profit exit", async () => {
   const directory = await mkdtemp(
     join(tmpdir(), "sentinel-paper-exit-runtime-"),

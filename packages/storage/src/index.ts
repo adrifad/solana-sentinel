@@ -123,6 +123,7 @@ export class SentinelStore {
       "010-trade-evidence.sql",
       "011-manual-paper-requests.sql",
       "012-manual-paper-request-expiry.sql",
+      "013-monitoring-leases.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -164,6 +165,7 @@ export class SentinelStore {
     input: MarketEvent,
     maxMonitoredTokens: number,
     heliusEnabled = false,
+    monitoringLeaseSeconds = 120,
   ): {
     inserted: boolean;
     monitoringEligible: boolean;
@@ -180,12 +182,18 @@ export class SentinelStore {
       if (existing) {
         this.#recordEventConflict(existing, event);
         const token = this.#db
-          .prepare("SELECT monitoring_eligible FROM tokens WHERE mint = ?")
+          .prepare(
+            "SELECT monitoring_eligible, monitoring_lease_until_utc FROM tokens WHERE mint = ?",
+          )
           .get(event.mint) as SqlRow | undefined;
         this.#db.exec("COMMIT");
         return {
           inserted: false,
-          monitoringEligible: token?.["monitoring_eligible"] === 1,
+          monitoringEligible:
+            token?.["monitoring_eligible"] === 1 &&
+            typeof token["monitoring_lease_until_utc"] === "string" &&
+            Date.parse(String(token["monitoring_lease_until_utc"])) >
+              Date.now(),
           ingestionLatencyMs: Math.max(
             0,
             Date.now() - Date.parse(event.receivedAtUtc),
@@ -194,17 +202,27 @@ export class SentinelStore {
       }
 
       const known = this.#db
-        .prepare("SELECT monitoring_eligible FROM tokens WHERE mint = ?")
+        .prepare(
+          "SELECT monitoring_eligible, monitoring_lease_until_utc FROM tokens WHERE mint = ?",
+        )
         .get(event.mint) as SqlRow | undefined;
-      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const nowUtc = utcNow();
       const monitoredToday = this.#db
         .prepare(
-          "SELECT COUNT(*) AS count FROM tokens WHERE monitoring_eligible = 1 AND first_seen_at_utc >= ?",
+          "SELECT COUNT(*) AS count FROM tokens WHERE monitoring_eligible = 1 AND monitoring_lease_until_utc > ?",
         )
-        .get(cutoff) as SqlRow;
+        .get(nowUtc) as SqlRow;
+      const knownLeaseActive =
+        known?.["monitoring_eligible"] === 1 &&
+        typeof known["monitoring_lease_until_utc"] === "string" &&
+        Date.parse(String(known["monitoring_lease_until_utc"])) > Date.now();
       const eligible = known
-        ? known["monitoring_eligible"] === 1
+        ? knownLeaseActive ||
+          Number(monitoredToday["count"] ?? 0) < maxMonitoredTokens
         : Number(monitoredToday["count"] ?? 0) < maxMonitoredTokens;
+      const leaseUntilUtc = eligible
+        ? new Date(Date.now() + monitoringLeaseSeconds * 1000).toISOString()
+        : null;
       const ingestionLatencyMs = Math.max(
         0,
         Date.now() - Date.parse(event.receivedAtUtc),
@@ -256,8 +274,8 @@ export class SentinelStore {
       this.#db
         .prepare(
           `INSERT INTO tokens
-        (mint, first_seen_at_utc, last_seen_at_utc, created_slot, creator, launch_initiator, migration_slot, market_phase, name, symbol, uri, monitoring_eligible, event_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        (mint, first_seen_at_utc, last_seen_at_utc, created_slot, creator, launch_initiator, migration_slot, market_phase, name, symbol, uri, monitoring_eligible, event_count, monitoring_lease_until_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(mint) DO UPDATE SET
           first_seen_at_utc = MIN(tokens.first_seen_at_utc, excluded.first_seen_at_utc),
           last_seen_at_utc = MAX(tokens.last_seen_at_utc, excluded.last_seen_at_utc),
@@ -277,6 +295,8 @@ export class SentinelStore {
           migration_slot = COALESCE(tokens.migration_slot, excluded.migration_slot),
           market_phase = CASE WHEN tokens.market_phase = 'MIGRATED_UNKNOWN_VENUE' OR excluded.market_phase = 'MIGRATED_UNKNOWN_VENUE' THEN 'MIGRATED_UNKNOWN_VENUE' ELSE tokens.market_phase END,
           name = COALESCE(tokens.name, excluded.name), symbol = COALESCE(tokens.symbol, excluded.symbol), uri = COALESCE(tokens.uri, excluded.uri),
+          monitoring_eligible = excluded.monitoring_eligible,
+          monitoring_lease_until_utc = COALESCE(excluded.monitoring_lease_until_utc, tokens.monitoring_lease_until_utc),
           event_count = tokens.event_count + 1`,
         )
         .run(
@@ -294,6 +314,7 @@ export class SentinelStore {
           event.symbol ?? null,
           event.uri ?? null,
           eligible ? 1 : 0,
+          leaseUntilUtc,
         );
       if (eligible && heliusEnabled && event.kind === "TOKEN_CREATED") {
         const now = utcNow();
@@ -364,7 +385,7 @@ export class SentinelStore {
   } | null {
     const row = this.#db
       .prepare(
-        `SELECT e.mint, e.kind, e.signature, e.slot, e.received_at_utc, t.creator, t.launch_initiator, t.monitoring_eligible,
+        `SELECT e.mint, e.kind, e.signature, e.slot, e.received_at_utc, t.creator, t.launch_initiator, t.monitoring_eligible, t.monitoring_lease_until_utc,
         j.status AS migration_recovery_status
         FROM market_events e JOIN tokens t USING(mint) LEFT JOIN migration_recovery_jobs j ON j.event_id = e.id WHERE e.id = ?`,
       )
@@ -382,7 +403,7 @@ export class SentinelStore {
             row["launch_initiator"] === null
               ? null
               : String(row["launch_initiator"]),
-          monitoringEligible: row["monitoring_eligible"] === 1,
+          monitoringEligible: isMonitoringLeaseActive(row),
           migrationRecoveryStatus:
             row["migration_recovery_status"] === null
               ? null
@@ -451,8 +472,29 @@ export class SentinelStore {
       .run(status, slot, owner, errorCode, mint);
   }
 
-  tryConsumeHeliusRequest(maxRequestsPerUtcDay: number): boolean {
+  tryConsumeHeliusRequest(
+    maxRequestsPerUtcDay: number,
+    exitReservedRequestsPerUtcDay = 0,
+    priority:
+      | "EXIT"
+      | "RISK"
+      | "CANDIDATE"
+      | "SECURITY"
+      | "CREATOR"
+      | "BACKGROUND" = "BACKGROUND",
+  ): boolean {
     const utcDay = utcNow().slice(0, 10);
+    if (
+      !Number.isSafeInteger(maxRequestsPerUtcDay) ||
+      !Number.isSafeInteger(exitReservedRequestsPerUtcDay) ||
+      exitReservedRequestsPerUtcDay < 0 ||
+      exitReservedRequestsPerUtcDay > maxRequestsPerUtcDay
+    )
+      throw new Error("HELIUS_REQUEST_BUDGET_CONFIG_INVALID");
+    const admissionLimit =
+      priority === "EXIT" || priority === "RISK"
+        ? maxRequestsPerUtcDay
+        : maxRequestsPerUtcDay - exitReservedRequestsPerUtcDay;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db
@@ -465,13 +507,90 @@ export class SentinelStore {
           `UPDATE helius_request_budget SET requests_used = requests_used + 1
           WHERE utc_day = ? AND requests_used < ?`,
         )
-        .run(utcDay, maxRequestsPerUtcDay);
+        .run(utcDay, admissionLimit);
       this.#db.exec("COMMIT");
       return Number(result.changes) === 1;
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  recordHeliusRequestOutcome(input: {
+    method: string;
+    priority:
+      "EXIT" | "RISK" | "CANDIDATE" | "SECURITY" | "CREATOR" | "BACKGROUND";
+    component: string;
+    purpose: string;
+    subjectMint: string | null;
+    attempt: number;
+    outcome: "SUCCEEDED" | "FAILED" | "BUDGET_BLOCKED";
+    errorCode: string | null;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO helius_rpc_request_history
+        (utc_day, method, priority, component, purpose, subject_mint, attempt, outcome, error_code, observed_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        utcNow().slice(0, 10),
+        input.method,
+        input.priority,
+        input.component,
+        input.purpose,
+        input.subjectMint,
+        input.attempt,
+        input.outcome,
+        input.errorCode,
+        utcNow(),
+      );
+  }
+
+  getHeliusRequestBudget(
+    maxRequestsPerUtcDay: number,
+    exitReservedRequestsPerUtcDay: number,
+  ): {
+    utcDay: string;
+    used: number;
+    remaining: number;
+    reservedForExits: number;
+    exitRequestsUsed: number;
+    byMethod: Array<{ method: string; requests: number; failures: number }>;
+  } {
+    const utcDay = utcNow().slice(0, 10);
+    const aggregate = this.#db
+      .prepare(
+        "SELECT requests_used FROM helius_request_budget WHERE utc_day = ?",
+      )
+      .get(utcDay) as SqlRow | undefined;
+    const methods = this.#db
+      .prepare(
+        `SELECT method,
+          SUM(CASE WHEN outcome != 'BUDGET_BLOCKED' THEN 1 ELSE 0 END) AS requests,
+          SUM(CASE WHEN outcome = 'FAILED' OR outcome = 'BUDGET_BLOCKED' THEN 1 ELSE 0 END) AS failures
+        FROM helius_rpc_request_history WHERE utc_day = ?
+        GROUP BY method ORDER BY requests DESC, method`,
+      )
+      .all(utcDay) as SqlRow[];
+    const exitUsage = this.#db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM helius_rpc_request_history WHERE utc_day = ? AND priority = 'EXIT' AND outcome != 'BUDGET_BLOCKED'",
+      )
+      .get(utcDay) as SqlRow;
+    const used = Number(aggregate?.["requests_used"] ?? 0);
+    return {
+      utcDay,
+      used,
+      remaining: Math.max(0, maxRequestsPerUtcDay - used),
+      reservedForExits: exitReservedRequestsPerUtcDay,
+      exitRequestsUsed: Number(exitUsage["count"] ?? 0),
+      byMethod: methods.map((row) => ({
+        method: String(row["method"]),
+        requests: Number(row["requests"]),
+        failures: Number(row["failures"] ?? 0),
+      })),
+    };
   }
 
   tryConsumeJupiterRequest(maxRequestsPerUtcDay: number): boolean {
@@ -557,7 +676,7 @@ export class SentinelStore {
       const now = utcNow();
       const row = this.#db
         .prepare(
-          `SELECT j.event_id, j.mint, j.signature, j.attempts, e.provider_slot, t.monitoring_eligible
+          `SELECT j.event_id, j.mint, j.signature, j.attempts, e.provider_slot, t.monitoring_eligible, t.monitoring_lease_until_utc
           FROM migration_recovery_jobs j JOIN market_events e ON e.id = j.event_id
           JOIN tokens t ON t.mint = j.mint
           WHERE j.status = 'PENDING' AND j.next_attempt_at_utc <= ?
@@ -585,7 +704,7 @@ export class SentinelStore {
               row["provider_slot"] === null
                 ? null
                 : Number(row["provider_slot"]),
-            monitoringEligible: row["monitoring_eligible"] === 1,
+            monitoringEligible: isMonitoringLeaseActive(row),
             attempts: Number(row["attempts"]) + 1,
           }
         : null;
@@ -3155,9 +3274,18 @@ function mapToken(row: SqlRow): StoredToken {
       row["mint_state_error_code"] === null
         ? null
         : String(row["mint_state_error_code"]),
-    monitoringEligible: row["monitoring_eligible"] === 1,
+    monitoringEligible: isMonitoringLeaseActive(row),
     eventCount: Number(row["event_count"]),
   };
+}
+
+function isMonitoringLeaseActive(row: SqlRow): boolean {
+  const leaseUntil = row["monitoring_lease_until_utc"];
+  return (
+    row["monitoring_eligible"] === 1 &&
+    typeof leaseUntil === "string" &&
+    Date.parse(leaseUntil) > Date.now()
+  );
 }
 
 function mapPaperOrder(row: SqlRow) {

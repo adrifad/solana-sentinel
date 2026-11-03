@@ -30,6 +30,8 @@ export class PaperRuntime {
   #timer: ReturnType<typeof setInterval> | undefined;
   #manualTimer: ReturnType<typeof setInterval> | undefined;
   #busy = false;
+  #entryBusy = false;
+  #entryWakePending = false;
   #manualBusy = false;
   #stopping = false;
   #initialBalanceMatches = true;
@@ -101,6 +103,8 @@ export class PaperRuntime {
       }
     }
     await this.tick();
+    if (this.#config.paper.automatic_entries_enabled)
+      await this.wakeEntries("STARTUP_RECOVERY");
     this.#timer = setInterval(
       () => void this.tick(),
       this.#config.paper.position_monitor_interval_ms,
@@ -115,7 +119,7 @@ export class PaperRuntime {
     this.#stopping = true;
     if (this.#timer) clearInterval(this.#timer);
     if (this.#manualTimer) clearInterval(this.#manualTimer);
-    while (this.#busy || this.#manualBusy)
+    while (this.#busy || this.#manualBusy || this.#entryBusy)
       await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
@@ -128,14 +132,35 @@ export class PaperRuntime {
           await this.#engine.recoverPendingOrders(100, true),
         );
       await this.#monitorPositions();
-      if (this.#config.paper.automatic_entries_enabled)
-        await this.#considerEntries();
     } catch (error) {
       log("error", "paper.runtime.tick_failed", {
         errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
       });
     } finally {
       this.#busy = false;
+    }
+  }
+
+  /** Notify the independent entry scheduler after a decision is durably saved. */
+  async wakeEntries(trigger = "DECISION_PERSISTED"): Promise<void> {
+    if (this.#stopping || !this.#config.paper.automatic_entries_enabled) return;
+    if (this.#entryBusy) {
+      this.#entryWakePending = true;
+      return;
+    }
+    this.#entryBusy = true;
+    try {
+      do {
+        this.#entryWakePending = false;
+        await this.#considerEntries();
+      } while (this.#entryWakePending && !this.#stopping);
+    } catch (error) {
+      log("error", "paper.entry_scheduler.failed", {
+        trigger,
+        errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+      });
+    } finally {
+      this.#entryBusy = false;
     }
   }
 

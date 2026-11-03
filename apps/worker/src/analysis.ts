@@ -51,6 +51,9 @@ export type AnalysisOptions = {
   config: AppConfig;
   configVersion: string;
   concurrency: number;
+  onDecisionPersisted?: (
+    decision: ReturnType<typeof evaluateRiskDecision>,
+  ) => void;
   now?: () => number;
 };
 
@@ -76,6 +79,7 @@ export class TokenAnalysisScheduler {
   readonly #config: AppConfig;
   readonly #configVersion: string;
   readonly #concurrency: number;
+  readonly #onDecisionPersisted: AnalysisOptions["onDecisionPersisted"];
   readonly #now: () => number;
   readonly #active = new Set<Promise<void>>();
   readonly #walletRefreshLocks = new Map<string, Promise<void>>();
@@ -101,6 +105,7 @@ export class TokenAnalysisScheduler {
     this.#config = options.config;
     this.#configVersion = options.configVersion;
     this.#concurrency = options.concurrency;
+    this.#onDecisionPersisted = options.onDecisionPersisted;
     this.#now = options.now ?? Date.now;
   }
 
@@ -361,6 +366,15 @@ export class TokenAnalysisScheduler {
       this.#now(),
     );
     this.#store.saveRiskDecision(decision);
+    try {
+      this.#onDecisionPersisted?.(decision);
+    } catch (error) {
+      log("error", "analysis.decision_notification_failed", {
+        mint: job.mint,
+        decisionId: decision.id,
+        errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+      });
+    }
     if (decision.status === "BUY_ELIGIBLE") {
       this.#store.saveDryRunTradeIntent({
         id: `dry-run:${decision.id}:BUY`,
@@ -476,7 +490,7 @@ export class TokenAnalysisScheduler {
     const inputAmountRaw = solToLamports(this.#config.risk.max_trade_sol);
     const requestedAtUtc = new Date(this.#now()).toISOString();
     if (marketPhase === "MIGRATED_PUMPSWAP" && this.#pumpSwapState) {
-      const loaded = await this.#pumpSwapState.load(mint);
+      const loaded = await this.#pumpSwapState.load(mint, "CANDIDATE");
       if (loaded.status !== "SUPPORTED") {
         log("warn", "analysis.pumpswap_state_unavailable", {
           mint,
@@ -515,7 +529,7 @@ export class TokenAnalysisScheduler {
       return { buy, sell };
     }
     if (marketPhase === "PUMP_CURVE" && this.#pumpCurveState) {
-      const loaded = await this.#pumpCurveState.load(mint);
+      const loaded = await this.#pumpCurveState.load(mint, "CANDIDATE");
       if (loaded.status !== "SUPPORTED") {
         log("warn", "analysis.pump_curve_state_unavailable", {
           mint,

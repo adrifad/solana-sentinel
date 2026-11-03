@@ -30,6 +30,7 @@ export const AppConfigSchema = z
             request_timeout_ms: z.number().int().min(100).max(30000),
             max_requests_per_second: z.number().int().min(1).max(1000),
             max_requests_per_utc_day: positiveInt,
+            exit_reserved_requests_per_utc_day: z.number().int().nonnegative(),
             max_concurrent_enrichments: z.number().int().min(1).max(32),
             enable_trade_stream: z.boolean(),
             max_active_trade_subscriptions: z.number().int().min(1).max(5000),
@@ -160,6 +161,16 @@ export const AppConfigSchema = z
   })
   .strict()
   .superRefine((config, context) => {
+    if (
+      config.providers.helius.exit_reserved_requests_per_utc_day >
+      config.providers.helius.max_requests_per_utc_day
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["providers", "helius", "exit_reserved_requests_per_utc_day"],
+        message:
+          "exit RPC reserve must not exceed the daily Helius request cap",
+      });
     const orderSize = solAmountLamports(config.paper.order_size_sol);
     const maxTrade = solAmountLamports(config.risk.max_trade_sol);
     if (orderSize <= 0n || orderSize > maxTrade)

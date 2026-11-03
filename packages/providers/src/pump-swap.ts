@@ -30,7 +30,11 @@ import type {
   QuoteRequest,
   QuoteResult,
 } from "@sentinel/domain";
-import type { HeliusAccount, HeliusRpcClient } from "./helius.ts";
+import type {
+  HeliusAccount,
+  HeliusRequestPriority,
+  HeliusRpcClient,
+} from "./helius.ts";
 
 const TOKEN_PROGRAM_IDS = new Set([
   TOKEN_PROGRAM_ID.toBase58(),
@@ -97,7 +101,10 @@ export class PumpSwapStateLoader {
     this.#onRawSnapshot = options.onRawSnapshot;
   }
 
-  async load(mintInput: string): Promise<PumpSwapStateResult> {
+  async load(
+    mintInput: string,
+    priority: HeliusRequestPriority = "CANDIDATE",
+  ): Promise<PumpSwapStateResult> {
     const parsedMint = PubkeySchema.safeParse(mintInput);
     if (!parsedMint.success)
       return { status: "UNSAFE", reasonCode: "MALFORMED_PROVIDER_DATA" };
@@ -110,7 +117,11 @@ export class PumpSwapStateLoader {
         PUMP_AMM_FEE_CONFIG_PDA.toBase58(),
         mint.toBase58(),
       ];
-      const first = await this.#helius.getMultipleAccounts(firstAddresses);
+      const first = await this.#helius.getMultipleAccounts(
+        firstAddresses,
+        priority,
+        mint.toBase58(),
+      );
       const [poolAccount, globalAccount, feeAccount, mintAccount] =
         first.accounts;
       if (!poolAccount || !globalAccount || !feeAccount || !mintAccount)
@@ -142,7 +153,11 @@ export class PumpSwapStateLoader {
         pool.poolBaseTokenAccount.toBase58(),
         pool.poolQuoteTokenAccount.toBase58(),
       ];
-      const second = await this.#helius.getMultipleAccounts(secondAddresses);
+      const second = await this.#helius.getMultipleAccounts(
+        secondAddresses,
+        priority,
+        mint.toBase58(),
+      );
       const [baseVault, quoteVault] = second.accounts;
       if (!baseVault || !quoteVault)
         return { status: "MISSING", reasonCode: "STATE_MISSING" };

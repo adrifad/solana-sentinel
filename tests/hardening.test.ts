@@ -44,6 +44,40 @@ test("Helius request budget rejects before network access", async () => {
   assert.equal(fetchCount, 0);
 });
 
+test("Helius daily budget reserves capacity for exit quotes and reports method usage", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-helius-priority-"));
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  try {
+    for (let index = 0; index < 8; index += 1)
+      assert.equal(store.tryConsumeHeliusRequest(10, 2, "BACKGROUND"), true);
+    assert.equal(store.tryConsumeHeliusRequest(10, 2, "CANDIDATE"), false);
+    assert.equal(store.tryConsumeHeliusRequest(10, 2, "EXIT"), true);
+    store.recordHeliusRequestOutcome({
+      method: "getMultipleAccounts",
+      priority: "EXIT",
+      component: "paper_position_monitor",
+      purpose: "risk_reducing_exit_quote",
+      subjectMint: "So11111111111111111111111111111111111111112",
+      attempt: 1,
+      outcome: "SUCCEEDED",
+      errorCode: null,
+    });
+    assert.equal(store.tryConsumeHeliusRequest(10, 2, "EXIT"), true);
+    assert.equal(store.tryConsumeHeliusRequest(10, 2, "EXIT"), false);
+    const budget = store.getHeliusRequestBudget(10, 2);
+    assert.equal(budget.used, 10);
+    assert.equal(budget.remaining, 0);
+    assert.equal(budget.exitRequestsUsed, 1);
+    assert.deepEqual(budget.byMethod, [
+      { method: "getMultipleAccounts", requests: 1, failures: 0 },
+    ]);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("PumpPortal frame classes persist bounded sanitized provider errors", async () => {
   const event = classifyPumpPortalFrame({
     txType: "create",

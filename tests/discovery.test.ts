@@ -200,6 +200,44 @@ test("persists unique events, preserves migration phase on out-of-order launch, 
   }
 });
 
+test("monitoring slots expire and admit later candidates without dropping discovery history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-monitoring-lease-"));
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  try {
+    const firstMint = "So11111111111111111111111111111111111111112";
+    const secondMint = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const first = parsePumpPortalMessage({ txType: "create", mint: firstMint });
+    const second = parsePumpPortalMessage({
+      txType: "create",
+      mint: secondMint,
+    });
+    assert.equal(
+      store.ingestEvent(first, 1, false, 1).monitoringEligible,
+      true,
+    );
+    assert.equal(
+      store.ingestEvent(second, 1, false, 1).monitoringEligible,
+      false,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const renewed = parsePumpPortalMessage({
+      txType: "create",
+      mint: secondMint,
+      slot: 123456,
+    });
+    assert.equal(
+      store.ingestEvent(renewed, 1, false, 30).monitoringEligible,
+      true,
+    );
+    assert.equal(store.eventCount(), 3);
+    assert.equal(store.getToken(firstMint)?.monitoringEligible, false);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("applies the mint-state migration to an existing version-one database", async () => {
   const dir = await mkdtemp(join(tmpdir(), "sentinel-upgrade-"));
   const dbPath = join(dir, "legacy.db");

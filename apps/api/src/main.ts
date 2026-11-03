@@ -10,6 +10,10 @@ const server = createApiServer({
   mode: config.config.mode,
   staleFeedSeconds: config.config.observability.health_stale_feed_seconds,
   tradeStreamEnabled: config.config.providers.helius.enable_trade_stream,
+  heliusMaxRequestsPerUtcDay:
+    config.config.providers.helius.max_requests_per_utc_day,
+  heliusExitReservedRequestsPerUtcDay:
+    config.config.providers.helius.exit_reserved_requests_per_utc_day,
   automaticEntriesEnabled: config.config.paper.automatic_entries_enabled,
   paperWalletId: config.config.paper.wallet_id,
   ...(config.paperOperatorToken

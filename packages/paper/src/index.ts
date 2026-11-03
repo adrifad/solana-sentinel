@@ -680,7 +680,10 @@ export class PumpVenuePaperQuoteProvider implements PaperQuoteProvider {
       ).toISOString(),
     });
     if (phase === "PUMP_CURVE") {
-      const loaded = await this.#curveState.load(request.mint);
+      const loaded = await this.#curveState.load(
+        request.mint,
+        request.side === "SELL" ? "EXIT" : "CANDIDATE",
+      );
       if (loaded.status !== "SUPPORTED") return null;
       return this.#stampQuote(
         this.#curveQuotes.quote(
@@ -692,7 +695,10 @@ export class PumpVenuePaperQuoteProvider implements PaperQuoteProvider {
       );
     }
     if (phase === "MIGRATED_PUMPSWAP") {
-      const loaded = await this.#swapState.load(request.mint);
+      const loaded = await this.#swapState.load(
+        request.mint,
+        request.side === "SELL" ? "EXIT" : "CANDIDATE",
+      );
       if (loaded.status !== "SUPPORTED") return null;
       return this.#stampQuote(
         this.#swapQuotes.quote(

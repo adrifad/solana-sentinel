@@ -8,6 +8,7 @@ providers:
     request_timeout_ms: 3000
     max_requests_per_second: 5
     max_requests_per_utc_day: 1000
+    exit_reserved_requests_per_utc_day: 200
     max_concurrent_enrichments: 4
     enable_trade_stream: false
     max_active_trade_subscriptions: 20

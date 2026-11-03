@@ -12,6 +12,8 @@ export type ApiOptions = {
   staleFeedSeconds: number;
   tradeStreamEnabled: boolean;
   automaticEntriesEnabled: boolean;
+  heliusMaxRequestsPerUtcDay?: number;
+  heliusExitReservedRequestsPerUtcDay?: number;
   paperWalletId: string;
   operatorToken?: string;
   maxTradeSol?: string;
@@ -370,6 +372,14 @@ export function getOperationalReadiness(options: ApiOptions) {
       options.staleFeedSeconds * 1000,
   );
   const completeness = options.store.getStreamCompleteness();
+  const heliusRequestBudget =
+    options.heliusMaxRequestsPerUtcDay !== undefined &&
+    options.heliusExitReservedRequestsPerUtcDay !== undefined
+      ? options.store.getHeliusRequestBudget(
+          options.heliusMaxRequestsPerUtcDay,
+          options.heliusExitReservedRequestsPerUtcDay,
+        )
+      : null;
   const tokens = options.store.listTokens(200);
   const tradeObservationReady =
     options.tradeStreamEnabled &&
@@ -575,6 +585,7 @@ export function getOperationalReadiness(options: ApiOptions) {
         options.tradeStreamEnabled && heliusTradeStream?.state === "HEALTHY",
     },
     dataCompleteness: completeness,
+    heliusRequestBudget,
     analysisReadiness: analysisReady,
     tradeObservationReady,
     paperRuntimeReady,

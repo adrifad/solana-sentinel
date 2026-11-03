@@ -16,7 +16,11 @@ import {
 } from "@pump-fun/pump-sdk";
 import { MarketSnapshotSchema, PubkeySchema } from "@sentinel/domain";
 import type { MarketSnapshot } from "@sentinel/domain";
-import type { HeliusAccount, HeliusRpcClient } from "./helius.ts";
+import type {
+  HeliusAccount,
+  HeliusRequestPriority,
+  HeliusRpcClient,
+} from "./helius.ts";
 import type { PumpCurveQuoteState } from "./quotes.ts";
 
 export type PumpCurveStateResult =
@@ -73,7 +77,10 @@ export class PumpCurveStateLoader {
     this.#onRawSnapshot = options.onRawSnapshot;
   }
 
-  async load(mintInput: string): Promise<PumpCurveStateResult> {
+  async load(
+    mintInput: string,
+    priority: HeliusRequestPriority = "CANDIDATE",
+  ): Promise<PumpCurveStateResult> {
     const parsedMint = PubkeySchema.safeParse(mintInput);
     if (!parsedMint.success)
       return { status: "UNSAFE", reasonCode: "MALFORMED_PROVIDER_DATA" };
@@ -100,7 +107,11 @@ export class PumpCurveStateLoader {
         legacyAta.toBase58(),
         token2022Ata.toBase58(),
       ];
-      const batch = await this.#helius.getMultipleAccounts(addresses);
+      const batch = await this.#helius.getMultipleAccounts(
+        addresses,
+        priority,
+        mint.toBase58(),
+      );
       this.#onRawSnapshot?.({
         slot: batch.slot,
         accounts: batch.accounts.map((account, index) =>

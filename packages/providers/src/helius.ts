@@ -176,13 +176,30 @@ export type WalletTransaction = {
   }>;
 };
 
+export type HeliusRequestPriority =
+  "EXIT" | "RISK" | "CANDIDATE" | "SECURITY" | "CREATOR" | "BACKGROUND";
+export type HeliusRequestContext = {
+  method: string;
+  priority: HeliusRequestPriority;
+  component: string;
+  purpose: string;
+  subjectMint: string | null;
+};
+
 export type HeliusOptions = {
   apiKey: string;
   requestTimeoutMs: number;
   maxRequestsPerSecond?: number;
   fetchImpl?: typeof fetch;
   now?: () => number;
-  consumeRequestBudget?: () => boolean;
+  consumeRequestBudget?: (request: HeliusRequestContext) => boolean;
+  recordRequestOutcome?: (
+    request: HeliusRequestContext & {
+      attempt: number;
+      outcome: "SUCCEEDED" | "FAILED" | "BUDGET_BLOCKED";
+      errorCode: string | null;
+    },
+  ) => void;
 };
 export type HeliusAccount = {
   slot: number;
@@ -215,9 +232,9 @@ export class HeliusRpcClient {
       this.#opts.now?.() ?? Date.now(),
     ).toISOString();
     try {
-      const rpcHealth = await this.#rpc("getHealth", []);
+      const rpcHealth = await this.#rpc("getHealth", [], "BACKGROUND", null);
       if (rpcHealth !== "ok") throw new ProviderFailure("RPC_UNHEALTHY");
-      const genesis = await this.#rpc("getGenesisHash", []);
+      const genesis = await this.#rpc("getGenesisHash", [], "BACKGROUND", null);
       if (
         typeof genesis !== "string" ||
         genesis.length < 32 ||
@@ -263,7 +280,11 @@ export class HeliusRpcClient {
     };
   }
 
-  async getMultipleAccounts(addresses: string[]): Promise<{
+  async getMultipleAccounts(
+    addresses: string[],
+    priority: HeliusRequestPriority = "BACKGROUND",
+    subjectMint: string | null = null,
+  ): Promise<{
     slot: number;
     accounts: HeliusAccount[];
   }> {
@@ -272,10 +293,12 @@ export class HeliusRpcClient {
     if (addresses.some((address) => !PubkeySchema.safeParse(address).success))
       throw new ProviderFailure("INVALID_PUBKEY");
     const parsed = MultipleAccountInfoResult.safeParse(
-      await this.#rpc("getMultipleAccounts", [
-        addresses,
-        { commitment: "confirmed", encoding: "base64" },
-      ]),
+      await this.#rpc(
+        "getMultipleAccounts",
+        [addresses, { commitment: "confirmed", encoding: "base64" }],
+        priority,
+        subjectMint,
+      ),
     );
     if (!parsed.success || parsed.data.value.length !== addresses.length)
       throw new ProviderFailure("MALFORMED_RESPONSE");
@@ -445,7 +468,12 @@ export class HeliusRpcClient {
     };
   }
 
-  async #rpc(method: string, params: unknown[]): Promise<unknown> {
+  async #rpc(
+    method: string,
+    params: unknown[],
+    priority: HeliusRequestPriority = "BACKGROUND",
+    subjectMint: string | null = null,
+  ): Promise<unknown> {
     const now = this.#opts.now ?? Date.now;
     if (this.#failureCount >= 5 && now() - this.#circuitOpenedAt < 15000)
       throw new ProviderFailure("CIRCUIT_OPEN");
@@ -456,8 +484,43 @@ export class HeliusRpcClient {
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await this.#pace();
-      if (this.#opts.consumeRequestBudget && !this.#opts.consumeRequestBudget())
+      const request = {
+        method,
+        priority,
+        component: (
+          {
+            EXIT: "paper_position_monitor",
+            RISK: "paper_risk_validation",
+            CANDIDATE: "candidate_analysis",
+            SECURITY: "token_security",
+            CREATOR: "creator_intelligence",
+            BACKGROUND: "helius_background",
+          } satisfies Record<HeliusRequestPriority, string>
+        )[priority],
+        purpose: (
+          {
+            EXIT: "risk_reducing_exit_quote",
+            RISK: "risk_critical_position_monitoring",
+            CANDIDATE: "candidate_market_validation",
+            SECURITY: "token_security_validation",
+            CREATOR: "creator_history_analysis",
+            BACKGROUND: method,
+          } satisfies Record<HeliusRequestPriority, string>
+        )[priority],
+        subjectMint,
+      };
+      if (
+        this.#opts.consumeRequestBudget &&
+        !this.#opts.consumeRequestBudget(request)
+      ) {
+        this.#recordRequestOutcome({
+          ...request,
+          attempt: attempt + 1,
+          outcome: "BUDGET_BLOCKED",
+          errorCode: "REQUEST_BUDGET_EXHAUSTED",
+        });
         throw new ProviderFailure("REQUEST_BUDGET_EXHAUSTED");
+      }
       const controller = new AbortController();
       const timeout = setTimeout(
         () => controller.abort(),
@@ -481,6 +544,12 @@ export class HeliusRpcClient {
         if (!("result" in envelope.data))
           throw new ProviderFailure("MALFORMED_RESPONSE");
         this.#failureCount = 0;
+        this.#recordRequestOutcome({
+          ...request,
+          attempt: attempt + 1,
+          outcome: "SUCCEEDED",
+          errorCode: null,
+        });
         return envelope.data.result;
       } catch (error) {
         lastFailure =
@@ -491,6 +560,12 @@ export class HeliusRpcClient {
                   ? "TIMEOUT"
                   : "PROVIDER_UNAVAILABLE",
               );
+        this.#recordRequestOutcome({
+          ...request,
+          attempt: attempt + 1,
+          outcome: "FAILED",
+          errorCode: lastFailure.code,
+        });
         if (
           lastFailure.code === "RPC_REJECTED" ||
           lastFailure.code === "MALFORMED_RESPONSE" ||
@@ -508,6 +583,20 @@ export class HeliusRpcClient {
     this.#failureCount += 1;
     if (this.#failureCount >= 5) this.#circuitOpenedAt = now();
     throw lastFailure;
+  }
+
+  #recordRequestOutcome(
+    request: HeliusRequestContext & {
+      attempt: number;
+      outcome: "SUCCEEDED" | "FAILED" | "BUDGET_BLOCKED";
+      errorCode: string | null;
+    },
+  ): void {
+    try {
+      this.#opts.recordRequestOutcome?.(request);
+    } catch {
+      // Diagnostics must never change the provider request result.
+    }
   }
 
   async #pace(): Promise<void> {

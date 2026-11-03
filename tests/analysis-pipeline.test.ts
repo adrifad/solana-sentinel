@@ -113,12 +113,14 @@ test("detected launch gets persistent fail-closed reports without Helius credent
   const store = new SentinelStore(join(directory, "sentinel.db"));
   await store.open();
   const config = await loadConfig({});
+  const persistedDecisionIds: string[] = [];
   const scheduler = new TokenAnalysisScheduler({
     store,
     helius: undefined,
     config: config.config,
     configVersion: config.configVersion,
     concurrency: 1,
+    onDecisionPersisted: (decision) => persistedDecisionIds.push(decision.id),
   });
   try {
     const event = parsePumpPortalMessage(fixture, Date.now());
@@ -150,6 +152,7 @@ test("detected launch gets persistent fail-closed reports without Helius credent
     await waitForDecision(store, event.mint);
     const report = store.getLatestTokenRiskReport(event.mint);
     const decision = store.listRiskDecisions(event.mint)[0];
+    assert.deepEqual(persistedDecisionIds, [decision?.id]);
     assert.equal(report?.status, "MISSING");
     assert.equal(
       report?.reasonCodes.includes("HELIUS_CREDENTIAL_MISSING"),

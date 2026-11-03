@@ -4,6 +4,8 @@
 
 The `@sentinel/paper` package contains a quote-at-arrival simulator, conservative fill adjustment, persistent order recovery, atomic double-entry settlement, positions, portfolio marks/PnL, risk gates, and an exit-rule evaluator. The worker now composes it in `APP_MODE=PAPER`, initializes a virtual wallet, recovers pending intents, and monitors open positions for stop-loss, take-profit, or max-hold exits. Quotes use the read-only Pump curve/PumpSwap loaders through Helius. No simulated trade is a real fill. Automatic entries default off and require complete observation/behavior/security evidence; the current observer cannot establish complete coverage, so it cannot currently submit an entry intent.
 
+Automatic entry evaluation is independent of position monitoring. A persisted analysis decision notifies the PAPER entry evaluator immediately, while startup recovery scans durable decisions if a process stopped between persistence and notification. The periodic position monitor only evaluates open positions. The strict complete-coverage gate and all quote, security, signal-age, and financial risk checks remain in force. Automatic entries remain disabled in the default configuration.
+
 The existing `risk.emergency_pause` setting is retained for configuration compatibility and maps to `pauseNewEntries`: it rejects new BUY orders before quote requests and again inside atomic settlement. A valid SELL may reduce held token balance during this pause. SELL proceeds are not compared with the BUY max trade amount; SELL settlement remains bounded by held token balance, a fresh validated quote, liquidity, fees, slippage, and ledger balance checks. Emergency liquidation is not implemented.
 
 ## Manual PAPER orders
