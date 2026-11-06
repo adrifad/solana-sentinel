@@ -29,12 +29,15 @@ export class PaperRuntime {
   readonly #risk = new PaperRiskManager();
   #timer: ReturnType<typeof setInterval> | undefined;
   #manualTimer: ReturnType<typeof setInterval> | undefined;
+  #healthTimer: ReturnType<typeof setInterval> | undefined;
   #busy = false;
   #entryBusy = false;
   #entryWakePending = false;
   #manualBusy = false;
   #stopping = false;
   #initialBalanceMatches = true;
+  #runtimeHealth: "HEALTHY" | "DEGRADED" = "HEALTHY";
+  #runtimeError: string | null = null;
 
   constructor(input: {
     store: SentinelStore;
@@ -107,6 +110,7 @@ export class PaperRuntime {
     }
     await this.tick();
     await this.wakeEntries("STARTUP_RECOVERY");
+    this.#reportRuntime("HEALTHY", null);
     this.#timer = setInterval(
       () => void this.tick(),
       this.#config.paper.position_monitor_interval_ms,
@@ -114,6 +118,10 @@ export class PaperRuntime {
     this.#manualTimer = setInterval(
       () => void this.#processManualRequest(),
       250,
+    );
+    this.#healthTimer = setInterval(
+      () => this.#reportRuntime(this.#runtimeHealth, this.#runtimeError),
+      10_000,
     );
     return {
       recoveredOrderCount: recovered.length,
@@ -126,8 +134,10 @@ export class PaperRuntime {
     this.#stopping = true;
     if (this.#timer) clearInterval(this.#timer);
     if (this.#manualTimer) clearInterval(this.#manualTimer);
+    if (this.#healthTimer) clearInterval(this.#healthTimer);
     while (this.#busy || this.#manualBusy || this.#entryBusy)
       await new Promise((resolve) => setTimeout(resolve, 10));
+    this.#reportRuntime("STOPPED", null);
   }
 
   async tick(): Promise<void> {
@@ -139,7 +149,12 @@ export class PaperRuntime {
           await this.#engine.recoverPendingOrders(100, true),
         );
       await this.#monitorPositions();
+      this.#reportRuntime("HEALTHY", null);
     } catch (error) {
+      this.#reportRuntime(
+        "DEGRADED",
+        error instanceof Error ? error.name : "PAPER_RUNTIME_TICK_FAILED",
+      );
       log("error", "paper.runtime.tick_failed", {
         errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
       });
@@ -214,6 +229,26 @@ export class PaperRuntime {
       unpriceablePositions: portfolio.latestMark?.unpriceablePositions ?? 0,
       blockers,
     };
+  }
+
+  #reportRuntime(
+    state: "HEALTHY" | "DEGRADED" | "STOPPED",
+    errorCode: string | null,
+  ): void {
+    if (state !== "STOPPED") {
+      this.#runtimeHealth = state;
+      this.#runtimeError = errorCode;
+    }
+    this.#store.setProviderHealth({
+      provider: "paper_runtime",
+      state,
+      checkedAtUtc: utcNow(),
+      lastEventAtUtc: null,
+      reconnectCount: 0,
+      errorCode,
+      queueDepth:
+        Number(this.#busy) + Number(this.#manualBusy) + Number(this.#entryBusy),
+    });
   }
 
   async #monitorPositions(): Promise<void> {

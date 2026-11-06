@@ -1,12 +1,24 @@
 # Solana Sentinel Implementation Status
 
+## Pipeline readiness diagnostics — 2026-11-06
+
+- Fixed global analysis readiness so it is derived from persisted eligible-token job queues and not `every()` over the latest, capped token list. The API now reports analysis job counts, enrichment/migration queue states, recent persisted failures, oldest pending time, and last completed time.
+- Helius internal budget exhaustion now defers enrichment until the next UTC budget day, records `REQUEST_BUDGET_EXHAUSTED`, and becomes claimable after the defer deadline. It no longer marks a reachable RPC provider degraded solely because the application's own request cap is exhausted. A successful later request clears the deferred failure. This is internal request-budget accounting, not Helius credit/entitlement reporting.
+- Added migration 016 for persisted analysis job failure codes. Startup recovery and retry behavior remain durable; ordinary analysis exceptions use bounded backoff, and direct budget exhaustion waits until the next UTC day.
+- Readiness now distinguishes analysis (`READY`/`RUNNING`/`DEGRADED`/`BLOCKED`), trade observations (`DISABLED`/`READY`/`DEGRADED`/`BLOCKED`), and automatic entry (`DISABLED`/`RUNNING`/`DEGRADED`/`BLOCKED`). It exposes active monitoring coverage counts, request usage/remaining, analysis blockers, and recent non-eligible decision reason codes. The dashboard renders these actual status values and queue/budget details.
+- Analysis, enrichment, and PAPER workers now persist independent process heartbeats in provider health. The API treats stale/missing scheduler heartbeats as blocked and recent degraded heartbeats as degraded; PAPER readiness no longer means only that a wallet row exists. RPC failure-code totals are exposed separately from request counts.
+- Source audit: the PAPER entry scheduler is already event-driven from persisted decisions and startup recovery; entry evaluations are not tied to the position-monitor timer. It still requires a current-config `BUY_ELIGIBLE` decision, complete trade coverage, complete behavior, current security, fresh signal/quotes, and portfolio risk approval. Automatic entries remain disabled by default.
+- Trade observation audit: Helius `logsSubscribe` can verify transactions received during a connected window and persists normalized observations, but the standard subscription has no replay cursor and the repository has no validated exhaustive historical reconciliation query. A live socket and verified individual swaps cannot prove complete behavior-window coverage. Coverage therefore remains incomplete and automatic entries must remain blocked until a defensible completeness contract is implemented and verified.
+- Local runtime boundary: Docker Compose is unavailable in this development environment (`docker compose` is not installed), and no deployment database was inspected or modified. No live RPC calls, metered streams, or production writes were performed. Runtime counts and mainnet evidence must be read from the deployment's `/api/health` and `/api/paper/candidates` endpoints after this commit is deployed; they are not asserted here.
+- Regression coverage added for mixed eligible/ineligible token readiness, queue and budget diagnostics, deferred enrichment recovery, scheduler health, and RPC connectivity remaining distinct from internal budget exhaustion. Local verification: `pnpm typecheck`, `pnpm test` (125 passed), `pnpm lint`, `pnpm format:check`, `pnpm docs:check`, and `pnpm build` passed. A fresh isolated DB applied migrations 001–016 and returned `PRAGMA integrity_check = ok`. These checks use local and synthetic fixtures; they do not verify deployed behavior or mainnet trade-stream access.
+
 ## Read-only operations dashboard — 2026-11-06
 
 - Added the first React/Tailwind operations dashboard slice in `apps/web`: API-backed discovery/decision counts, candidate and entry-evaluation table, readiness blockers, provider health, observation completeness, and PAPER wallet/position/PnL status when mode is PAPER.
 - The UI is strictly read-only and polls health/candidate diagnostics every 15 seconds. Missing API or quote data is displayed as unavailable; no market values are synthesized. It has no order or configuration controls.
 - Local development uses `pnpm dev:web`. Compose adds an optional dashboard service on `127.0.0.1:4173`, behind the internal API and without operator credentials. Automatic entries remain disabled by default.
 - Visual review covered desktop and mobile layouts with the API offline; the offline state rendered explicitly. This is a first slice, not the full dashboard specification: token detail, creator pages, SSE, and write/configuration workflows are not included.
-- A fresh isolated database applied migrations through schema version 15 and passed `PRAGMA integrity_check`. Automated fixtures and quality checks are listed with the dashboard delivery commit after merge validation.
+- A fresh isolated database applied migrations through schema version 16 and passed `PRAGMA integrity_check` in the pipeline diagnostics validation.
 
 ## Independent Telegram monitoring service — 2026-11-03
 

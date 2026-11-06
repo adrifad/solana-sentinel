@@ -53,7 +53,7 @@ The optional operations dashboard is a read-only React/Tailwind application. Sta
 
 To inspect why a token has or has not reached PAPER entry evaluation, use the read-only `GET /api/paper/candidates` endpoint. It reports candidate decisions and evidence, scheduler enablement, and durable skip/order outcomes. The default configuration intentionally leaves automatic entries and verified trade streams disabled.
 
-To inspect why a token has or has not reached PAPER entry evaluation, use the read-only `GET /api/paper/candidates` endpoint. It reports candidate decisions and evidence, scheduler enablement, and durable skip/order outcomes. The default configuration intentionally leaves automatic entries and verified trade streams disabled.
+`GET /api/health` separates analysis queue state, trade-observation coverage, and automatic-entry state. It reports analysis jobs queued/processing/completed, RPC requests used/remaining, coverage counts, and recent decision reason codes. RPC budget exhaustion is an internal quota condition and is not itself evidence that the Helius endpoint is disconnected. Helius `logsSubscribe` observations remain `UNVERIFIED` for completeness because the subscription has no replay cursor; verified events do not by themselves prove a continuous launch window.
 
 ## Local implementation commands
 

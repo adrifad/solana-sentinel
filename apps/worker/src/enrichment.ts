@@ -14,7 +14,10 @@ export class EnrichmentScheduler {
   readonly #concurrency: number;
   readonly #active = new Set<Promise<void>>();
   #timer: ReturnType<typeof setInterval> | undefined;
+  #healthTimer: ReturnType<typeof setInterval> | undefined;
   #stopping = false;
+  #healthState: "HEALTHY" | "DEGRADED" = "HEALTHY";
+  #healthError: string | null = null;
 
   constructor(
     store: SentinelStore,
@@ -29,7 +32,12 @@ export class EnrichmentScheduler {
   start(): void {
     this.#store.recoverInterruptedEnrichmentJobs();
     this.#store.recoverInterruptedMigrationJobs();
+    this.#reportScheduler("HEALTHY", null);
     this.#timer = setInterval(() => this.#fill(), 200);
+    this.#healthTimer = setInterval(
+      () => this.#reportScheduler(this.#healthState, this.#healthError),
+      10_000,
+    );
     this.#fill();
   }
 
@@ -40,7 +48,9 @@ export class EnrichmentScheduler {
   async stop(): Promise<void> {
     this.#stopping = true;
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#healthTimer) clearInterval(this.#healthTimer);
     await Promise.allSettled([...this.#active]);
+    this.#reportScheduler("STOPPED", null);
   }
 
   #fill(): void {
@@ -170,6 +180,7 @@ export class EnrichmentScheduler {
         reconnectCount: 0,
         errorCode: null,
       });
+      this.#reportScheduler("HEALTHY", null);
     } catch (error) {
       const deterministicFailure =
         error instanceof Error &&
@@ -184,17 +195,24 @@ export class EnrichmentScheduler {
           : deterministicFailure && error instanceof Error
             ? error.message
             : "PROVIDER_UNAVAILABLE";
+      const budgetExhausted = errorCode === "REQUEST_BUDGET_EXHAUSTED";
       const terminal =
         deterministicFailure ||
-        job.attempts >= 3 ||
+        (!budgetExhausted && job.attempts >= 3) ||
         errorCode === "INVALID_SIGNATURE";
+      const untilUtcDay = new Date();
+      untilUtcDay.setUTCHours(24, 0, 0, 0);
       this.#store.finishMigrationRecoveryJob(
         job.eventId,
         terminal ? "FAILED" : "PENDING",
         errorCode,
-        terminal ? 0 : 500 * 2 ** (job.attempts - 1),
+        budgetExhausted
+          ? Math.max(1000, untilUtcDay.getTime() - Date.now())
+          : terminal
+            ? 0
+            : 500 * 2 ** (job.attempts - 1),
       );
-      if (error instanceof ProviderFailure)
+      if (error instanceof ProviderFailure && !budgetExhausted)
         this.#store.setProviderHealth({
           provider: "helius",
           state: "DEGRADED",
@@ -204,6 +222,7 @@ export class EnrichmentScheduler {
           errorCode,
           queueDepth: this.#active.size,
         });
+      this.#reportScheduler("DEGRADED", errorCode);
       log("warn", "migration.recovery_failed", {
         mint: job.mint,
         eventId: job.eventId,
@@ -275,16 +294,17 @@ export class EnrichmentScheduler {
         reconnectCount: 0,
         errorCode: null,
       });
+      this.#reportScheduler("HEALTHY", null);
     } catch (error) {
       const errorCode =
         error instanceof ProviderFailure ? error.code : "PROVIDER_UNAVAILABLE";
       const budgetExhausted = errorCode === "REQUEST_BUDGET_EXHAUSTED";
-      const terminal = budgetExhausted || job.attempts >= 3;
+      const terminal = !budgetExhausted && job.attempts >= 3;
       const untilUtcDay = new Date();
       untilUtcDay.setUTCHours(24, 0, 0, 0);
       this.#store.finishEnrichmentJob(
         job.eventId,
-        terminal ? (budgetExhausted ? "PENDING" : "FAILED") : "PENDING",
+        budgetExhausted ? "DEFERRED_BUDGET" : terminal ? "FAILED" : "PENDING",
         errorCode,
         budgetExhausted
           ? Math.max(1000, untilUtcDay.getTime() - Date.now())
@@ -292,15 +312,17 @@ export class EnrichmentScheduler {
             ? 0
             : 500 * 2 ** (job.attempts - 1),
       );
-      this.#store.setProviderHealth({
-        provider: "helius",
-        state: "DEGRADED",
-        checkedAtUtc: utcNow(),
-        lastEventAtUtc: null,
-        reconnectCount: 0,
-        errorCode,
-        queueDepth: this.#active.size,
-      });
+      if (!budgetExhausted)
+        this.#store.setProviderHealth({
+          provider: "helius",
+          state: "DEGRADED",
+          checkedAtUtc: utcNow(),
+          lastEventAtUtc: null,
+          reconnectCount: 0,
+          errorCode,
+          queueDepth: this.#active.size,
+        });
+      this.#reportScheduler("DEGRADED", errorCode);
       log("warn", "provider.helius.enrichment_failed", {
         mint: job.mint,
         eventId: job.eventId,
@@ -308,5 +330,24 @@ export class EnrichmentScheduler {
         willRetry: !terminal,
       });
     }
+  }
+
+  #reportScheduler(
+    state: "HEALTHY" | "DEGRADED" | "STOPPED",
+    errorCode: string | null,
+  ): void {
+    if (state !== "STOPPED") {
+      this.#healthState = state;
+      this.#healthError = errorCode;
+    }
+    this.#store.setProviderHealth({
+      provider: "enrichment_scheduler",
+      state,
+      checkedAtUtc: utcNow(),
+      lastEventAtUtc: null,
+      reconnectCount: 0,
+      errorCode,
+      queueDepth: this.#active.size,
+    });
   }
 }

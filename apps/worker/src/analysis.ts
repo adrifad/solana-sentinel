@@ -84,7 +84,10 @@ export class TokenAnalysisScheduler {
   readonly #active = new Set<Promise<void>>();
   readonly #walletRefreshLocks = new Map<string, Promise<void>>();
   #timer: ReturnType<typeof setInterval> | undefined;
+  #healthTimer: ReturnType<typeof setInterval> | undefined;
   #stopping = false;
+  #healthState: "HEALTHY" | "DEGRADED" = "HEALTHY";
+  #healthError: string | null = null;
 
   constructor(options: AnalysisOptions) {
     this.#store = options.store;
@@ -111,7 +114,12 @@ export class TokenAnalysisScheduler {
 
   start(): void {
     this.#store.recoverInterruptedAnalysisJobs();
+    this.#reportScheduler("HEALTHY", null);
     this.#timer = setInterval(() => this.#fill(), 200);
+    this.#healthTimer = setInterval(
+      () => this.#reportScheduler(this.#healthState, this.#healthError),
+      10_000,
+    );
     this.#fill();
   }
 
@@ -122,7 +130,9 @@ export class TokenAnalysisScheduler {
   async stop(): Promise<void> {
     this.#stopping = true;
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#healthTimer) clearInterval(this.#healthTimer);
     await Promise.allSettled([...this.#active]);
+    this.#reportScheduler("STOPPED", null);
   }
 
   #fill(): void {
@@ -132,6 +142,10 @@ export class TokenAnalysisScheduler {
       try {
         job = this.#store.claimAnalysisJob();
       } catch (error) {
+        this.#reportScheduler(
+          "DEGRADED",
+          error instanceof Error ? error.message : "ANALYSIS_JOB_CLAIM_FAILED",
+        );
         log("error", "analysis.job_claim_failed", {
           errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
         });
@@ -139,12 +153,19 @@ export class TokenAnalysisScheduler {
       }
       if (!job) return;
       const task = this.#analyze(job).catch((error: unknown) => {
+        const errorCode = providerError(error);
+        const retryDelayMs =
+          errorCode === "REQUEST_BUDGET_EXHAUSTED"
+            ? millisecondsUntilUtcDayReset()
+            : Math.min(60_000, 1_000 * 2 ** Math.min(job.attempts - 1, 6));
         log("error", "analysis.job_failed", {
           mint: job.mint,
           eventId: job.eventId,
-          errorCode: error instanceof Error ? error.message : "UNKNOWN_ERROR",
+          errorCode,
+          retryDelayMs,
         });
-        this.#store.finishAnalysisJob(job.eventId, 1000);
+        this.#store.finishAnalysisJob(job.eventId, retryDelayMs, errorCode);
+        this.#reportScheduler("DEGRADED", errorCode);
       });
       this.#active.add(task);
       void task.finally(() => {
@@ -159,7 +180,11 @@ export class TokenAnalysisScheduler {
     const event = this.#store.getMarketEventSummary(job.eventId);
     const token = this.#store.getToken(job.mint);
     if (!event || !token) {
-      this.#store.finishAnalysisJob(job.eventId);
+      this.#store.finishAnalysisJob(
+        job.eventId,
+        60_000,
+        !event ? "ANALYSIS_EVENT_NOT_FOUND" : "ANALYSIS_TOKEN_NOT_FOUND",
+      );
       return;
     }
     this.#recordStage(
@@ -302,7 +327,7 @@ export class TokenAnalysisScheduler {
       (this.#helius || this.#jupiter) &&
       event.monitoringEligible &&
       security.status === "SUPPORTED"
-        ? await this.#quoteExit(job.mint, token.marketPhase)
+        ? await this.#quoteExit(job.mint, token.marketPhase, evidence)
         : { buy: null, sell: null };
     this.#recordStage(
       job.eventId,
@@ -390,10 +415,23 @@ export class TokenAnalysisScheduler {
       event.monitoringEligible &&
       (evidence.walletProfiles.some((profile) => !profile.historyComplete) ||
         security.status === "MISSING");
-    const retryDelayMs = refreshNeeded
-      ? Math.min(3_600_000, 30_000 * 2 ** Math.min(job.attempts - 1, 7))
-      : 0;
-    this.#store.finishAnalysisJob(job.eventId, retryDelayMs);
+    const budgetError = [...evidence.errors, ...security.reasonCodes].find(
+      (code) => code.includes("REQUEST_BUDGET_EXHAUSTED"),
+    );
+    const retryDelayMs = budgetError
+      ? millisecondsUntilUtcDayReset()
+      : refreshNeeded
+        ? Math.min(3_600_000, 30_000 * 2 ** Math.min(job.attempts - 1, 7))
+        : 0;
+    this.#store.finishAnalysisJob(
+      job.eventId,
+      retryDelayMs,
+      budgetError ?? null,
+    );
+    this.#reportScheduler(
+      budgetError ? "DEGRADED" : "HEALTHY",
+      budgetError ?? null,
+    );
     this.#recordStage(
       job.eventId,
       job.mint,
@@ -408,6 +446,25 @@ export class TokenAnalysisScheduler {
       securityStatus: security.status,
       evidenceCount: evidence.evidenceRefs.size,
       latencyMs: decision.latencyMs,
+    });
+  }
+
+  #reportScheduler(
+    state: "HEALTHY" | "DEGRADED" | "STOPPED",
+    errorCode: string | null,
+  ): void {
+    if (state !== "STOPPED") {
+      this.#healthState = state;
+      this.#healthError = errorCode;
+    }
+    this.#store.setProviderHealth({
+      provider: "analysis_scheduler",
+      state,
+      checkedAtUtc: utcNow(),
+      lastEventAtUtc: null,
+      reconnectCount: 0,
+      errorCode,
+      queueDepth: this.#active.size,
     });
   }
 
@@ -483,6 +540,7 @@ export class TokenAnalysisScheduler {
   async #quoteExit(
     mint: string,
     marketPhase: string,
+    evidence: AnalysisEvidence,
   ): Promise<{
     buy: QuoteResult | null;
     sell: QuoteResult | null;
@@ -492,6 +550,7 @@ export class TokenAnalysisScheduler {
     if (marketPhase === "MIGRATED_PUMPSWAP" && this.#pumpSwapState) {
       const loaded = await this.#pumpSwapState.load(mint, "CANDIDATE");
       if (loaded.status !== "SUPPORTED") {
+        evidence.errors.add(loaded.reasonCode);
         log("warn", "analysis.pumpswap_state_unavailable", {
           mint,
           errorCode: loaded.reasonCode,
@@ -531,6 +590,7 @@ export class TokenAnalysisScheduler {
     if (marketPhase === "PUMP_CURVE" && this.#pumpCurveState) {
       const loaded = await this.#pumpCurveState.load(mint, "CANDIDATE");
       if (loaded.status !== "SUPPORTED") {
+        evidence.errors.add(loaded.reasonCode);
         log("warn", "analysis.pump_curve_state_unavailable", {
           mint,
           errorCode: loaded.reasonCode,
@@ -592,9 +652,11 @@ export class TokenAnalysisScheduler {
       this.#store.saveQuoteResult(sell);
       return { buy, sell };
     } catch (error) {
+      const errorCode = providerError(error);
+      evidence.errors.add(errorCode);
       log("warn", "analysis.quote_failed", {
         mint,
-        errorCode: providerError(error),
+        errorCode,
       });
       return { buy: null, sell: null };
     }
@@ -1440,6 +1502,12 @@ function providerError(error: unknown): HeliusErrorCode {
     : error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
       ? error.message
       : "PROVIDER_UNAVAILABLE";
+}
+
+function millisecondsUntilUtcDayReset(): number {
+  const nextUtcDay = new Date();
+  nextUtcDay.setUTCHours(24, 0, 0, 0);
+  return Math.max(1000, nextUtcDay.getTime() - Date.now());
 }
 
 export function serializeWalletTransactionSummary(

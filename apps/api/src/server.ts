@@ -517,6 +517,23 @@ export function getOperationalReadiness(options: ApiOptions) {
   const heliusTradeStream = providers.find(
     (provider) => provider.provider === "helius_trade_stream",
   );
+  const analysisScheduler = providers.find(
+    (provider) => provider.provider === "analysis_scheduler",
+  );
+  const enrichmentScheduler = providers.find(
+    (provider) => provider.provider === "enrichment_scheduler",
+  );
+  const paperRuntimeHealth = providers.find(
+    (provider) => provider.provider === "paper_runtime",
+  );
+  const recentlyChecked = (provider: (typeof providers)[number] | undefined) =>
+    Boolean(
+      provider?.checkedAtUtc &&
+      Date.now() - Date.parse(provider.checkedAtUtc) <=
+        options.staleFeedSeconds * 1000,
+    );
+  const freshHealth = (provider: (typeof providers)[number] | undefined) =>
+    provider?.state === "HEALTHY" && recentlyChecked(provider);
   const pumpFresh = Boolean(
     pump?.checkedAtUtc &&
     Date.now() - Date.parse(pump.checkedAtUtc) <=
@@ -532,30 +549,112 @@ export function getOperationalReadiness(options: ApiOptions) {
         )
       : null;
   const tokens = options.store.listTokens(200);
+  const monitoredTokens = tokens.filter((token) => token.monitoringEligible);
+  const analysisStats = options.store.getAnalysisPipelineStats?.() ?? {
+    eligibleTokens: monitoredTokens.length,
+    analysis: {},
+    enrichment: {},
+    migrationRecovery: {},
+    failureReasons: [],
+    latestCompletedAtUtc: null,
+    oldestPendingAtUtc: null,
+  };
+  const tradeCoverageStats =
+    options.store.getTradeObservationCoverageStats?.() ?? {
+      monitoredTokens: monitoredTokens.length,
+      byStatus: {},
+      completeTokens: monitoredTokens.filter(
+        (token) =>
+          options.store.getLatestTradeObservationCoverage(token.mint)
+            ?.status === "COMPLETE",
+      ).length,
+    };
+  const analysisPending = analysisStats.analysis["PENDING"] ?? 0;
+  const analysisProcessing = analysisStats.analysis["PROCESSING"] ?? 0;
+  const analysisCompleted = analysisStats.analysis["COMPLETE"] ?? 0;
+  const enrichmentPending = analysisStats.enrichment["PENDING"] ?? 0;
+  const enrichmentProcessing = analysisStats.enrichment["PROCESSING"] ?? 0;
+  const budgetDeferred = analysisStats.enrichment["DEFERRED_BUDGET"] ?? 0;
+  const migrationPending = analysisStats.migrationRecovery["PENDING"] ?? 0;
+  const migrationProcessing =
+    analysisStats.migrationRecovery["PROCESSING"] ?? 0;
+  const analysisFailures = analysisStats.failureReasons.length > 0;
+  const budgetBlocked =
+    budgetDeferred > 0 || heliusRequestBudget?.remaining === 0;
+  const analysisSchedulerDegraded =
+    analysisScheduler?.state === "DEGRADED" ||
+    enrichmentScheduler?.state === "DEGRADED";
+  const heliusRpcDegraded = helius?.state === "DEGRADED";
+  const analysisReady =
+    analysisStats.eligibleTokens > 0 &&
+    helius?.state === "HEALTHY" &&
+    freshHealth(analysisScheduler) &&
+    freshHealth(enrichmentScheduler) &&
+    analysisPending === 0 &&
+    analysisProcessing === 0 &&
+    enrichmentPending === 0 &&
+    enrichmentProcessing === 0 &&
+    migrationPending === 0 &&
+    migrationProcessing === 0 &&
+    analysisCompleted > 0 &&
+    !budgetDeferred &&
+    !analysisFailures;
+  const analysisStatus =
+    analysisStats.eligibleTokens === 0
+      ? "BLOCKED"
+      : !recentlyChecked(analysisScheduler) ||
+          !recentlyChecked(enrichmentScheduler)
+        ? "BLOCKED"
+        : budgetBlocked ||
+            analysisFailures ||
+            analysisSchedulerDegraded ||
+            heliusRpcDegraded
+          ? "DEGRADED"
+          : helius?.state !== "HEALTHY"
+            ? "BLOCKED"
+            : analysisPending > 0 ||
+                analysisProcessing > 0 ||
+                enrichmentPending > 0 ||
+                enrichmentProcessing > 0 ||
+                migrationPending > 0 ||
+                migrationProcessing > 0
+              ? "RUNNING"
+              : analysisReady
+                ? "READY"
+                : "BLOCKED";
   const tradeObservationReady =
     options.tradeStreamEnabled &&
     heliusTradeStream?.state === "HEALTHY" &&
-    tokens.length > 0 &&
-    tokens.every(
-      (token) =>
-        options.store.getLatestTradeObservationCoverage(token.mint)?.status ===
-        "COMPLETE",
-    );
-  const analysisReady =
-    tokens.length > 0 &&
-    tokens.every(
-      (token) =>
-        options.store.getAnalysisOutcome(token.mint)[0]?.["status"] ===
-          "COMPLETE" &&
-        options.store.listRiskDecisions(token.mint, 1).length > 0,
-    );
+    tradeCoverageStats.monitoredTokens > 0 &&
+    tradeCoverageStats.completeTokens === tradeCoverageStats.monitoredTokens;
   const blockers: string[] = [];
+  const analysisBlockers: string[] = [];
   const discoveryReady = pumpFresh && pump?.state === "HEALTHY";
   if (!discoveryReady) blockers.push("PUMPPORTAL_DISCOVERY_NOT_HEALTHY");
   if (!options.tradeStreamEnabled) blockers.push("TRADE_STREAM_DISABLED");
   if (options.tradeStreamEnabled && heliusTradeStream?.state !== "HEALTHY")
     blockers.push("HELIUS_TRADE_STREAM_NOT_HEALTHY");
   if (!tradeObservationReady) blockers.push("TRADE_STREAM_COVERAGE_UNVERIFIED");
+  if (analysisStats.eligibleTokens === 0)
+    analysisBlockers.push("NO_MONITORING_ELIGIBLE_TOKENS");
+  if (helius?.state !== "HEALTHY")
+    analysisBlockers.push("HELIUS_RPC_NOT_HEALTHY");
+  if (!recentlyChecked(analysisScheduler))
+    analysisBlockers.push("ANALYSIS_SCHEDULER_NOT_HEALTHY");
+  else if (analysisScheduler?.state === "DEGRADED")
+    analysisBlockers.push("ANALYSIS_SCHEDULER_DEGRADED");
+  if (!recentlyChecked(enrichmentScheduler))
+    analysisBlockers.push("ENRICHMENT_SCHEDULER_NOT_HEALTHY");
+  else if (enrichmentScheduler?.state === "DEGRADED")
+    analysisBlockers.push("ENRICHMENT_SCHEDULER_DEGRADED");
+  if (analysisPending > 0) analysisBlockers.push("ANALYSIS_JOBS_PENDING");
+  if (analysisProcessing > 0) analysisBlockers.push("ANALYSIS_JOBS_PROCESSING");
+  if (enrichmentPending > 0 || enrichmentProcessing > 0)
+    analysisBlockers.push("ENRICHMENT_JOBS_PENDING");
+  if (migrationPending > 0 || migrationProcessing > 0)
+    analysisBlockers.push("MIGRATION_RECOVERY_PENDING");
+  if (budgetBlocked) analysisBlockers.push("HELIUS_REQUEST_BUDGET_EXHAUSTED");
+  if (analysisFailures) analysisBlockers.push("ANALYSIS_PROVIDER_FAILURES");
   if (!analysisReady) blockers.push("ANALYSIS_NOT_READY");
   let paperAccount: ReturnType<SentinelStore["getPaperPortfolioState"]> | null =
     null;
@@ -579,20 +678,28 @@ export function getOperationalReadiness(options: ApiOptions) {
   );
   if (options.mode === "PAPER" && paperAccountInit && !initialBalanceMatches)
     blockers.push("PAPER_INITIAL_BALANCE_CONFIG_MISMATCH");
+  const runtimeHealthFresh = freshHealth(paperRuntimeHealth);
+  const paperRuntimeReady =
+    options.mode === "PAPER" && paperAccount !== null && runtimeHealthFresh;
+  if (options.mode === "PAPER" && !runtimeHealthFresh)
+    blockers.push("PAPER_WORKER_NOT_HEALTHY");
   const paperExecutionReady =
     options.mode === "PAPER" &&
     options.automaticEntriesEnabled &&
     analysisReady &&
     tradeObservationReady &&
+    !budgetBlocked &&
     Boolean(helius?.state === "HEALTHY") &&
     Boolean(heliusTradeStream?.state === "HEALTHY") &&
+    paperRuntimeReady &&
     (paperAccount?.latestMark?.unpriceablePositions ?? 0) === 0;
-  const paperRuntimeReady = options.mode === "PAPER" && paperAccount !== null;
   const walletReady = Boolean(
     paperAccount && paperAccountInit && initialBalanceMatches,
   );
   const operatorAuthReady = Boolean(options.operatorToken);
-  const quoteInfrastructureReady = helius?.state === "HEALTHY";
+  const quoteInfrastructureReady =
+    helius?.state === "HEALTHY" &&
+    (heliusRequestBudget === null || heliusRequestBudget.remaining > 0);
   const manualCandidateAvailable = tokens.some((token) => {
     const decision = options.store.listRiskDecisions(token.mint, 1)[0];
     const security = options.store.getLatestTokenRiskReport?.(token.mint);
@@ -706,6 +813,10 @@ export function getOperationalReadiness(options: ApiOptions) {
     paperManualEntryBlockers.push("PAPER_WALLET_NOT_INITIALIZED_OR_MISMATCHED");
     paperManualExitBlockers.push("PAPER_WALLET_NOT_INITIALIZED_OR_MISMATCHED");
   }
+  if (options.mode === "PAPER" && !runtimeHealthFresh) {
+    paperManualEntryBlockers.push("PAPER_WORKER_NOT_HEALTHY");
+    paperManualExitBlockers.push("PAPER_WORKER_NOT_HEALTHY");
+  }
   if (!operatorAuthReady) {
     paperManualEntryBlockers.push("PAPER_OPERATOR_AUTH_NOT_CONFIGURED");
     paperManualExitBlockers.push("PAPER_OPERATOR_AUTH_NOT_CONFIGURED");
@@ -725,6 +836,36 @@ export function getOperationalReadiness(options: ApiOptions) {
     blockers.push("AUTOMATIC_ENTRIES_DISABLED");
   if (options.mode === "PAPER" && helius?.state !== "HEALTHY")
     blockers.push("HELIUS_PROVIDER_NOT_HEALTHY");
+  const automaticEntryStatus =
+    options.mode !== "PAPER" || !options.automaticEntriesEnabled
+      ? "DISABLED"
+      : paperExecutionReady && initialBalanceMatches
+        ? "RUNNING"
+        : budgetBlocked || analysisSchedulerDegraded || heliusRpcDegraded
+          ? "DEGRADED"
+          : "BLOCKED";
+  const rejectionReasons: Record<string, number> = {};
+  let buyEligibleInActiveSample = 0;
+  for (const token of tokens) {
+    const decision = options.store.listRiskDecisions(token.mint, 1)[0];
+    if (token.monitoringEligible && decision?.status === "BUY_ELIGIBLE")
+      buyEligibleInActiveSample += 1;
+    if (decision && decision.status !== "BUY_ELIGIBLE")
+      for (const reason of decision.reasonCodes ?? [])
+        rejectionReasons[reason] = (rejectionReasons[reason] ?? 0) + 1;
+  }
+  const automaticEntryBlockers =
+    options.mode !== "PAPER"
+      ? ["MODE_IS_NOT_PAPER"]
+      : options.automaticEntriesEnabled
+        ? [...new Set(blockers)]
+        : ["AUTOMATIC_ENTRIES_DISABLED"];
+  if (
+    options.mode === "PAPER" &&
+    options.automaticEntriesEnabled &&
+    buyEligibleInActiveSample === 0
+  )
+    automaticEntryBlockers.push("NO_BUY_ELIGIBLE_DECISION_IN_ACTIVE_SAMPLE");
   return {
     mode: options.mode,
     processHealth: true,
@@ -734,11 +875,41 @@ export function getOperationalReadiness(options: ApiOptions) {
       heliusRpc: helius?.state === "HEALTHY",
       heliusTradeStream:
         options.tradeStreamEnabled && heliusTradeStream?.state === "HEALTHY",
+      analysisScheduler: freshHealth(analysisScheduler),
+      enrichmentScheduler: freshHealth(enrichmentScheduler),
+      paperRuntime: options.mode === "PAPER" && runtimeHealthFresh,
     },
     dataCompleteness: completeness,
     heliusRequestBudget,
     analysisReadiness: analysisReady,
+    analysisStatus,
+    analysisDiagnostics: {
+      eligibleTokens: analysisStats.eligibleTokens,
+      pending: analysisPending,
+      processing: analysisProcessing,
+      complete: analysisCompleted,
+      enrichment: analysisStats.enrichment,
+      migrationRecovery: analysisStats.migrationRecovery,
+      failureReasons: analysisStats.failureReasons,
+      blockers: analysisBlockers,
+      latestCompletedAtUtc: analysisStats.latestCompletedAtUtc,
+      oldestPendingAtUtc: analysisStats.oldestPendingAtUtc,
+    },
     tradeObservationReady,
+    tradeObservationStatus: !options.tradeStreamEnabled
+      ? "DISABLED"
+      : tradeObservationReady
+        ? "READY"
+        : heliusTradeStream?.state === "HEALTHY"
+          ? "DEGRADED"
+          : "BLOCKED",
+    tradeObservationDiagnostics: {
+      monitoredTokens: tradeCoverageStats.monitoredTokens,
+      completeTokens: tradeCoverageStats.completeTokens,
+      byStatus: tradeCoverageStats.byStatus,
+      streamHealth: heliusTradeStream?.state ?? "UNKNOWN",
+      completenessReason: "HELIUS_LOGS_SUBSCRIBE_HAS_NO_REPLAY_CURSOR",
+    },
     paperRuntimeReady,
     paperManualEntryReady,
     paperManualEntryBlockers,
@@ -749,6 +920,13 @@ export function getOperationalReadiness(options: ApiOptions) {
     paperAutomaticEntryReady:
       paperExecutionReady && (paperAccountInit ? initialBalanceMatches : false),
     automaticEntriesEnabled: options.automaticEntriesEnabled,
+    automaticEntryStatus,
+    automaticEntryBlockers,
+    buyEligibleInActiveSample,
+    decisionReasonCodes: Object.entries(rejectionReasons)
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 10)
+      .map(([reasonCode, count]) => ({ reasonCode, count })),
     paper: paperAccount
       ? {
           openPositions: paperAccount.positions.length,

@@ -16,6 +16,8 @@
 
 :root {
   color-scheme: dark;
+  scrollbar-color: #34394d #0b0d16;
+  scrollbar-width: thin;
   font-family:
     "Manrope Variable", "Manrope", ui-sans-serif, system-ui, sans-serif;
   font-synthesis: none;
@@ -30,7 +32,7 @@
 }
 
 body {
-  min-width: 360px;
+  min-width: 320px;
   min-height: 100vh;
   margin: 0;
   background:

@@ -286,8 +286,8 @@ export default function App() {
               <label className="hidden h-9 w-60 items-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.025] px-3 text-muted focus-within:border-[#6e5dc0] md:flex">
                 <Search size={14} />
                 <input
-                  className="w-full bg-transparent text-xs text-slate-100 outline-none placeholder:text-[#687087]"
-                  placeholder="Search candidate or mint"
+                  className="min-w-0 flex-1 bg-transparent text-xs text-slate-100 outline-none placeholder:text-[#687087]"
+                  placeholder="Search tokens"
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
                 />
@@ -296,7 +296,7 @@ export default function App() {
                 </kbd>
               </label>
               <div
-                className={`hidden items-center gap-2 rounded-xl border px-3 py-2 text-[10px] font-bold tracking-wide sm:flex ${paperMode ? "border-[#574684] bg-[#29223f]/70 text-[#d0c4ff]" : "border-white/[0.08] bg-white/[0.025] text-slate-300"}`}
+                className={`hidden shrink-0 items-center gap-2 whitespace-nowrap rounded-xl border px-3 py-2 text-[10px] font-bold tracking-wide lg:flex ${paperMode ? "border-[#574684] bg-[#29223f]/70 text-[#d0c4ff]" : "border-white/[0.08] bg-white/[0.025] text-slate-300"}`}
               >
                 <span
                   className={`size-1.5 rounded-full ${paperMode ? "bg-violet" : "bg-[#9299ad]"}`}
@@ -376,7 +376,7 @@ export default function App() {
                 </div>
               )}
 
-              <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-4">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <MetricCard
                   icon={Blocks}
                   label="Tokens discovered"
@@ -435,13 +435,11 @@ export default function App() {
             <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(330px,.85fr)]">
               <Panel id="pipeline" className="overflow-hidden">
                 <div className="flex flex-wrap items-start justify-between gap-3 border-b border-line/80 px-5 py-4 sm:px-6">
-                  <div>
-                    <SectionTitle
-                      icon={Gauge}
-                      title="Entry pipeline"
-                      subtitle="Latest candidate counts · current sample"
-                    />
-                  </div>
+                  <SectionTitle
+                    icon={Gauge}
+                    title="Entry pipeline"
+                    subtitle="Latest candidate counts · current sample"
+                  />
                   <span
                     className={`rounded-lg px-2.5 py-1.5 text-[10px] font-bold ${candidateData?.automaticEntriesEnabled ? "bg-[#202c2c] text-mint" : "bg-[#302528] text-[#f3b6bf]"}`}
                   >
@@ -520,7 +518,7 @@ export default function App() {
               </Panel>
 
               <Panel id="health" className="flex flex-col">
-                <div className="flex items-start justify-between border-b border-line/80 px-5 py-4">
+                <div className="flex items-start justify-between border-b border-line/80 px-5 py-4 sm:px-6">
                   <SectionTitle
                     icon={Activity}
                     title="System readiness"
@@ -530,7 +528,7 @@ export default function App() {
                     className={`mt-1 inline-flex size-2 rounded-full ${loadState === "connected" ? "bg-mint shadow-[0_0_10px_#48d6a2aa]" : loadState === "loading" ? "bg-amber-300" : "bg-rose"}`}
                   />
                 </div>
-                <div className="space-y-3 px-5 py-4">
+                <div className="space-y-3 px-5 py-4 sm:px-6">
                   <ReadinessRow
                     label="Process health"
                     value={truthy(readiness["processHealth"])}
@@ -540,12 +538,18 @@ export default function App() {
                     value={truthy(readiness["discoveryReady"])}
                   />
                   <ReadinessRow
-                    label="Analysis"
-                    value={truthy(readiness["analysisReadiness"])}
+                    label="Analysis pipeline"
+                    value={readinessStatus(
+                      readiness["analysisStatus"],
+                      readiness["analysisReadiness"],
+                    )}
                   />
                   <ReadinessRow
                     label="Trade observations"
-                    value={truthy(readiness["tradeObservationReady"])}
+                    value={readinessStatus(
+                      readiness["tradeObservationStatus"],
+                      readiness["tradeObservationReady"],
+                    )}
                   />
                   <ReadinessRow
                     label="PAPER runtime"
@@ -553,14 +557,15 @@ export default function App() {
                   />
                   <ReadinessRow
                     label="Automatic entry"
-                    value={
+                    value={readinessStatus(
+                      readiness["automaticEntryStatus"],
                       candidateData?.automaticEntriesEnabled
-                        ? truthy(readiness["paperAutomaticEntryReady"])
-                        : "Disabled"
-                    }
+                        ? readiness["paperAutomaticEntryReady"]
+                        : false,
+                    )}
                   />
                 </div>
-                <div className="mt-auto border-t border-line/80 px-5 py-3.5">
+                <div className="mt-auto border-t border-line/80 px-5 py-3.5 sm:px-6">
                   <p className="mb-2 text-[9px] font-bold uppercase tracking-[0.15em] text-[#6e7489]">
                     Current blockers
                   </p>
@@ -568,13 +573,17 @@ export default function App() {
                     reasons={activeBlockers}
                     emptyLabel="No API blockers reported"
                   />
+                  <AnalysisDiagnostics
+                    readiness={readiness}
+                    budget={readiness["heliusRequestBudget"]}
+                  />
                 </div>
               </Panel>
             </section>
 
             <section id="candidates" className="mt-5 scroll-mt-24">
               <Panel className="overflow-hidden">
-                <div className="flex flex-col justify-between gap-3 border-b border-line/80 px-5 py-4 sm:flex-row sm:items-center sm:px-6">
+                <div className="flex flex-col gap-3 border-b border-line/80 px-5 py-4 md:flex-row md:items-center md:justify-between md:px-6">
                   <SectionTitle
                     icon={Blocks}
                     title="Token candidates"
@@ -584,8 +593,8 @@ export default function App() {
                         : "Candidate analysis and entry activity"
                     }
                   />
-                  <div className="flex items-center gap-2">
-                    <label className="flex h-9 flex-1 items-center gap-2 rounded-lg border border-white/[0.08] bg-black/20 px-2.5 text-[#7d8498] sm:w-56 sm:flex-none">
+                  <div className="flex w-full min-w-0 items-center gap-2 md:w-auto">
+                    <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-white/[0.08] bg-black/20 px-2.5 text-[#7d8498] md:w-56 md:flex-none">
                       <Search size={13} />
                       <input
                         aria-label="Filter candidates"
@@ -595,14 +604,23 @@ export default function App() {
                         placeholder="Filter name or mint"
                       />
                     </label>
-                    <div className="hidden h-9 items-center gap-2 rounded-lg border border-white/[0.08] bg-black/20 px-2.5 text-[10px] text-[#9298aa] sm:flex">
+                    <div className="hidden h-9 shrink-0 items-center gap-2 rounded-lg border border-white/[0.08] bg-black/20 px-2.5 text-[10px] text-[#9298aa] sm:flex">
                       <SlidersHorizontal size={13} /> Latest first
                     </div>
                   </div>
                 </div>
                 {filteredCandidates.length > 0 ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-[850px] border-collapse text-left">
+                  <div className="overflow-x-auto overscroll-x-contain">
+                    <table className="w-full min-w-[1040px] table-fixed border-collapse text-left">
+                      <colgroup>
+                        <col className="w-[20%]" />
+                        <col className="w-[17%]" />
+                        <col className="w-[15%]" />
+                        <col className="w-[14%]" />
+                        <col className="w-[18%]" />
+                        <col className="w-[9%]" />
+                        <col className="w-[7%]" />
+                      </colgroup>
                       <thead>
                         <tr className="border-b border-line/70 bg-white/[0.012] text-[9px] font-bold uppercase tracking-[0.12em] text-[#71778d]">
                           <th className="px-6 py-3 font-semibold">Token</th>
@@ -615,7 +633,7 @@ export default function App() {
                             Entry activity
                           </th>
                           <th className="px-4 py-3 font-semibold">Seen</th>
-                          <th className="px-5 py-3" />
+                          <th className="px-4 py-3 text-center" />
                         </tr>
                       </thead>
                       <tbody>
@@ -893,7 +911,7 @@ function SectionTitle({
       <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg border border-white/[0.06] bg-white/[0.035] text-[#a89aff]">
         <Icon size={14} strokeWidth={1.9} />
       </span>
-      <div>
+      <div className="min-w-0">
         <h2 className="text-[12px] font-bold tracking-[-0.01em] text-[#eff0f6]">
           {title}
         </h2>
@@ -923,20 +941,22 @@ function MetricCard({
         ? "text-mint bg-[#18322f]"
         : "text-[#f0c987] bg-[#342c24]";
   return (
-    <div className="relative overflow-hidden rounded-2xl border border-line bg-panel px-4 py-4 sm:px-5">
+    <div className="relative flex min-h-[132px] flex-col overflow-hidden rounded-2xl border border-line bg-panel px-4 py-4 sm:px-5">
       <div className="absolute right-0 top-0 h-20 w-24 rounded-full bg-violet/[0.035] blur-2xl" />
       <div className="relative flex items-start justify-between gap-2">
-        <p className="text-[10px] font-semibold text-[#9ba1b3]">{label}</p>
+        <p className="min-h-7 text-[10px] font-semibold leading-3.5 text-[#9ba1b3]">
+          {label}
+        </p>
         <span
           className={`flex size-7 items-center justify-center rounded-lg ${tintClass}`}
         >
           <Icon size={14} />
         </span>
       </div>
-      <p className="relative mt-4 truncate text-[24px] font-semibold tracking-[-0.045em] text-[#f3f2f8] sm:text-[27px]">
+      <p className="relative mt-3 truncate text-[24px] font-semibold tracking-[-0.045em] text-[#f3f2f8] sm:text-[27px]">
         {value}
       </p>
-      <p className="relative mt-1.5 truncate text-[9px] text-[#7e859a]">
+      <p className="relative mt-auto truncate pt-1.5 text-[9px] text-[#7e859a]">
         {detail}
       </p>
     </div>
@@ -1018,7 +1038,7 @@ function CandidateRow({ candidate }: { candidate: Candidate }) {
         <div className="flex items-center gap-1.5">
           <StatusBadge value={security} compact />
         </div>
-        <p className="mt-1.5 text-[9px] text-[#777e92]">
+        <p className="mt-1.5 truncate text-[9px] text-[#777e92]">
           Behavior {behavior.toLowerCase()}
         </p>
       </td>
@@ -1031,7 +1051,7 @@ function CandidateRow({ candidate }: { candidate: Candidate }) {
         </p>
       </td>
       <td className="px-4 py-3.5">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <StatusBadge
             value={evaluation.activity ?? evaluation.status}
             compact
@@ -1045,16 +1065,22 @@ function CandidateRow({ candidate }: { candidate: Candidate }) {
         </p>
       </td>
       <td className="px-4 py-3.5">
-        <p className="text-[9px] text-[#9da3b4]">
+        <p
+          className="truncate text-[9px] text-[#9da3b4]"
+          title={formatAge(candidate.token.firstSeenAtUtc)}
+        >
           {formatAge(candidate.token.firstSeenAtUtc)}
         </p>
-        <p className="mt-1 text-[9px] text-[#686f83]">
+        <p
+          className="mt-1 truncate text-[9px] text-[#686f83]"
+          title={candidate.token.marketPhase}
+        >
           {candidate.token.marketPhase}
         </p>
       </td>
-      <td className="px-5 py-3.5">
+      <td className="px-4 py-3.5 text-center">
         <a
-          className="flex size-7 items-center justify-center rounded-lg border border-white/[0.07] text-[#7e8599] transition hover:border-[#6654b5] hover:text-[#c5b8ff]"
+          className="mx-auto flex size-7 items-center justify-center rounded-lg border border-white/[0.07] text-[#7e8599] transition hover:border-[#6654b5] hover:text-[#c5b8ff]"
           href={`/api/tokens/${encodeURIComponent(candidate.token.mint)}`}
           target="_blank"
           rel="noreferrer"
@@ -1126,13 +1152,14 @@ function StatusBadge({
 }
 
 function ReadinessRow({ label, value }: { label: string; value: string }) {
-  const healthy = value === "Ready";
+  const healthy = value === "Ready" || value === "Running";
   const inactive = value === "Disabled";
+  const blocked = value === "Blocked";
   return (
     <div className="flex items-center justify-between gap-2">
-      <div className="flex items-center gap-2.5">
+      <div className="flex min-w-0 flex-1 items-center gap-2.5">
         <span
-          className={`flex size-5 items-center justify-center rounded-md ${healthy ? "bg-[#18312e] text-mint" : inactive ? "bg-[#302528] text-[#e4a4ad]" : "bg-[#302b23] text-[#e8c07f]"}`}
+          className={`flex size-5 shrink-0 items-center justify-center rounded-md ${healthy ? "bg-[#18312e] text-mint" : inactive ? "bg-[#302528] text-[#e4a4ad]" : blocked ? "bg-[#38262b] text-[#ed929f]" : "bg-[#302b23] text-[#e8c07f]"}`}
         >
           {healthy ? (
             <CircleCheck size={12} />
@@ -1142,10 +1169,12 @@ function ReadinessRow({ label, value }: { label: string; value: string }) {
             <CircleDot size={12} />
           )}
         </span>
-        <span className="text-[10px] text-[#a7adbd]">{label}</span>
+        <span className="min-w-0 truncate text-[10px] text-[#a7adbd]">
+          {label}
+        </span>
       </div>
       <span
-        className={`text-[9px] font-semibold ${healthy ? "text-mint" : inactive ? "text-[#dc9aa4]" : "text-[#d9b977]"}`}
+        className={`shrink-0 whitespace-nowrap text-right text-[9px] font-semibold ${healthy ? "text-mint" : inactive || blocked ? "text-[#dc9aa4]" : "text-[#d9b977]"}`}
       >
         {value}
       </span>
@@ -1282,6 +1311,133 @@ function providerLabel(name: string): string {
 
 function truthy(value: unknown): string {
   return value === true ? "Ready" : value === false ? "Blocked" : "Unknown";
+}
+
+function readinessStatus(status: unknown, fallback: unknown): string {
+  if (typeof status === "string") {
+    const labels: Record<string, string> = {
+      READY: "Ready",
+      RUNNING: "Running",
+      DEGRADED: "Degraded",
+      BLOCKED: "Blocked",
+      DISABLED: "Disabled",
+    };
+    if (labels[status]) return labels[status];
+  }
+  return truthy(fallback);
+}
+
+function AnalysisDiagnostics({
+  readiness,
+  budget,
+}: {
+  readiness: Record<string, unknown>;
+  budget: unknown;
+}) {
+  const diagnostics = readiness["analysisDiagnostics"];
+  const data =
+    diagnostics && typeof diagnostics === "object"
+      ? (diagnostics as Record<string, unknown>)
+      : {};
+  const budgetData =
+    budget && typeof budget === "object"
+      ? (budget as Record<string, unknown>)
+      : {};
+  const tradeData =
+    readiness["tradeObservationDiagnostics"] &&
+    typeof readiness["tradeObservationDiagnostics"] === "object"
+      ? (readiness["tradeObservationDiagnostics"] as Record<string, unknown>)
+      : {};
+  const analysisBlockers = Array.isArray(data["blockers"])
+    ? (data["blockers"] as string[])
+    : [];
+  const automaticBlockers = Array.isArray(readiness["automaticEntryBlockers"])
+    ? (readiness["automaticEntryBlockers"] as string[])
+    : [];
+  const rpcErrors = Array.isArray(budgetData["byErrorCode"])
+    ? (budgetData["byErrorCode"] as Array<Record<string, unknown>>)
+    : [];
+  const reasons = Array.isArray(readiness["decisionRejectionReasons"])
+    ? (readiness["decisionRejectionReasons"] as Array<Record<string, unknown>>)
+    : [];
+  return (
+    <div className="mt-4 space-y-3 border-t border-line/70 pt-3">
+      <div className="grid grid-cols-2 gap-2 text-[9px] text-[#8c93a8] sm:grid-cols-4">
+        <DiagnosticValue label="Eligible" value={data["eligibleTokens"]} />
+        <DiagnosticValue label="Queued" value={data["pending"]} />
+        <DiagnosticValue label="Processing" value={data["processing"]} />
+        <DiagnosticValue label="Analyzed" value={data["complete"]} />
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[9px] text-[#8c93a8]">
+        <span>
+          Helius RPC: {number(budgetData["used"] as number | undefined)} used ·{" "}
+          {number(budgetData["remaining"] as number | undefined)} remaining
+        </span>
+        <span>
+          Trade coverage:{" "}
+          {number(tradeData["completeTokens"] as number | undefined)} /{" "}
+          {number(tradeData["monitoredTokens"] as number | undefined)} complete
+          · {String(healthCoverage(readiness["tradeObservationStatus"]))}
+        </span>
+      </div>
+      {rpcErrors.length > 0 && (
+        <p className="text-[9px] leading-relaxed text-[#d1aa72]">
+          RPC errors today:{" "}
+          {rpcErrors
+            .slice(0, 4)
+            .map(
+              (item) =>
+                `${formatReason(String(item["errorCode"]))} (${number(item["count"] as number | undefined)})`,
+            )
+            .join(" · ")}
+        </p>
+      )}
+      {analysisBlockers.length > 0 && (
+        <p className="text-[9px] leading-relaxed text-[#d1aa72]">
+          Analysis: {analysisBlockers.map(formatReason).join(" · ")}
+        </p>
+      )}
+      {automaticBlockers.length > 0 && (
+        <p className="text-[9px] leading-relaxed text-[#d1aa72]">
+          Entry scheduler: {automaticBlockers.map(formatReason).join(" · ")}
+        </p>
+      )}
+      {reasons.length > 0 && (
+        <div>
+          <p className="mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] text-[#6e7489]">
+            Recent decision reason codes
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {reasons.slice(0, 5).map((item) => (
+              <span
+                key={String(item["reasonCode"])}
+                className="rounded-md border border-white/[0.06] bg-black/15 px-2 py-1 text-[9px] text-[#a6adbf]"
+              >
+                {formatReason(String(item["reasonCode"]))} ·{" "}
+                {number(item["count"] as number | undefined)}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DiagnosticValue({ label, value }: { label: string; value: unknown }) {
+  return (
+    <div className="rounded-lg border border-white/[0.045] bg-black/15 px-2.5 py-2">
+      <span>{label}</span>
+      <strong className="ml-1.5 font-mono text-slate-200">
+        {number(typeof value === "number" ? value : undefined)}
+      </strong>
+    </div>
+  );
+}
+
+function healthCoverage(status: unknown): string {
+  if (typeof status === "string") return formatReason(status);
+  return "Unavailable";
 }
 
 function number(value: number | null | undefined): string {

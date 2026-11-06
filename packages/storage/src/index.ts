@@ -152,6 +152,7 @@ export class SentinelStore {
       "013-monitoring-leases.sql",
       "014-telegram-outbox.sql",
       "015-paper-entry-evaluations.sql",
+      "016-analysis-diagnostics.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -669,6 +670,7 @@ export class SentinelStore {
     reservedForExits: number;
     exitRequestsUsed: number;
     byMethod: Array<{ method: string; requests: number; failures: number }>;
+    byErrorCode: Array<{ errorCode: string; count: number }>;
   } {
     const utcDay = utcNow().slice(0, 10);
     const aggregate = this.#db
@@ -690,6 +692,13 @@ export class SentinelStore {
         "SELECT COUNT(*) AS count FROM helius_rpc_request_history WHERE utc_day = ? AND priority = 'EXIT' AND outcome != 'BUDGET_BLOCKED'",
       )
       .get(utcDay) as SqlRow;
+    const errors = this.#db
+      .prepare(
+        `SELECT error_code AS errorCode, COUNT(*) AS count
+         FROM helius_rpc_request_history WHERE utc_day = ? AND error_code IS NOT NULL
+         GROUP BY error_code ORDER BY count DESC, errorCode LIMIT 10`,
+      )
+      .all(utcDay) as SqlRow[];
     const used = Number(aggregate?.["requests_used"] ?? 0);
     return {
       utcDay,
@@ -701,6 +710,10 @@ export class SentinelStore {
         method: String(row["method"]),
         requests: Number(row["requests"]),
         failures: Number(row["failures"] ?? 0),
+      })),
+      byErrorCode: errors.map((row) => ({
+        errorCode: String(row["errorCode"]),
+        count: Number(row["count"] ?? 0),
       })),
     };
   }
@@ -744,7 +757,7 @@ export class SentinelStore {
         .prepare(
           `SELECT j.event_id, j.mint, j.attempts, e.kind, e.slot, e.chain_time_status
           FROM enrichment_jobs j JOIN market_events e ON e.id = j.event_id
-          WHERE j.status = 'PENDING' AND j.next_attempt_at_utc <= ?
+          WHERE j.status IN ('PENDING', 'DEFERRED_BUDGET') AND j.next_attempt_at_utc <= ?
           ORDER BY j.created_at_utc LIMIT 1`,
         )
         .get(now) as SqlRow | undefined;
@@ -755,7 +768,7 @@ export class SentinelStore {
       const changed = this.#db
         .prepare(
           `UPDATE enrichment_jobs SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
-          WHERE event_id = ? AND status = 'PENDING'`,
+          WHERE event_id = ? AND status IN ('PENDING', 'DEFERRED_BUDGET')`,
         )
         .run(now, String(row["event_id"]));
       this.#db.exec("COMMIT");
@@ -1020,6 +1033,126 @@ export class SentinelStore {
       .all(mint, mint) as Array<Record<string, unknown>>;
   }
 
+  getAnalysisPipelineStats(): {
+    eligibleTokens: number;
+    analysis: Record<string, number>;
+    enrichment: Record<string, number>;
+    migrationRecovery: Record<string, number>;
+    failureReasons: Array<{ reasonCode: string; count: number }>;
+    latestCompletedAtUtc: string | null;
+    oldestPendingAtUtc: string | null;
+  } {
+    const now = utcNow();
+    const activeLease =
+      "t.monitoring_lease_until_utc IS NULL OR t.monitoring_lease_until_utc > ?";
+    const eligible = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM tokens t WHERE t.monitoring_eligible = 1 AND (${activeLease})`,
+      )
+      .get(now) as SqlRow;
+    const countStatuses = (
+      query: string,
+      ...params: string[]
+    ): Record<string, number> => {
+      const rows = this.#db.prepare(query).all(...params) as SqlRow[];
+      return Object.fromEntries(
+        rows.map((row) => [String(row["status"]), Number(row["count"] ?? 0)]),
+      );
+    };
+    const analysis = countStatuses(
+      `SELECT status, COUNT(*) AS count FROM (
+        SELECT j.status FROM analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE t.monitoring_eligible = 1 AND (${activeLease})
+        UNION ALL
+        SELECT j.status FROM migration_analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE t.monitoring_eligible = 1 AND (${activeLease})
+      ) GROUP BY status`,
+      now,
+      now,
+    );
+    const enrichment = countStatuses(
+      `SELECT status, COUNT(*) AS count FROM enrichment_jobs j
+       JOIN tokens t ON t.mint = j.mint WHERE t.monitoring_eligible = 1 AND (${activeLease}) GROUP BY status`,
+      now,
+    );
+    const migrationRecovery = countStatuses(
+      `SELECT status, COUNT(*) AS count FROM migration_recovery_jobs j
+       JOIN tokens t ON t.mint = j.mint WHERE t.monitoring_eligible = 1 AND (${activeLease}) GROUP BY status`,
+      now,
+    );
+    const failures = this.#db
+      .prepare(
+        `SELECT reasonCode, COUNT(*) AS count FROM (
+          SELECT j.last_error_code AS reasonCode FROM enrichment_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.last_error_code IS NOT NULL AND t.monitoring_eligible = 1 AND (${activeLease})
+          UNION ALL SELECT j.last_error_code FROM analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.last_error_code IS NOT NULL AND t.monitoring_eligible = 1 AND (${activeLease})
+          UNION ALL SELECT j.last_error_code FROM migration_analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.last_error_code IS NOT NULL AND t.monitoring_eligible = 1 AND (${activeLease})
+          UNION ALL SELECT j.error_code FROM migration_recovery_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.error_code IS NOT NULL AND t.monitoring_eligible = 1 AND (${activeLease})
+        ) GROUP BY reasonCode ORDER BY count DESC, reasonCode LIMIT 10`,
+      )
+      .all(now, now, now, now) as SqlRow[];
+    const times = this.#db
+      .prepare(
+        `SELECT
+          (SELECT MAX(updatedAtUtc) FROM (
+            SELECT j.updated_at_utc AS updatedAtUtc FROM analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.status = 'COMPLETE' AND t.monitoring_eligible = 1 AND (${activeLease})
+            UNION ALL SELECT j.updated_at_utc FROM migration_analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.status = 'COMPLETE' AND t.monitoring_eligible = 1 AND (${activeLease})
+          )) AS latestCompletedAtUtc,
+          (SELECT MIN(createdAtUtc) FROM (
+            SELECT j.created_at_utc AS createdAtUtc FROM analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.status IN ('PENDING', 'PROCESSING') AND t.monitoring_eligible = 1 AND (${activeLease})
+            UNION ALL SELECT j.created_at_utc FROM migration_analysis_jobs j JOIN tokens t ON t.mint = j.mint WHERE j.status IN ('PENDING', 'PROCESSING') AND t.monitoring_eligible = 1 AND (${activeLease})
+          )) AS oldestPendingAtUtc`,
+      )
+      .get(now, now, now, now) as SqlRow;
+    return {
+      eligibleTokens: Number(eligible["count"] ?? 0),
+      analysis,
+      enrichment,
+      migrationRecovery,
+      failureReasons: failures.map((row) => ({
+        reasonCode: String(row["reasonCode"]),
+        count: Number(row["count"] ?? 0),
+      })),
+      latestCompletedAtUtc:
+        times["latestCompletedAtUtc"] === null
+          ? null
+          : String(times["latestCompletedAtUtc"]),
+      oldestPendingAtUtc:
+        times["oldestPendingAtUtc"] === null
+          ? null
+          : String(times["oldestPendingAtUtc"]),
+    };
+  }
+
+  getTradeObservationCoverageStats(): {
+    monitoredTokens: number;
+    byStatus: Record<string, number>;
+    completeTokens: number;
+  } {
+    const now = utcNow();
+    const monitored = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM tokens WHERE monitoring_eligible = 1
+        AND (monitoring_lease_until_utc IS NULL OR monitoring_lease_until_utc > ?)`,
+      )
+      .get(now) as SqlRow;
+    const rows = this.#db
+      .prepare(
+        `SELECT status, COUNT(*) AS count FROM (
+          SELECT c.status, ROW_NUMBER() OVER (PARTITION BY c.mint ORDER BY c.updated_at_utc DESC, c.id DESC) AS rank
+          FROM trade_observation_coverage c JOIN tokens t ON t.mint = c.mint
+          WHERE t.monitoring_eligible = 1
+            AND (t.monitoring_lease_until_utc IS NULL OR t.monitoring_lease_until_utc > ?)
+        ) WHERE rank = 1 GROUP BY status`,
+      )
+      .all(now) as SqlRow[];
+    const byStatus = Object.fromEntries(
+      rows.map((row) => [String(row["status"]), Number(row["count"] ?? 0)]),
+    );
+    return {
+      monitoredTokens: Number(monitored["count"] ?? 0),
+      byStatus,
+      completeTokens: byStatus["COMPLETE"] ?? 0,
+    };
+  }
+
   finishEnrichmentJob(
     eventId: string,
     status: "COMPLETE" | "FAILED" | "DEFERRED_BUDGET" | "PENDING",
@@ -1184,18 +1317,23 @@ export class SentinelStore {
     }
   }
 
-  finishAnalysisJob(eventId: string, retryDelayMs = 0): void {
+  finishAnalysisJob(
+    eventId: string,
+    retryDelayMs = 0,
+    errorCode: string | null = null,
+  ): void {
     const now = utcNow();
     const args = [
-      retryDelayMs > 0 ? "PENDING" : "COMPLETE",
+      retryDelayMs > 0 || errorCode ? "PENDING" : "COMPLETE",
       new Date(Date.now() + retryDelayMs).toISOString(),
       now,
+      errorCode,
       eventId,
     ] as const;
     for (const table of ["analysis_jobs", "migration_analysis_jobs"])
       this.#db
         .prepare(
-          `UPDATE ${table} SET status = ?, next_attempt_at_utc = ?, updated_at_utc = ?
+          `UPDATE ${table} SET status = ?, next_attempt_at_utc = ?, updated_at_utc = ?, last_error_code = ?
           WHERE event_id = ?`,
         )
         .run(...args);
@@ -3409,6 +3547,9 @@ export class SentinelStore {
       health.state === "DEGRADED" || health.connectionState === "DISCONNECTED";
     if (
       this.#telegramEnabled &&
+      ["pumpportal", "helius", "helius_trade_stream"].includes(
+        health.provider,
+      ) &&
       (wasDisconnected !== isDisconnected ||
         previous?.["state"] !== health.state)
     ) {

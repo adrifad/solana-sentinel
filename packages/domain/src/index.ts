@@ -396,7 +396,13 @@ export function paperPositionId(walletId: string, mint: string): string {
 export type ProviderState =
   "DISABLED" | "STARTING" | "HEALTHY" | "DEGRADED" | "STOPPED";
 export type ProviderHealth = {
-  provider: "pumpportal" | "helius" | "helius_trade_stream";
+  provider:
+    | "pumpportal"
+    | "helius"
+    | "helius_trade_stream"
+    | "analysis_scheduler"
+    | "enrichment_scheduler"
+    | "paper_runtime";
   state: ProviderState;
   checkedAtUtc: string | null;
   lastEventAtUtc: string | null;
