@@ -16,6 +16,8 @@ The `@sentinel/paper` package contains a quote-at-arrival simulator, conservativ
 
 Automatic entry evaluation is independent of position monitoring. A persisted analysis decision notifies the PAPER entry evaluator immediately, while startup recovery scans durable decisions if a process stopped between persistence and notification. The periodic position monitor only evaluates open positions. The strict complete-coverage gate and all quote, security, signal-age, and financial risk checks remain in force. Automatic entries remain disabled in the default configuration.
 
+Inspect `GET /api/paper/candidates` to see discovered tokens, latest decisions and reason codes, security/behavior/coverage evidence, and automatic-entry evaluation state. `AUTOMATIC_ENTRIES_DISABLED` means the worker did not attempt an automatic order; persisted `NOT_ATTEMPTED`, `SKIPPED`, `EVALUATING`, and terminal order states distinguish an idle scheduler from an evaluation or order attempt. The endpoint is read-only and does not relax entry gates.
+
 The existing `risk.emergency_pause` setting is retained for configuration compatibility and maps to `pauseNewEntries`: it rejects new BUY orders before quote requests and again inside atomic settlement. A valid SELL may reduce held token balance during this pause. SELL proceeds are not compared with the BUY max trade amount; SELL settlement remains bounded by held token balance, a fresh validated quote, liquidity, fees, slippage, and ledger balance checks. Emergency liquidation is not implemented.
 
 ## Manual PAPER orders

@@ -62,6 +62,28 @@ export type ManualPaperRequest = {
   completedAtUtc: string | null;
 };
 
+export type PaperEntryEvaluation = {
+  mint: string;
+  decisionId: string | null;
+  decisionStatus: string | null;
+  status:
+    | "NOT_ATTEMPTED"
+    | "SKIPPED"
+    | "EVALUATING"
+    | "ORDER_SUBMITTED"
+    | "FILLED"
+    | "REJECTED"
+    | "UNFILLABLE";
+  reasonCode: string | null;
+  reasonCodes: string[];
+  evaluatedAtUtc: string;
+  evaluationCount: number;
+  orderAttemptCount: number;
+  executionOrderId: string | null;
+  orderStatus: string | null;
+  evidence: Record<string, unknown>;
+};
+
 export type StoredToken = {
   mint: string;
   firstSeenAtUtc: string;
@@ -129,6 +151,7 @@ export class SentinelStore {
       "012-manual-paper-request-expiry.sql",
       "013-monitoring-leases.sql",
       "014-telegram-outbox.sql",
+      "015-paper-entry-evaluations.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -368,6 +391,72 @@ export class SentinelStore {
       .prepare("SELECT * FROM tokens ORDER BY last_seen_at_utc DESC LIMIT ?")
       .all(safeLimit) as SqlRow[];
     return rows.map(mapToken);
+  }
+
+  getTokenCount(): number {
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS count FROM tokens")
+      .get() as SqlRow;
+    return Number(row["count"] ?? 0);
+  }
+
+  recordPaperEntryEvaluation(input: {
+    mint: string;
+    decisionId: string | null;
+    decisionStatus: string | null;
+    status: PaperEntryEvaluation["status"];
+    reasonCode: string | null;
+    reasonCodes?: string[];
+    evaluatedAtUtc: string;
+    executionOrderId?: string | null;
+    orderStatus?: string | null;
+    orderAttempted?: boolean;
+    evidence?: Record<string, unknown>;
+  }): void {
+    const evaluationKey = `automatic-entry:${input.mint}:${input.decisionId ?? "NO_DECISION"}`;
+    this.#db
+      .prepare(
+        `INSERT INTO paper_entry_evaluations
+         (evaluation_key, mint, decision_id, decision_status, status, reason_code,
+          reason_codes_json, evaluated_at_utc, evaluation_count, order_attempt_count,
+          execution_order_id, order_status, evidence_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+         ON CONFLICT(evaluation_key) DO UPDATE SET
+           decision_status = excluded.decision_status,
+           status = excluded.status,
+           reason_code = excluded.reason_code,
+           reason_codes_json = excluded.reason_codes_json,
+           evaluated_at_utc = excluded.evaluated_at_utc,
+           evaluation_count = paper_entry_evaluations.evaluation_count + 1,
+           order_attempt_count = paper_entry_evaluations.order_attempt_count + excluded.order_attempt_count,
+           execution_order_id = COALESCE(excluded.execution_order_id, paper_entry_evaluations.execution_order_id),
+           order_status = excluded.order_status,
+           evidence_json = excluded.evidence_json`,
+      )
+      .run(
+        evaluationKey,
+        input.mint,
+        input.decisionId,
+        input.decisionStatus,
+        input.status,
+        input.reasonCode,
+        JSON.stringify(input.reasonCodes ?? []),
+        input.evaluatedAtUtc,
+        input.orderAttempted ? 1 : 0,
+        input.executionOrderId ?? null,
+        input.orderStatus ?? null,
+        JSON.stringify(input.evidence ?? {}),
+      );
+  }
+
+  getLatestPaperEntryEvaluation(mint: string): PaperEntryEvaluation | null {
+    const row = this.#db
+      .prepare(
+        `SELECT * FROM paper_entry_evaluations WHERE mint = ?
+         ORDER BY evaluated_at_utc DESC, evaluation_key DESC LIMIT 1`,
+      )
+      .get(mint) as SqlRow | undefined;
+    return row ? mapPaperEntryEvaluation(row) : null;
   }
 
   getToken(mint: string): StoredToken | null {
@@ -3653,6 +3742,31 @@ function mapPaperOrder(row: SqlRow) {
     createdAtUtc: String(row["created_at_utc"]),
     entrySource: String(row["entry_source"] ?? "AUTOMATIC") as
       "AUTOMATIC" | "MANUAL",
+  };
+}
+
+function mapPaperEntryEvaluation(row: SqlRow): PaperEntryEvaluation {
+  return {
+    mint: String(row["mint"]),
+    decisionId: row["decision_id"] === null ? null : String(row["decision_id"]),
+    decisionStatus:
+      row["decision_status"] === null ? null : String(row["decision_status"]),
+    status: String(row["status"]) as PaperEntryEvaluation["status"],
+    reasonCode: row["reason_code"] === null ? null : String(row["reason_code"]),
+    reasonCodes: JSON.parse(String(row["reason_codes_json"])) as string[],
+    evaluatedAtUtc: String(row["evaluated_at_utc"]),
+    evaluationCount: Number(row["evaluation_count"]),
+    orderAttemptCount: Number(row["order_attempt_count"]),
+    executionOrderId:
+      row["execution_order_id"] === null
+        ? null
+        : String(row["execution_order_id"]),
+    orderStatus:
+      row["order_status"] === null ? null : String(row["order_status"]),
+    evidence: JSON.parse(String(row["evidence_json"])) as Record<
+      string,
+      unknown
+    >,
   };
 }
 

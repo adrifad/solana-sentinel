@@ -642,7 +642,7 @@ test("migration 010 persists trade evidence and prior state reopens cleanly", as
       migrations.some((item) => item.version === 6),
       true,
     );
-    assert.equal(migrations.at(-1)?.version, 14);
+    assert.equal(migrations.at(-1)?.version, 15);
     assert.equal(store.tryConsumeJupiterRequest(1), true);
     assert.equal(store.tryConsumeJupiterRequest(1), false);
   } finally {

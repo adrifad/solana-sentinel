@@ -6,3 +6,5 @@ allowBuilds:
   bufferutil: true
   esbuild: true
   utf-8-validate: true
+minimumReleaseAgeExclude:
+  - lucide-react@1.70.0

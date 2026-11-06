@@ -184,7 +184,7 @@ test("paper buy uses a quote after arrival, applies costs, and deduplicates fill
     assert.equal(result.fill?.["venueFeeRaw"], "10000");
     assert.equal(quoteProvider.calls[0]?.at, "2026-11-01T00:00:00.250Z");
     const state = store.getPaperPortfolioState("paper-wallet");
-    assert.equal(store.listAppliedMigrations().at(-1)?.version, 14);
+    assert.equal(store.listAppliedMigrations().at(-1)?.version, 15);
     assert.equal(state.solBalanceRaw, "999990000");
     assert.equal(state.positions[0]?.tokenAmountRaw, "99500");
     const quoteCount = quoteProvider.calls.length;

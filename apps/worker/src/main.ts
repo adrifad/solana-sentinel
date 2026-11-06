@@ -164,8 +164,8 @@ async function main(): Promise<void> {
     config: loaded.config,
     configVersion: loaded.configVersion,
     concurrency: loaded.config.analysis.concurrent_token_analysis,
-    onDecisionPersisted: () => {
-      if (paper) void paper.wakeEntries();
+    onDecisionPersisted: (decision) => {
+      if (paper) void paper.wakeEntries("DECISION_PERSISTED", decision.mint);
     },
   });
   analysis.start();

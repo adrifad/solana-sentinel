@@ -7,6 +7,7 @@ COPY packages ./packages
 COPY config ./config
 COPY tsconfig.json eslint.config.js ./
 RUN pnpm install --frozen-lockfile
+RUN pnpm --filter @sentinel/web build
 RUN mkdir -p /app/data && chown -R node:node /app
 USER node
 ENV APP_MODE=DRY_RUN DB_PATH=/app/data/sentinel.db

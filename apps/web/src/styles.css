@@ -1,0 +1,70 @@
+@import "@fontsource-variable/manrope";
+@import "tailwindcss";
+
+@theme {
+  --font-sans:
+    "Manrope Variable", "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --color-canvas: #080a12;
+  --color-panel: #111522;
+  --color-panel-raised: #171b2b;
+  --color-line: #252a3b;
+  --color-muted: #858ba1;
+  --color-violet: #8b72f8;
+  --color-mint: #48d6a2;
+  --color-rose: #ff7386;
+}
+
+:root {
+  color-scheme: dark;
+  font-family:
+    "Manrope Variable", "Manrope", ui-sans-serif, system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  background: #080a12;
+  color: #eef0f7;
+  font-optical-sizing: auto;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 360px;
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(
+      ellipse at 77% 0%,
+      rgb(104 80 207 / 10%),
+      transparent 30rem
+    ),
+    #080a12;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible {
+  outline: 2px solid #ab9aff;
+  outline-offset: 3px;
+}
+
+::selection {
+  background: rgb(139 114 248 / 35%);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid #080a12;
+  border-radius: 8px;
+  background: #34394d;
+}

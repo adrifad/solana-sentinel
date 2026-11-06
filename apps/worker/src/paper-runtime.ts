@@ -106,8 +106,7 @@ export class PaperRuntime {
       }
     }
     await this.tick();
-    if (this.#config.paper.automatic_entries_enabled)
-      await this.wakeEntries("STARTUP_RECOVERY");
+    await this.wakeEntries("STARTUP_RECOVERY");
     this.#timer = setInterval(
       () => void this.tick(),
       this.#config.paper.position_monitor_interval_ms,
@@ -150,8 +149,19 @@ export class PaperRuntime {
   }
 
   /** Notify the independent entry scheduler after a decision is durably saved. */
-  async wakeEntries(trigger = "DECISION_PERSISTED"): Promise<void> {
-    if (this.#stopping || !this.#config.paper.automatic_entries_enabled) return;
+  async wakeEntries(
+    trigger = "DECISION_PERSISTED",
+    candidateMint?: string,
+  ): Promise<void> {
+    if (this.#stopping) return;
+    if (!this.#config.paper.automatic_entries_enabled) {
+      this.#recordEntryCandidatesAsSkipped(
+        "AUTOMATIC_ENTRIES_DISABLED",
+        trigger,
+        candidateMint,
+      );
+      return;
+    }
     if (this.#entryBusy) {
       this.#entryWakePending = true;
       return;
@@ -163,6 +173,18 @@ export class PaperRuntime {
         await this.#considerEntries();
       } while (this.#entryWakePending && !this.#stopping);
     } catch (error) {
+      try {
+        this.#recordEntriesSkipped(
+          this.#store.listTokens(200),
+          "ENTRY_SCHEDULER_ERROR",
+          {
+            trigger,
+            errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+          },
+        );
+      } catch {
+        // Preserve worker progress if diagnostics cannot be persisted.
+      }
       log("error", "paper.entry_scheduler.failed", {
         trigger,
         errorCode: error instanceof Error ? error.name : "UNKNOWN_ERROR",
@@ -306,8 +328,19 @@ export class PaperRuntime {
     await this.#engine.refreshPortfolio(this.#walletId, observedQuotes);
   }
 
-  async #considerEntries(): Promise<void> {
-    if (!this.#initialBalanceMatches) return;
+  async #considerEntries(candidateMint?: string): Promise<void> {
+    const tokens = this.#store
+      .listTokens(200)
+      .filter(
+        (token) => candidateMint === undefined || token.mint === candidateMint,
+      );
+    if (!this.#initialBalanceMatches) {
+      this.#recordEntriesSkipped(
+        tokens,
+        "PAPER_INITIAL_BALANCE_CONFIG_MISMATCH",
+      );
+      return;
+    }
     const portfolio = await this.#engine.refreshPortfolio(this.#walletId);
     const canEnter = this.#risk.canOpenRisk({
       report: portfolio,
@@ -315,15 +348,44 @@ export class PaperRuntime {
       maxDailyLossLamports: paperExecutionConfigFromAppConfig(this.#config).risk
         .maxDailyLossLamports,
     });
-    if (!canEnter.allowed) return;
-    for (const token of this.#store.listTokens(200)) {
+    if (!canEnter.allowed) {
+      this.#recordEntriesSkipped(
+        tokens,
+        canEnter.reasonCode ?? "PAPER_RISK_GATE_BLOCKED",
+      );
+      return;
+    }
+    for (const token of tokens) {
       const decision = this.#store.listRiskDecisions(token.mint, 1)[0];
-      if (
-        !decision ||
-        decision.status !== "BUY_ELIGIBLE" ||
-        decision.configVersion !== this.#configVersion
-      )
+      if (!decision) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          null,
+          "SKIPPED",
+          "RISK_DECISION_NOT_FOUND",
+        );
         continue;
+      }
+      if (decision.status !== "BUY_ELIGIBLE") {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          `DECISION_${decision.status}`,
+          { decisionReasonCodes: decision.reasonCodes },
+        );
+        continue;
+      }
+      if (decision.configVersion !== this.#configVersion) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          "DECISION_CONFIG_VERSION_MISMATCH",
+          { currentConfigVersion: this.#configVersion },
+        );
+        continue;
+      }
       const coverage = this.#store.getLatestTradeObservationCoverage(
         token.mint,
       );
@@ -332,35 +394,108 @@ export class PaperRuntime {
         1,
       )[0];
       const security = this.#store.getLatestTokenRiskReport(token.mint);
+      if (coverage?.status !== "COMPLETE") {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          `TRADE_COVERAGE_${coverage?.status ?? "UNVERIFIED"}`,
+          { coverageReasonCode: coverage?.reasonCode ?? "NO_COVERAGE_RECORD" },
+        );
+        continue;
+      }
       if (
-        coverage?.status !== "COMPLETE" ||
         behavior?.complete !== true ||
         behavior.mint !== token.mint ||
         Date.parse(behavior.observedAtUtc) >
           Date.parse(decision.decidedAtUtc) ||
-        !decision.evidenceRefs.includes(`launch_behavior:${behavior.id}`) ||
-        security?.status !== "SUPPORTED" ||
-        security.id !== decision.securityReportId ||
-        Date.parse(coverage.windowExpiresAtUtc) >
-          Date.parse(decision.decidedAtUtc)
-      )
+        !decision.evidenceRefs.includes(`launch_behavior:${behavior.id}`)
+      ) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          "LAUNCH_BEHAVIOR_NOT_VALID_FOR_DECISION",
+          {
+            behaviorId: behavior?.id ?? null,
+            behaviorComplete: behavior?.complete ?? false,
+            behaviorObservedAtUtc: behavior?.observedAtUtc ?? null,
+          },
+        );
         continue;
+      }
+      if (
+        security?.status !== "SUPPORTED" ||
+        security.id !== decision.securityReportId
+      ) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          "SECURITY_REPORT_NOT_CURRENT_OR_SUPPORTED",
+          { securityReportId: security?.id ?? null },
+        );
+        continue;
+      }
+      if (
+        Date.parse(coverage.windowExpiresAtUtc) >
+        Date.parse(decision.decidedAtUtc)
+      ) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          "BEHAVIOR_WINDOW_NOT_CLOSED_AT_DECISION",
+          { windowExpiresAtUtc: coverage.windowExpiresAtUtc },
+        );
+        continue;
+      }
       if (
         Date.now() - Date.parse(decision.decidedAtUtc) >
         this.#config.strategy.max_signal_age_ms
-      )
+      ) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          "RISK_DECISION_EXPIRED",
+          { maxSignalAgeMs: this.#config.strategy.max_signal_age_ms },
+        );
         continue;
+      }
       const amount = solToLamports(this.#config.paper.order_size_sol);
       if (
         BigInt(amount) >
         BigInt(
           paperExecutionConfigFromAppConfig(this.#config).risk.maxTradeInputRaw,
         )
-      )
+      ) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          "PAPER_MAX_TRADE_EXCEEDED",
+          { configuredOrderSizeSol: this.#config.paper.order_size_sol },
+        );
         continue;
+      }
       const key = `paper-entry:${decision.id}`;
+      const orderId = hash(key);
+      this.#store.recordPaperEntryEvaluation({
+        mint: token.mint,
+        decisionId: decision.id,
+        decisionStatus: decision.status,
+        status: "EVALUATING",
+        reasonCode: null,
+        reasonCodes: decision.reasonCodes,
+        evaluatedAtUtc: utcNow(),
+        executionOrderId: orderId,
+        orderStatus: "PENDING",
+        orderAttempted: true,
+        evidence: { trigger: "AUTOMATIC_ENTRY_EVALUATION" },
+      });
       const result = await this.#engine.execute({
-        id: hash(key),
+        id: orderId,
         idempotencyKey: key,
         walletId: this.#walletId,
         mode: "PAPER",
@@ -377,7 +512,89 @@ export class PaperRuntime {
         status: result.order.status,
         reasonCode: result.reasonCode,
       });
+      const evaluationStatus =
+        result.order.status === "SIMULATED_FILLED"
+          ? "FILLED"
+          : result.order.status === "UNFILLABLE"
+            ? "UNFILLABLE"
+            : result.order.status === "PENDING"
+              ? "ORDER_SUBMITTED"
+              : "REJECTED";
+      this.#store.recordPaperEntryEvaluation({
+        mint: token.mint,
+        decisionId: decision.id,
+        decisionStatus: decision.status,
+        status: evaluationStatus,
+        reasonCode: result.reasonCode ?? result.order.reasonCode,
+        reasonCodes: decision.reasonCodes,
+        evaluatedAtUtc: utcNow(),
+        executionOrderId: result.order.id,
+        orderStatus: result.order.status,
+        evidence: {
+          fillId: result.fill?.["orderId"] ?? null,
+          quoteId: result.fill?.["quoteId"] ?? null,
+        },
+      });
     }
+  }
+
+  #recordEntryCandidatesAsSkipped(
+    reasonCode: string,
+    trigger: string,
+    candidateMint?: string,
+  ): void {
+    const tokens = candidateMint
+      ? [this.#store.getToken(candidateMint)].filter(
+          (token): token is NonNullable<typeof token> => token !== null,
+        )
+      : this.#store.listTokens(200);
+    this.#recordEntriesSkipped(tokens, reasonCode, { trigger });
+  }
+
+  #recordEntriesSkipped(
+    tokens: ReturnType<SentinelStore["listTokens"]>,
+    reasonCode: string,
+    evidence: Record<string, unknown> = {},
+  ): void {
+    for (const token of tokens) {
+      const decision = this.#store.listRiskDecisions(token.mint, 1)[0] ?? null;
+      this.#recordEntryEvaluation(
+        token.mint,
+        decision,
+        "NOT_ATTEMPTED",
+        reasonCode,
+        evidence,
+      );
+    }
+  }
+
+  #recordEntryEvaluation(
+    mint: string,
+    decision: ReturnType<SentinelStore["listRiskDecisions"]>[number] | null,
+    status:
+      | "NOT_ATTEMPTED"
+      | "SKIPPED"
+      | "EVALUATING"
+      | "ORDER_SUBMITTED"
+      | "FILLED"
+      | "REJECTED"
+      | "UNFILLABLE",
+    reasonCode: string | null,
+    evidence: Record<string, unknown> = {},
+  ): void {
+    this.#store.recordPaperEntryEvaluation({
+      mint,
+      decisionId: decision?.id ?? null,
+      decisionStatus: decision?.status ?? null,
+      status,
+      reasonCode,
+      reasonCodes: decision?.reasonCodes ?? [],
+      evaluatedAtUtc: utcNow(),
+      evidence: {
+        automaticEntriesEnabled: this.#config.paper.automatic_entries_enabled,
+        ...evidence,
+      },
+    });
   }
 
   async #processManualRequest(): Promise<void> {

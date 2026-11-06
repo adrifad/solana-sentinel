@@ -196,6 +196,128 @@ async function handleRequest(
   }
   if (request.method !== "GET")
     return send(response, 405, { error: "METHOD_NOT_ALLOWED" });
+  if (url.pathname === "/api/paper/candidates") {
+    const limit = Number(url.searchParams.get("limit") ?? "50");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200)
+      return send(response, 400, { error: "INVALID_LIMIT" });
+    const tokens = options.store.listTokens(200);
+    const candidates = tokens.slice(0, limit).map((token) => {
+      const decision =
+        options.store.listRiskDecisions(token.mint, 1)[0] ?? null;
+      const coverage = options.store.getLatestTradeObservationCoverage(
+        token.mint,
+      );
+      const behavior =
+        options.store.listLaunchBehaviorSnapshots(token.mint, 1)[0] ?? null;
+      const security = options.store.getLatestTokenRiskReport(token.mint);
+      const analysis = options.store.getAnalysisOutcome(token.mint)[0] ?? null;
+      const evaluation = options.store.getLatestPaperEntryEvaluation(
+        token.mint,
+      ) ?? {
+        mint: token.mint,
+        decisionId: decision?.id ?? null,
+        decisionStatus: decision?.status ?? null,
+        status: options.automaticEntriesEnabled
+          ? "NOT_EVALUATED"
+          : "NOT_ATTEMPTED",
+        reasonCode: options.automaticEntriesEnabled
+          ? "ENTRY_EVALUATION_NOT_RECORDED"
+          : "AUTOMATIC_ENTRIES_DISABLED",
+        reasonCodes: decision?.reasonCodes ?? [],
+        evaluatedAtUtc: null,
+        evaluationCount: 0,
+        orderAttemptCount: 0,
+        executionOrderId: null,
+        orderStatus: null,
+        evidence: {},
+      };
+      const evaluationAgeMs = evaluation.evaluatedAtUtc
+        ? Date.now() - Date.parse(evaluation.evaluatedAtUtc)
+        : null;
+      const attemptActivity =
+        evaluation.status !== "EVALUATING"
+          ? evaluation.status
+          : evaluationAgeMs !== null && evaluationAgeMs <= 30_000
+            ? "IN_PROGRESS"
+            : "STALE_EVALUATION_RECORD";
+      return {
+        token,
+        analysis,
+        decision,
+        security: security
+          ? {
+              id: security.id,
+              status: security.status,
+              reasonCodes: security.reasonCodes,
+              observedAtUtc: security.observedAtUtc,
+              testTokenClassification: security.testTokenClassification,
+            }
+          : null,
+        tradeCoverage: coverage,
+        launchBehavior: behavior
+          ? {
+              id: behavior.id,
+              complete: behavior.complete,
+              classification: behavior.classification,
+              reasonCodes: behavior.reasonCodes,
+              independentBuyerEstimate: behavior.independentBuyerEstimate,
+              observedAtUtc: behavior.observedAtUtc,
+            }
+          : null,
+        entryEvaluation: {
+          ...evaluation,
+          activity: attemptActivity,
+          ageMs: evaluationAgeMs,
+        },
+      };
+    });
+    const decisionCounts: Record<string, number> = {};
+    const entryEvaluationCounts: Record<string, number> = {};
+    const entryReasonCounts: Record<string, number> = {};
+    for (const candidate of candidates) {
+      const decisionStatus = candidate.decision?.status ?? "NO_DECISION";
+      decisionCounts[decisionStatus] =
+        (decisionCounts[decisionStatus] ?? 0) + 1;
+      const evaluationStatus = candidate.entryEvaluation.status;
+      entryEvaluationCounts[evaluationStatus] =
+        (entryEvaluationCounts[evaluationStatus] ?? 0) + 1;
+      const reason = candidate.entryEvaluation.reasonCode;
+      if (typeof reason === "string")
+        entryReasonCounts[reason] = (entryReasonCounts[reason] ?? 0) + 1;
+    }
+    const totalEvaluations = candidates.reduce(
+      (sum, candidate) => sum + candidate.entryEvaluation.evaluationCount,
+      0,
+    );
+    const totalOrderAttempts = candidates.reduce(
+      (sum, candidate) => sum + candidate.entryEvaluation.orderAttemptCount,
+      0,
+    );
+    return send(response, 200, {
+      mode: options.mode,
+      automaticEntriesEnabled: options.automaticEntriesEnabled,
+      schedulerState: options.automaticEntriesEnabled ? "ENABLED" : "DISABLED",
+      schedulerBlockers: options.automaticEntriesEnabled
+        ? []
+        : ["AUTOMATIC_ENTRIES_DISABLED"],
+      totalDiscovered: options.store.getTokenCount(),
+      sampleLimit: 200,
+      returnedCount: candidates.length,
+      monitoringEligibleInSample: tokens.filter(
+        (token) => token.monitoringEligible,
+      ).length,
+      decisionCounts,
+      entryEvaluationCounts,
+      entryReasonCounts,
+      currentlyEvaluatingInSample: candidates.filter(
+        (candidate) => candidate.entryEvaluation.activity === "IN_PROGRESS",
+      ).length,
+      evaluationCountInSample: totalEvaluations,
+      orderAttemptCountInSample: totalOrderAttempts,
+      candidates,
+      checkedAtUtc: utcNow(),
+    });
+  }
   if (url.pathname === "/api/paper/status") {
     if (options.mode !== "PAPER")
       return send(response, 409, { error: "PAPER_MODE_REQUIRED" });

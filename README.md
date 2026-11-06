@@ -1,7 +1,7 @@
 # Solana Sentinel — Early Launch Intelligence & Trading Bot
 
 **Status:** Read-only discovery and analysis plus an isolated, virtual `PAPER` runtime. Automatic entries remain disabled by default and live trade coverage is unverified.
-**Language:** TypeScript, Node.js, SQLite; optional React dashboard.  
+**Language:** TypeScript, Node.js, SQLite, React and Tailwind CSS dashboard.
 **Network:** Solana **mainnet** data for all modes; no live trading until separately armed.  
 **Initial focus:** Pump.fun new-token detection, creator intelligence, anti-scam, test-token classification, and shadow trading.
 
@@ -47,7 +47,13 @@
 - `config/default.yaml`: baseline non-secret settings, conservative limits; **example only**.
 - `.gitignore`: excludes `.env`, DBs, signer secrets, logs.
 
-The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Automatic entry evaluation wakes on persisted decisions independently of the exit-monitor interval, but automatic entries remain disabled by default. Monitoring slots expire after the configured observation duration, and Helius request budgeting reserves capacity for risk-reducing exit quotes. Automatic entries still require complete observation coverage, which the current log observer cannot establish; manual entry has a separate narrow evidence-backed coverage exception. PAPER has no signer or transaction submission path, LIVE, the dashboard, and profitability claims remain unsupported. See [implementation status](docs/IMPLEMENTATION-STATUS.md), the [Sprint 3.2 validation report](SPRINT32_VALIDATION_REPORT.md), and the [current zero-trade diagnostic report](ZERO_TRADE_DIAGNOSTIC_REPORT.md) for evidence and remaining gates.
+The current runtime supports explicit `DRY_RUN` and virtual `PAPER` modes. PAPER initializes a persistent virtual wallet, recovers pending orders, obtains fresh Pump curve/PumpSwap quotes through read-only Helius RPC, and monitors positions for stop-loss, take-profit, or maximum holding time. Automatic entry evaluation wakes on persisted decisions independently of the exit-monitor interval, but automatic entries remain disabled by default. Monitoring slots expire after the configured observation duration, and Helius request budgeting reserves capacity for risk-reducing exit quotes. Automatic entries still require complete observation coverage, which the current log observer cannot establish; manual entry has a separate narrow evidence-backed coverage exception. PAPER has no signer or transaction submission path. LIVE, full dashboard workflows, and profitability claims remain unsupported. See [implementation status](docs/IMPLEMENTATION-STATUS.md), the [Sprint 3.2 validation report](SPRINT32_VALIDATION_REPORT.md), and the [current zero-trade diagnostic report](ZERO_TRADE_DIAGNOSTIC_REPORT.md) for evidence and remaining gates.
+
+The optional operations dashboard is a read-only React/Tailwind application. Start it locally with `pnpm dev:web`; it proxies `/api` requests to `http://127.0.0.1:8787` by default. With Docker Compose, use `docker compose up -d --build dashboard`; it is available on `http://127.0.0.1:4173` and reads the internal API service. The screen shows discovered candidates, stored decisions and entry evaluations, observation/security state, providers, and virtual PAPER portfolio marks when the API provides them. It does not submit orders or change trading configuration. Missing API data is shown as unavailable rather than simulated.
+
+To inspect why a token has or has not reached PAPER entry evaluation, use the read-only `GET /api/paper/candidates` endpoint. It reports candidate decisions and evidence, scheduler enablement, and durable skip/order outcomes. The default configuration intentionally leaves automatic entries and verified trade streams disabled.
+
+To inspect why a token has or has not reached PAPER entry evaluation, use the read-only `GET /api/paper/candidates` endpoint. It reports candidate decisions and evidence, scheduler enablement, and durable skip/order outcomes. The default configuration intentionally leaves automatic entries and verified trade streams disabled.
 
 ## Local implementation commands
 

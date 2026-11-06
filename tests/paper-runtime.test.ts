@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import {
   paperExecutionConfigFromAppConfig,
 } from "@sentinel/paper";
 import { SentinelStore } from "@sentinel/storage";
+import { parsePumpPortalMessage } from "@sentinel/providers";
 import { PaperRuntime } from "../apps/worker/src/paper-runtime.ts";
 
 test("PAPER runtime initializes and recovers only virtual wallet state without quote provider", async () => {
@@ -84,6 +85,65 @@ test("automatic entry scheduler wakes independently from the position monitor", 
     assert.equal(tokenScans, 0);
     await runtime.wakeEntries("TEST_DECISION_PERSISTED");
     assert.equal(tokenScans, 1);
+  } finally {
+    await runtime.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("disabled automatic entry scheduler persists a visible candidate reason", async () => {
+  const fixture = JSON.parse(
+    await readFile("tests/fixtures/pumpportal-created.synthetic.json", "utf8"),
+  ) as unknown;
+  const event = parsePumpPortalMessage(fixture);
+  const directory = await mkdtemp(
+    join(tmpdir(), "sentinel-entry-diagnostics-"),
+  );
+  const store = new SentinelStore(join(directory, "paper.db"));
+  await store.open();
+  const config = (await loadConfig({ APP_MODE: "PAPER" })).config;
+  const runtime = new PaperRuntime({
+    store,
+    config,
+    configVersion: "d".repeat(64),
+  });
+  try {
+    store.ingestEvent(event, 20, true, 120);
+    await runtime.start();
+    const evaluation = store.getLatestPaperEntryEvaluation(event.mint);
+    assert.equal(evaluation?.status, "NOT_ATTEMPTED");
+    assert.equal(evaluation?.reasonCode, "AUTOMATIC_ENTRIES_DISABLED");
+    assert.equal(evaluation?.orderAttemptCount, 0);
+  } finally {
+    await runtime.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("enabled automatic entry scheduler records a missing-decision skip", async () => {
+  const fixture = JSON.parse(
+    await readFile("tests/fixtures/pumpportal-created.synthetic.json", "utf8"),
+  ) as unknown;
+  const event = parsePumpPortalMessage(fixture);
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-entry-skip-"));
+  const store = new SentinelStore(join(directory, "paper.db"));
+  await store.open();
+  const config = (await loadConfig({ APP_MODE: "PAPER" })).config;
+  config.paper.automatic_entries_enabled = true;
+  const runtime = new PaperRuntime({
+    store,
+    config,
+    configVersion: "e".repeat(64),
+  });
+  try {
+    store.ingestEvent(event, 20, true, 120);
+    await runtime.start();
+    const evaluation = store.getLatestPaperEntryEvaluation(event.mint);
+    assert.equal(evaluation?.status, "SKIPPED");
+    assert.equal(evaluation?.reasonCode, "RISK_DECISION_NOT_FOUND");
+    assert.equal(evaluation?.orderAttemptCount, 0);
   } finally {
     await runtime.stop();
     store.close();

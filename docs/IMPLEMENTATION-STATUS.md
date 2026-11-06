@@ -1,5 +1,13 @@
 # Solana Sentinel Implementation Status
 
+## Read-only operations dashboard — 2026-11-06
+
+- Added the first React/Tailwind operations dashboard slice in `apps/web`: API-backed discovery/decision counts, candidate and entry-evaluation table, readiness blockers, provider health, observation completeness, and PAPER wallet/position/PnL status when mode is PAPER.
+- The UI is strictly read-only and polls health/candidate diagnostics every 15 seconds. Missing API or quote data is displayed as unavailable; no market values are synthesized. It has no order or configuration controls.
+- Local development uses `pnpm dev:web`. Compose adds an optional dashboard service on `127.0.0.1:4173`, behind the internal API and without operator credentials. Automatic entries remain disabled by default.
+- Visual review covered desktop and mobile layouts with the API offline; the offline state rendered explicitly. This is a first slice, not the full dashboard specification: token detail, creator pages, SSE, and write/configuration workflows are not included.
+- A fresh isolated database applied migrations through schema version 15 and passed `PRAGMA integrity_check`. Automated fixtures and quality checks are listed with the dashboard delivery commit after merge validation.
+
 ## Independent Telegram monitoring service — 2026-11-03
 
 - Added an optional `apps/telegram-bot` process and Compose profile. It is disabled by default, publishes no port, runs with a read-only container root, shares only the existing SQLite data volume, and uses internal API reads for status/portfolio data.
