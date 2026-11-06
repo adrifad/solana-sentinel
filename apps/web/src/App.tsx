@@ -2,10 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Activity,
-  Bell,
   Blocks,
   Check,
-  ChevronDown,
   CircleAlert,
   CircleCheck,
   CircleDot,
@@ -19,7 +17,6 @@ import {
   Search,
   ShieldAlert,
   ShieldCheck,
-  SlidersHorizontal,
   WalletCards,
   X,
   Zap,
@@ -164,11 +161,11 @@ export default function App() {
         <aside className="hidden w-[248px] shrink-0 border-r border-line/80 bg-[#0b0d16] lg:flex lg:flex-col">
           <Brand />
           <div className="px-4 pb-5">
-            <div className="flex rounded-xl border border-white/[0.06] bg-white/[0.025] p-1 text-[11px] text-muted">
-              <span className="flex-1 rounded-lg bg-[#29223f] px-3 py-2 text-center font-semibold text-[#c7baff]">
+            <div className="flex items-center gap-2 px-1 text-[10px] text-muted">
+              <span className="rounded-md border border-[#574684]/70 bg-[#29223f]/55 px-2 py-1 font-semibold text-[#c7baff]">
                 Mainnet
               </span>
-              <span className="flex-1 px-3 py-2 text-center">Read only</span>
+              <span className="text-[#6f7589]">Read-only console</span>
             </div>
           </div>
           <nav className="px-3" aria-label="Main navigation">
@@ -305,13 +302,6 @@ export default function App() {
                   ? "PAPER / VIRTUAL"
                   : (health?.mode ?? "WAITING FOR API")}
               </div>
-              <button
-                className="relative rounded-xl border border-white/[0.08] bg-white/[0.025] p-2 text-[#9197aa] hover:text-white"
-                aria-label="Notifications are unavailable in this dashboard"
-              >
-                <Bell size={16} />
-                <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-violet" />
-              </button>
               <button
                 onClick={() => void refreshDashboard()}
                 disabled={refreshing}
@@ -604,8 +594,8 @@ export default function App() {
                         placeholder="Filter name or mint"
                       />
                     </label>
-                    <div className="hidden h-9 shrink-0 items-center gap-2 rounded-lg border border-white/[0.08] bg-black/20 px-2.5 text-[10px] text-[#9298aa] sm:flex">
-                      <SlidersHorizontal size={13} /> Latest first
+                    <div className="hidden shrink-0 px-1 text-[10px] text-[#7d8498] sm:block">
+                      Newest first
                     </div>
                   </div>
                 </div>
@@ -873,7 +863,6 @@ function Brand() {
         </p>
         <p className="mt-0.5 text-[9px] text-[#777e92]">Launch intelligence</p>
       </div>
-      <ChevronDown size={13} className="ml-auto text-[#72788c]" />
     </div>
   );
 }
