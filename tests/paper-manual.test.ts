@@ -160,12 +160,15 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
   const quoteProvider = {
     quoteAvailable: true,
     rateLimitOnce: true,
+    requests: [] as Array<{ side: string; priority: string | undefined }>,
     async quoteAtArrival(request: {
       mint: string;
       side: "BUY" | "SELL";
       exactInputAmountRaw: string;
       requestedAtUtc: string;
+      priority?: "CANDIDATE" | "EXIT";
     }): Promise<QuoteResult | null> {
+      this.requests.push({ side: request.side, priority: request.priority });
       if (!this.quoteAvailable) return null;
       await new Promise((resolve) => setTimeout(resolve, 200));
       const time = Date.parse(request.requestedAtUtc);
@@ -254,6 +257,12 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
     // Simulate restart after the request and idempotent order were claimed.
     await runtime.start();
     await waitForRequest(store, queued.id, "FILLED");
+    assert.ok(
+      quoteProvider.requests.some(
+        (request) =>
+          request.side === "SELL" && request.priority === "CANDIDATE",
+      ),
+    );
     assert.equal(store.getManualPaperRequest(queued.id)?.attempts, 3);
     const portfolioAfterBuy = store.getPaperPortfolioState(walletId);
     assert.equal(portfolioAfterBuy.positions.length, 1);
@@ -304,6 +313,11 @@ test("manual PAPER BUY then SELL settles virtual balances, position and realized
       createdAtUtc: new Date().toISOString(),
     });
     await waitForRequest(store, exit.id, "FILLED");
+    assert.ok(
+      quoteProvider.requests.some(
+        (request) => request.side === "SELL" && request.priority === undefined,
+      ),
+    );
     const finalState = store.getPaperPortfolioState(walletId);
     assert.equal(finalState.positions.length, 0);
     assert.ok(BigInt(finalState.solBalanceRaw) > 10_000_000_000n - 10_000_000n);

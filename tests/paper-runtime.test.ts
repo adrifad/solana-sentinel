@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "@sentinel/config";
+import { base58Encode } from "@sentinel/domain";
 import type { QuoteResult } from "@sentinel/domain";
 import {
   PaperTradingEngine,
@@ -12,6 +13,7 @@ import {
 import { SentinelStore } from "@sentinel/storage";
 import { parsePumpPortalMessage } from "@sentinel/providers";
 import { PaperRuntime } from "../apps/worker/src/paper-runtime.ts";
+import { computeAdaptivePositionMonitorDelayMs } from "../apps/worker/src/paper-runtime.ts";
 
 test("PAPER runtime initializes and recovers only virtual wallet state without quote provider", async () => {
   const directory = await mkdtemp(join(tmpdir(), "sentinel-paper-runtime-"));
@@ -61,35 +63,94 @@ test("PAPER runtime initializes and recovers only virtual wallet state without q
   }
 });
 
-test("automatic entry scheduler wakes independently from the position monitor", async () => {
+test("candidate wake evaluates only its mint and queues concurrent candidate wakes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "sentinel-paper-entry-wake-"));
   const store = new SentinelStore(join(directory, "paper.db"));
   await store.open();
   const config = (await loadConfig({ APP_MODE: "PAPER" })).config;
   config.paper.automatic_entries_enabled = true;
   let tokenScans = 0;
+  const evaluatedMints: string[] = [];
   const listTokens = store.listTokens.bind(store);
   store.listTokens = ((...args: Parameters<typeof store.listTokens>) => {
     tokenScans += 1;
     return listTokens(...args);
   }) as typeof store.listTokens;
+  const recordEvaluation = store.recordPaperEntryEvaluation.bind(store);
+  store.recordPaperEntryEvaluation = ((
+    input: Parameters<typeof store.recordPaperEntryEvaluation>[0],
+  ) => {
+    evaluatedMints.push(input.mint);
+    return recordEvaluation(input);
+  }) as typeof store.recordPaperEntryEvaluation;
   const runtime = new PaperRuntime({
     store,
     config,
     configVersion: "c".repeat(64),
   });
   try {
+    const fixture = JSON.parse(
+      await readFile(
+        "tests/fixtures/pumpportal-created.synthetic.json",
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    const first = parsePumpPortalMessage(fixture);
+    const second = parsePumpPortalMessage({
+      ...fixture,
+      mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      signature: base58Encode(Buffer.alloc(64, 1)),
+    });
+    store.ingestEvent(first, 20, true, 120);
+    store.ingestEvent(second, 20, true, 120);
     await runtime.start();
     tokenScans = 0;
+    evaluatedMints.length = 0;
+    config.paper.automatic_entries_enabled = true;
     await runtime.tick();
     assert.equal(tokenScans, 0);
-    await runtime.wakeEntries("TEST_DECISION_PERSISTED");
-    assert.equal(tokenScans, 1);
+    await Promise.all([
+      runtime.wakeEntries("DECISION_PERSISTED", first.mint),
+      runtime.wakeEntries("DECISION_PERSISTED", second.mint),
+    ]);
+    assert.equal(tokenScans, 0);
+    assert.deepEqual(
+      new Set(evaluatedMints),
+      new Set([first.mint, second.mint]),
+    );
   } finally {
     await runtime.stop();
     store.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("exit monitoring cadence adapts to remaining Helius request budget", () => {
+  const input = {
+    baseIntervalMs: 15_000,
+    maxIntervalMs: 900_000,
+    openPositions: 2,
+    estimatedRpcRequestsPerPosition: 4,
+    remainingRpcRequests: 200,
+    untilBudgetResetMs: 12 * 60 * 60 * 1000,
+  };
+  assert.equal(
+    computeAdaptivePositionMonitorDelayMs({
+      ...input,
+      remainingRpcRequests: 0,
+    }),
+    input.maxIntervalMs,
+  );
+  assert.ok(
+    computeAdaptivePositionMonitorDelayMs(input) > input.baseIntervalMs,
+  );
+  assert.equal(
+    computeAdaptivePositionMonitorDelayMs({
+      ...input,
+      remainingRpcRequests: 100_000,
+    }),
+    input.baseIntervalMs,
+  );
 });
 
 test("disabled automatic entry scheduler persists a visible candidate reason", async () => {

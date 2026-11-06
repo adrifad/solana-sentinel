@@ -237,12 +237,15 @@ export class HeliusTradeStream {
         this.#onMessage(data);
       });
       socket.on("error", () => {
-        if (this.#socket === socket)
+        if (this.#socket === socket) {
+          this.#markActiveSubscriptionsGap("HELIUS_TRADE_SOCKET_ERROR");
           this.#options.onHealth?.(
             "DEGRADED",
             "HELIUS_TRADE_SOCKET_ERROR",
             this.#reconnectCount,
           );
+          if (socket.readyState < WebSocket.CLOSING) socket.close();
+        }
       });
       socket.on("close", () => {
         finish();
@@ -250,17 +253,7 @@ export class HeliusTradeStream {
         this.#socket = undefined;
         this.#requests.clear();
         if (!this.#running) return;
-        const at = new Date(this.#options.now()).toISOString();
-        for (const subscription of this.#subscriptions.values()) {
-          subscription.subscriptionId = null;
-          subscription.requestId = null;
-          this.#reportCoverage(
-            subscription,
-            "GAP_DETECTED",
-            "HELIUS_TRADE_SOCKET_DISCONNECTED",
-            Date.parse(at),
-          );
-        }
+        this.#markActiveSubscriptionsGap("HELIUS_TRADE_SOCKET_DISCONNECTED");
         this.#reconnectCount += 1;
         this.#options.onHealth?.(
           "DEGRADED",
@@ -275,6 +268,24 @@ export class HeliusTradeStream {
         this.#retryTimer = setTimeout(() => this.#connect(), delay);
       });
     });
+  }
+
+  #markActiveSubscriptionsGap(reasonCode: string): void {
+    const observedAt = this.#options.now();
+    for (const subscription of this.#subscriptions.values()) {
+      if (subscription.subscriptionId !== null)
+        this.#bySubscriptionId.delete(subscription.subscriptionId);
+      if (subscription.requestId !== null)
+        this.#requests.delete(subscription.requestId);
+      subscription.subscriptionId = null;
+      subscription.requestId = null;
+      this.#reportCoverage(
+        subscription,
+        "GAP_DETECTED",
+        reasonCode,
+        observedAt,
+      );
+    }
   }
 
   #sendSubscribe(subscription: Subscription): void {

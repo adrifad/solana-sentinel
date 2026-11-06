@@ -336,11 +336,12 @@ test("Helius reconnect records a gap and resubscribes without claiming completen
   sockets[0]!.emit("open");
   assert.equal(stream.activeSubscriptionCount, 1);
   assert.match(sockets[0]!.sent[0]!, /logsSubscribe/);
-  sockets[0]!.emit("close");
+  sockets[0]!.emit("error", new Error("synthetic socket fault"));
   await waitFor(() => sockets.length === 2);
   sockets[1]!.emit("open");
   assert.match(sockets[1]!.sent[0]!, /logsSubscribe/);
   assert.ok(coverage.some((item) => item.startsWith("GAP_DETECTED:")));
+  assert.ok(coverage.includes("GAP_DETECTED:HELIUS_TRADE_SOCKET_ERROR"));
   assert.ok(coverage.every((item) => !item.startsWith("COMPLETE:")));
   await stream.stop();
 });

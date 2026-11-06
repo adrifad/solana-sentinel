@@ -1036,6 +1036,7 @@ export class SentinelStore {
   getAnalysisPipelineStats(): {
     eligibleTokens: number;
     analysis: Record<string, number>;
+    historicalAnalysis: Record<string, number>;
     enrichment: Record<string, number>;
     migrationRecovery: Record<string, number>;
     failureReasons: Array<{ reasonCode: string; count: number }>;
@@ -1067,6 +1068,12 @@ export class SentinelStore {
       ) GROUP BY status`,
       now,
       now,
+    );
+    const historicalAnalysis = countStatuses(
+      `SELECT status, COUNT(*) AS count FROM (
+        SELECT status FROM analysis_jobs
+        UNION ALL SELECT status FROM migration_analysis_jobs
+      ) GROUP BY status`,
     );
     const enrichment = countStatuses(
       `SELECT status, COUNT(*) AS count FROM enrichment_jobs j
@@ -1104,6 +1111,7 @@ export class SentinelStore {
     return {
       eligibleTokens: Number(eligible["count"] ?? 0),
       analysis,
+      historicalAnalysis,
       enrichment,
       migrationRecovery,
       failureReasons: failures.map((row) => ({
@@ -1125,6 +1133,9 @@ export class SentinelStore {
     monitoredTokens: number;
     byStatus: Record<string, number>;
     completeTokens: number;
+    observationCount: number;
+    verifiedObservationCount: number;
+    latestObservationAtUtc: string | null;
   } {
     const now = utcNow();
     const monitored = this.#db
@@ -1146,10 +1157,22 @@ export class SentinelStore {
     const byStatus = Object.fromEntries(
       rows.map((row) => [String(row["status"]), Number(row["count"] ?? 0)]),
     );
+    const observations = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+          SUM(CASE WHEN validation_status = 'VERIFIED' THEN 1 ELSE 0 END) AS verified,
+          MAX(received_at_utc) AS latest
+         FROM launch_trade_observations`,
+      )
+      .get() as SqlRow;
     return {
       monitoredTokens: Number(monitored["count"] ?? 0),
       byStatus,
       completeTokens: byStatus["COMPLETE"] ?? 0,
+      observationCount: Number(observations["total"] ?? 0),
+      verifiedObservationCount: Number(observations["verified"] ?? 0),
+      latestObservationAtUtc:
+        observations["latest"] === null ? null : String(observations["latest"]),
     };
   }
 

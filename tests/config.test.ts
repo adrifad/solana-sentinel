@@ -15,6 +15,9 @@ test("loads safe DRY_RUN defaults without wallet credentials", async () => {
     DB_PATH: ":memory:",
   });
   assert.equal(loaded.config.mode, "DRY_RUN");
+  assert.equal(loaded.config.paper.position_monitor_interval_ms, 15_000);
+  assert.equal(loaded.config.paper.position_monitor_max_interval_ms, 900_000);
+  assert.equal(loaded.config.paper.position_monitor_estimated_rpc_requests, 2);
   assert.equal(loaded.pumpPortalApiKey, undefined);
   assert.equal(loaded.heliusApiKey, undefined);
   assert.match(loaded.configVersion, /^[a-f0-9]{64}$/);
@@ -52,6 +55,20 @@ test("rejects unsupported settings and bad ports", async () => {
   );
   await assert.rejects(() => loadConfig({ APP_CONFIG_PATH: capacityFile }));
   await rm(capacityPath, { recursive: true, force: true });
+
+  const intervalPath = await mkdtemp(
+    join(tmpdir(), "sentinel-monitor-interval-"),
+  );
+  const intervalFile = join(intervalPath, "bad-interval.yaml");
+  await writeFile(
+    intervalFile,
+    valid.replace(
+      "position_monitor_max_interval_ms: 900000",
+      "position_monitor_max_interval_ms: 1000",
+    ),
+  );
+  await assert.rejects(() => loadConfig({ APP_CONFIG_PATH: intervalFile }));
+  await rm(intervalPath, { recursive: true, force: true });
 });
 
 test("Telegram bot stays disabled by default and requires explicit secrets and allowlists", async () => {

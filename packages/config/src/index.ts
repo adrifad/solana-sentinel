@@ -145,6 +145,18 @@ export const AppConfigSchema = z
         stop_loss_bps: z.number().int().min(1).max(10000),
         take_profit_bps: z.number().int().positive(),
         position_monitor_interval_ms: z.number().int().min(250).max(900000),
+        position_monitor_max_interval_ms: z
+          .number()
+          .int()
+          .min(1000)
+          .max(3600000)
+          .default(900000),
+        position_monitor_estimated_rpc_requests: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(2),
         exit_retry_base_ms: z.number().int().min(1000).max(300000),
         exit_retry_max_ms: z.number().int().min(1000).max(3600000),
       })
@@ -161,6 +173,15 @@ export const AppConfigSchema = z
   })
   .strict()
   .superRefine((config, context) => {
+    if (
+      config.paper.position_monitor_max_interval_ms <
+      config.paper.position_monitor_interval_ms
+    )
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["paper", "position_monitor_max_interval_ms"],
+        message: "position monitor max interval must be >= its base interval",
+      });
     if (
       config.providers.helius.exit_reserved_requests_per_utc_day >
       config.providers.helius.max_requests_per_utc_day

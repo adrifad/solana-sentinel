@@ -28,7 +28,7 @@ Deployment hard locks (mode, live enablement, wallet/signer identity, chain netw
 - `providers.helius`: `enable_trade_stream` defaults false; if explicitly enabled, `max_active_trade_subscriptions` and `max_trade_events_per_day` cap the read-only logs observer. Coverage remains unverified without reconciliation.
 - `security`: mint authority/extension policy, unknown handling, holder sampling size, snapshot freshness and slot-skew limits.
 - `strategy`: entry timing, opportunity score and scoring weights, min observations.
-- `paper`: initial virtual SOL, wallet id, latency simulation, quote stale window, fee model, conservative slippage, auto-entry opt-in, stop/take thresholds, monitor cadence, and bounded exit retry delays. The default position monitor cadence is 10 minutes to respect the configured Helius request budget at the maximum position count.
+- `paper`: initial virtual SOL, wallet id, latency simulation, quote stale window, fee model, conservative slippage, auto-entry opt-in, stop/take thresholds, monitor cadence, and bounded exit retry delays. Exit monitoring defaults to a 15-second base cadence and adapts up to 15 minutes using open-position count, estimated/observed quote RPC cost, remaining Helius daily request budget, and time until UTC reset. Set `position_monitor_estimated_rpc_requests` conservatively; the cadence is not a guaranteed exit time.
 - `risk`: per-order max SOL, max exposure, position count, daily loss, max drawdown, maximum quote price impact.
 - `observability`: health thresholds, budgets, event logging retention.
 

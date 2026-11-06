@@ -1317,6 +1317,7 @@ function readinessStatus(status: unknown, fallback: unknown): string {
   if (typeof status === "string") {
     const labels: Record<string, string> = {
       READY: "Ready",
+      IDLE: "Idle · no active monitoring leases",
       RUNNING: "Running",
       DEGRADED: "Degraded",
       BLOCKED: "Blocked",
@@ -1348,12 +1349,30 @@ function AnalysisDiagnostics({
     typeof readiness["tradeObservationDiagnostics"] === "object"
       ? (readiness["tradeObservationDiagnostics"] as Record<string, unknown>)
       : {};
+  const paperData =
+    readiness["paper"] && typeof readiness["paper"] === "object"
+      ? (readiness["paper"] as Record<string, unknown>)
+      : {};
+  const monitorData =
+    paperData["positionMonitor"] &&
+    typeof paperData["positionMonitor"] === "object"
+      ? (paperData["positionMonitor"] as Record<string, unknown>)
+      : {};
   const analysisBlockers = Array.isArray(data["blockers"])
     ? (data["blockers"] as string[])
     : [];
+  const historicalAnalysis =
+    data["historicalStatusCounts"] &&
+    typeof data["historicalStatusCounts"] === "object"
+      ? (data["historicalStatusCounts"] as Record<string, number>)
+      : {};
   const automaticBlockers = Array.isArray(readiness["automaticEntryBlockers"])
     ? (readiness["automaticEntryBlockers"] as string[])
     : [];
+  const coverageStatuses =
+    tradeData["byStatus"] && typeof tradeData["byStatus"] === "object"
+      ? Object.entries(tradeData["byStatus"] as Record<string, number>)
+      : [];
   const rpcErrors = Array.isArray(budgetData["byErrorCode"])
     ? (budgetData["byErrorCode"] as Array<Record<string, unknown>>)
     : [];
@@ -1363,10 +1382,14 @@ function AnalysisDiagnostics({
   return (
     <div className="mt-4 space-y-3 border-t border-line/70 pt-3">
       <div className="grid grid-cols-2 gap-2 text-[9px] text-[#8c93a8] sm:grid-cols-4">
-        <DiagnosticValue label="Eligible" value={data["eligibleTokens"]} />
+        <DiagnosticValue label="Active leases" value={data["eligibleTokens"]} />
         <DiagnosticValue label="Queued" value={data["pending"]} />
         <DiagnosticValue label="Processing" value={data["processing"]} />
-        <DiagnosticValue label="Analyzed" value={data["complete"]} />
+        <DiagnosticValue label="Analyzed total" value={data["complete"]} />
+        <DiagnosticValue
+          label="Failed total"
+          value={historicalAnalysis["FAILED"]}
+        />
       </div>
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-[9px] text-[#8c93a8]">
         <span>
@@ -1379,7 +1402,37 @@ function AnalysisDiagnostics({
           {number(tradeData["monitoredTokens"] as number | undefined)} complete
           · {String(healthCoverage(readiness["tradeObservationStatus"]))}
         </span>
+        <span>
+          Verified trades:{" "}
+          {number(tradeData["verifiedObservationCount"] as number | undefined)}{" "}
+          / {number(tradeData["observationCount"] as number | undefined)}
+        </span>
       </div>
+      {coverageStatuses.length > 0 && (
+        <p className="text-[9px] leading-relaxed text-[#8c93a8]">
+          Coverage states:{" "}
+          {coverageStatuses
+            .map(([state, count]) => `${state} ${number(count)}`)
+            .join(" · ")}
+        </p>
+      )}
+      <p className="text-[9px] leading-relaxed text-[#8c93a8]">
+        Exit monitor: {String(monitorData["status"] ?? "Unavailable")} ·{" "}
+        {number(monitorData["openPositions"] as number | undefined)} open ·
+        configured{" "}
+        {number(monitorData["configuredIntervalMs"] as number | undefined)} ms
+        base · estimate{" "}
+        {number(monitorData["estimatedNextIntervalMs"] as number | undefined)}{" "}
+        ms · exit RPC{" "}
+        {number(monitorData["exitRequestsUsed"] as number | undefined)} used /{" "}
+        {number(monitorData["exitRequestsRemaining"] as number | undefined)}{" "}
+        available · capacity{" "}
+        {formatReason(String(monitorData["budgetReadiness"] ?? "UNKNOWN"))} ·
+        daily need{" "}
+        {number(monitorData["requiredDailyExitRequests"] as number | undefined)}{" "}
+        / {number(monitorData["reservedExitRequests"] as number | undefined)}{" "}
+        reserved
+      </p>
       {rpcErrors.length > 0 && (
         <p className="text-[9px] leading-relaxed text-[#d1aa72]">
           RPC errors today:{" "}

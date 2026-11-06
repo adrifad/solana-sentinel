@@ -23,6 +23,9 @@ export type ApiOptions = {
   manualExitRequestExpiryMs?: number;
   minHolderSampleCoverageBps?: number;
   minIndependentBuyers?: number;
+  positionMonitorIntervalMs?: number;
+  positionMonitorMaxIntervalMs?: number;
+  positionMonitorEstimatedRpcRequests?: number;
 };
 
 const EntryRequestSchema = z
@@ -553,6 +556,7 @@ export function getOperationalReadiness(options: ApiOptions) {
   const analysisStats = options.store.getAnalysisPipelineStats?.() ?? {
     eligibleTokens: monitoredTokens.length,
     analysis: {},
+    historicalAnalysis: {},
     enrichment: {},
     migrationRecovery: {},
     failureReasons: [],
@@ -568,10 +572,15 @@ export function getOperationalReadiness(options: ApiOptions) {
           options.store.getLatestTradeObservationCoverage(token.mint)
             ?.status === "COMPLETE",
       ).length,
+      observationCount: 0,
+      verifiedObservationCount: 0,
+      latestObservationAtUtc: null,
     };
   const analysisPending = analysisStats.analysis["PENDING"] ?? 0;
   const analysisProcessing = analysisStats.analysis["PROCESSING"] ?? 0;
   const analysisCompleted = analysisStats.analysis["COMPLETE"] ?? 0;
+  const analysisCompletedHistorically =
+    analysisStats.historicalAnalysis?.["COMPLETE"] ?? analysisCompleted;
   const enrichmentPending = analysisStats.enrichment["PENDING"] ?? 0;
   const enrichmentProcessing = analysisStats.enrichment["PROCESSING"] ?? 0;
   const budgetDeferred = analysisStats.enrichment["DEFERRED_BUDGET"] ?? 0;
@@ -599,29 +608,33 @@ export function getOperationalReadiness(options: ApiOptions) {
     analysisCompleted > 0 &&
     !budgetDeferred &&
     !analysisFailures;
-  const analysisStatus =
-    analysisStats.eligibleTokens === 0
-      ? "BLOCKED"
-      : !recentlyChecked(analysisScheduler) ||
-          !recentlyChecked(enrichmentScheduler)
-        ? "BLOCKED"
-        : budgetBlocked ||
-            analysisFailures ||
-            analysisSchedulerDegraded ||
-            heliusRpcDegraded
-          ? "DEGRADED"
-          : helius?.state !== "HEALTHY"
-            ? "BLOCKED"
-            : analysisPending > 0 ||
-                analysisProcessing > 0 ||
-                enrichmentPending > 0 ||
-                enrichmentProcessing > 0 ||
-                migrationPending > 0 ||
-                migrationProcessing > 0
-              ? "RUNNING"
-              : analysisReady
-                ? "READY"
-                : "BLOCKED";
+  const analysisQueueActive =
+    analysisPending > 0 ||
+    analysisProcessing > 0 ||
+    enrichmentPending > 0 ||
+    enrichmentProcessing > 0 ||
+    migrationPending > 0 ||
+    migrationProcessing > 0;
+  const analysisSchedulersFresh =
+    recentlyChecked(analysisScheduler) && recentlyChecked(enrichmentScheduler);
+  const analysisStatus = !analysisSchedulersFresh
+    ? "BLOCKED"
+    : budgetBlocked ||
+        analysisFailures ||
+        analysisSchedulerDegraded ||
+        heliusRpcDegraded
+      ? "DEGRADED"
+      : helius?.state !== "HEALTHY"
+        ? analysisQueueActive
+          ? "BLOCKED"
+          : "DEGRADED"
+        : analysisQueueActive
+          ? "RUNNING"
+          : analysisStats.eligibleTokens === 0
+            ? "IDLE"
+            : analysisReady
+              ? "READY"
+              : "BLOCKED";
   const tradeObservationReady =
     options.tradeStreamEnabled &&
     heliusTradeStream?.state === "HEALTHY" &&
@@ -655,6 +668,13 @@ export function getOperationalReadiness(options: ApiOptions) {
     analysisBlockers.push("MIGRATION_RECOVERY_PENDING");
   if (budgetBlocked) analysisBlockers.push("HELIUS_REQUEST_BUDGET_EXHAUSTED");
   if (analysisFailures) analysisBlockers.push("ANALYSIS_PROVIDER_FAILURES");
+  if (
+    analysisStats.eligibleTokens > 0 &&
+    !analysisQueueActive &&
+    analysisCompleted === 0 &&
+    !analysisFailures
+  )
+    analysisBlockers.push("NO_COMPLETED_ANALYSIS_FOR_ACTIVE_LEASES");
   if (!analysisReady) blockers.push("ANALYSIS_NOT_READY");
   let paperAccount: ReturnType<SentinelStore["getPaperPortfolioState"]> | null =
     null;
@@ -683,6 +703,34 @@ export function getOperationalReadiness(options: ApiOptions) {
     options.mode === "PAPER" && paperAccount !== null && runtimeHealthFresh;
   if (options.mode === "PAPER" && !runtimeHealthFresh)
     blockers.push("PAPER_WORKER_NOT_HEALTHY");
+  const projectedPositions = Math.max(
+    1,
+    (paperAccount?.positions.length ?? 0) + 1,
+  );
+  const estimatedRpcRequestsPerPosition =
+    options.positionMonitorEstimatedRpcRequests ?? 0;
+  const maximumMonitorIntervalMs = options.positionMonitorMaxIntervalMs ?? 0;
+  const requiredDailyExitRequests =
+    maximumMonitorIntervalMs > 0
+      ? Math.ceil(
+          (projectedPositions * estimatedRpcRequestsPerPosition * 86_400_000) /
+            maximumMonitorIntervalMs,
+        )
+      : Number.POSITIVE_INFINITY;
+  const positionMonitorBudgetReason =
+    options.mode !== "PAPER"
+      ? null
+      : heliusRequestBudget === null ||
+          estimatedRpcRequestsPerPosition <= 0 ||
+          maximumMonitorIntervalMs <= 0
+        ? "EXIT_MONITOR_BUDGET_UNKNOWN"
+        : requiredDailyExitRequests > heliusRequestBudget.reservedForExits
+          ? "EXIT_MONITOR_BUDGET_INSUFFICIENT"
+          : heliusRequestBudget.remaining <
+              estimatedRpcRequestsPerPosition * projectedPositions
+            ? "EXIT_MONITOR_BUDGET_EXHAUSTED"
+            : null;
+  const positionMonitorBudgetReady = positionMonitorBudgetReason === null;
   const paperExecutionReady =
     options.mode === "PAPER" &&
     options.automaticEntriesEnabled &&
@@ -692,6 +740,7 @@ export function getOperationalReadiness(options: ApiOptions) {
     Boolean(helius?.state === "HEALTHY") &&
     Boolean(heliusTradeStream?.state === "HEALTHY") &&
     paperRuntimeReady &&
+    positionMonitorBudgetReady &&
     (paperAccount?.latestMark?.unpriceablePositions ?? 0) === 0;
   const walletReady = Boolean(
     paperAccount && paperAccountInit && initialBalanceMatches,
@@ -803,6 +852,43 @@ export function getOperationalReadiness(options: ApiOptions) {
       behaviorValid,
     );
   });
+  const positionMonitorStates =
+    options.store.listPaperPositionMonitorStates?.(options.paperWalletId) ?? [];
+  const positionMonitorCounts: Record<string, number> = {};
+  for (const monitor of positionMonitorStates)
+    positionMonitorCounts[monitor.status] =
+      (positionMonitorCounts[monitor.status] ?? 0) + 1;
+  const configuredMonitorBaseMs = options.positionMonitorIntervalMs ?? null;
+  const configuredMonitorMaxMs = options.positionMonitorMaxIntervalMs ?? null;
+  let estimatedNextMonitorDelayMs: number | null = null;
+  if (paperAccount && configuredMonitorBaseMs && configuredMonitorMaxMs) {
+    if (paperAccount.positions.length === 0) {
+      estimatedNextMonitorDelayMs = configuredMonitorBaseMs;
+    } else if (heliusRequestBudget) {
+      const now = new Date();
+      const untilUtcResetMs = Math.max(
+        1000,
+        Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth(),
+          now.getUTCDate() + 1,
+        ) - now.getTime(),
+      );
+      const estimate =
+        heliusRequestBudget.remaining <= 0
+          ? configuredMonitorMaxMs
+          : Math.ceil(
+              ((options.positionMonitorEstimatedRpcRequests ?? 1) *
+                paperAccount.positions.length *
+                untilUtcResetMs) /
+                heliusRequestBudget.remaining,
+            );
+      estimatedNextMonitorDelayMs = Math.min(
+        configuredMonitorMaxMs,
+        Math.max(configuredMonitorBaseMs, estimate),
+      );
+    }
+  }
   const paperManualEntryBlockers: string[] = [];
   const paperManualExitBlockers: string[] = [];
   if (options.mode !== "PAPER") {
@@ -825,6 +911,8 @@ export function getOperationalReadiness(options: ApiOptions) {
     paperManualEntryBlockers.push("QUOTE_PROVIDER_NOT_HEALTHY");
     paperManualExitBlockers.push("QUOTE_PROVIDER_NOT_HEALTHY");
   }
+  if (positionMonitorBudgetReason)
+    paperManualEntryBlockers.push(positionMonitorBudgetReason);
   if (!manualCandidateAvailable)
     paperManualEntryBlockers.push("NO_VERIFIED_MANUAL_ENTRY_CANDIDATE");
   if (!paperAccount?.positions.length)
@@ -866,6 +954,12 @@ export function getOperationalReadiness(options: ApiOptions) {
     buyEligibleInActiveSample === 0
   )
     automaticEntryBlockers.push("NO_BUY_ELIGIBLE_DECISION_IN_ACTIVE_SAMPLE");
+  if (
+    options.mode === "PAPER" &&
+    options.automaticEntriesEnabled &&
+    positionMonitorBudgetReason
+  )
+    automaticEntryBlockers.push(positionMonitorBudgetReason);
   return {
     mode: options.mode,
     processHealth: true,
@@ -887,7 +981,9 @@ export function getOperationalReadiness(options: ApiOptions) {
       eligibleTokens: analysisStats.eligibleTokens,
       pending: analysisPending,
       processing: analysisProcessing,
-      complete: analysisCompleted,
+      complete: analysisCompletedHistorically,
+      completeForActiveLeases: analysisCompleted,
+      historicalStatusCounts: analysisStats.historicalAnalysis ?? {},
       enrichment: analysisStats.enrichment,
       migrationRecovery: analysisStats.migrationRecovery,
       failureReasons: analysisStats.failureReasons,
@@ -907,6 +1003,10 @@ export function getOperationalReadiness(options: ApiOptions) {
       monitoredTokens: tradeCoverageStats.monitoredTokens,
       completeTokens: tradeCoverageStats.completeTokens,
       byStatus: tradeCoverageStats.byStatus,
+      observationCount: tradeCoverageStats.observationCount ?? 0,
+      verifiedObservationCount:
+        tradeCoverageStats.verifiedObservationCount ?? 0,
+      latestObservationAtUtc: tradeCoverageStats.latestObservationAtUtc ?? null,
       streamHealth: heliusTradeStream?.state ?? "UNKNOWN",
       completenessReason: "HELIUS_LOGS_SUBSCRIBE_HAS_NO_REPLAY_CURSOR",
     },
@@ -932,6 +1032,29 @@ export function getOperationalReadiness(options: ApiOptions) {
           openPositions: paperAccount.positions.length,
           unpriceablePositions:
             paperAccount.latestMark?.unpriceablePositions ?? 0,
+          positionMonitor: {
+            status: paperAccount.positions.length === 0 ? "IDLE" : "ACTIVE",
+            openPositions: paperAccount.positions.length,
+            trackedPositions: positionMonitorStates.length,
+            configuredIntervalMs: options.positionMonitorIntervalMs ?? null,
+            maxIntervalMs: options.positionMonitorMaxIntervalMs ?? null,
+            estimatedNextIntervalMs: estimatedNextMonitorDelayMs,
+            monitorStates: positionMonitorCounts,
+            exitRequestsUsed: heliusRequestBudget?.exitRequestsUsed ?? null,
+            exitRequestsRemaining:
+              heliusRequestBudget === null
+                ? null
+                : Math.max(0, heliusRequestBudget.remaining),
+            reservedExitRequests: heliusRequestBudget?.reservedForExits ?? null,
+            projectedPositions,
+            estimatedRpcRequestsPerPosition,
+            requiredDailyExitRequests: Number.isFinite(
+              requiredDailyExitRequests,
+            )
+              ? requiredDailyExitRequests
+              : null,
+            budgetReadiness: positionMonitorBudgetReason ?? "READY",
+          },
         }
       : null,
     blockers: [...new Set(blockers)],

@@ -54,6 +54,7 @@ export type PaperQuoteRequest = {
   requestedAtUtc: string;
   arrivalAtUtc?: string;
   maxAgeMs: number;
+  priority?: "CANDIDATE" | "EXIT";
 };
 
 export interface PaperQuoteProvider {
@@ -682,7 +683,7 @@ export class PumpVenuePaperQuoteProvider implements PaperQuoteProvider {
     if (phase === "PUMP_CURVE") {
       const loaded = await this.#curveState.load(
         request.mint,
-        request.side === "SELL" ? "EXIT" : "CANDIDATE",
+        request.priority ?? (request.side === "SELL" ? "EXIT" : "CANDIDATE"),
       );
       if (loaded.status !== "SUPPORTED") return null;
       return this.#stampQuote(
@@ -697,7 +698,7 @@ export class PumpVenuePaperQuoteProvider implements PaperQuoteProvider {
     if (phase === "MIGRATED_PUMPSWAP") {
       const loaded = await this.#swapState.load(
         request.mint,
-        request.side === "SELL" ? "EXIT" : "CANDIDATE",
+        request.priority ?? (request.side === "SELL" ? "EXIT" : "CANDIDATE"),
       );
       if (loaded.status !== "SUPPORTED") return null;
       return this.#stampQuote(

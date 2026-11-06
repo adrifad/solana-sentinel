@@ -101,7 +101,9 @@ paper:
   order_size_sol: '0.01'
   stop_loss_bps: 1500
   take_profit_bps: 3000
-  position_monitor_interval_ms: 600000
+  position_monitor_interval_ms: 15000
+  position_monitor_max_interval_ms: 900000
+  position_monitor_estimated_rpc_requests: 2
   exit_retry_base_ms: 5000
   exit_retry_max_ms: 300000
 

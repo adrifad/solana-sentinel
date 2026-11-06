@@ -27,12 +27,15 @@ export class PaperRuntime {
   readonly #quotes: PaperQuoteProvider;
   readonly #exit = new PaperExitStrategy();
   readonly #risk = new PaperRiskManager();
-  #timer: ReturnType<typeof setInterval> | undefined;
+  #timer: ReturnType<typeof setTimeout> | undefined;
   #manualTimer: ReturnType<typeof setInterval> | undefined;
   #healthTimer: ReturnType<typeof setInterval> | undefined;
   #busy = false;
   #entryBusy = false;
-  #entryWakePending = false;
+  #entryWakeQueue = new Set<string>();
+  #entryFullScanPending = false;
+  #entryActiveMint: string | null = null;
+  #estimatedExitQuoteRequests = 0;
   #manualBusy = false;
   #stopping = false;
   #initialBalanceMatches = true;
@@ -111,10 +114,7 @@ export class PaperRuntime {
     await this.tick();
     await this.wakeEntries("STARTUP_RECOVERY");
     this.#reportRuntime("HEALTHY", null);
-    this.#timer = setInterval(
-      () => void this.tick(),
-      this.#config.paper.position_monitor_interval_ms,
-    );
+    this.#schedulePositionMonitor(this.#nextPositionMonitorDelayMs());
     this.#manualTimer = setInterval(
       () => void this.#processManualRequest(),
       250,
@@ -132,7 +132,7 @@ export class PaperRuntime {
 
   async stop(): Promise<void> {
     this.#stopping = true;
-    if (this.#timer) clearInterval(this.#timer);
+    if (this.#timer) clearTimeout(this.#timer);
     if (this.#manualTimer) clearInterval(this.#manualTimer);
     if (this.#healthTimer) clearInterval(this.#healthTimer);
     while (this.#busy || this.#manualBusy || this.#entryBusy)
@@ -178,15 +178,37 @@ export class PaperRuntime {
       return;
     }
     if (this.#entryBusy) {
-      this.#entryWakePending = true;
+      if (candidateMint) {
+        if (candidateMint !== this.#entryActiveMint)
+          this.#entryWakeQueue.add(candidateMint);
+      } else {
+        this.#entryFullScanPending = true;
+      }
       return;
     }
     this.#entryBusy = true;
     try {
-      do {
-        this.#entryWakePending = false;
-        await this.#considerEntries();
-      } while (this.#entryWakePending && !this.#stopping);
+      if (candidateMint) this.#entryWakeQueue.add(candidateMint);
+      else this.#entryFullScanPending = true;
+      while (
+        !this.#stopping &&
+        (this.#entryFullScanPending || this.#entryWakeQueue.size > 0)
+      ) {
+        if (this.#entryFullScanPending) {
+          this.#entryFullScanPending = false;
+          await this.#considerEntries();
+          continue;
+        }
+        const [mint] = this.#entryWakeQueue;
+        if (!mint) continue;
+        this.#entryWakeQueue.delete(mint);
+        this.#entryActiveMint = mint;
+        try {
+          await this.#considerEntries(mint);
+        } finally {
+          this.#entryActiveMint = null;
+        }
+      }
     } catch (error) {
       try {
         this.#recordEntriesSkipped(
@@ -253,6 +275,7 @@ export class PaperRuntime {
 
   async #monitorPositions(): Promise<void> {
     const state = this.#store.getPaperPortfolioState(this.#walletId);
+    const requestsBefore = this.#getExitRequestCount();
     const now = Date.now();
     const observedQuotes = new Map<string, QuoteResult | null>();
     for (const position of state.positions) {
@@ -361,14 +384,106 @@ export class PaperRuntime {
       }
     }
     await this.#engine.refreshPortfolio(this.#walletId, observedQuotes);
+    const requestsAfter = this.#getExitRequestCount();
+    const observedRequests = Math.max(0, requestsAfter - requestsBefore);
+    if (state.positions.length > 0 && observedRequests > 0)
+      this.#estimatedExitQuoteRequests = Math.max(
+        this.#estimatedExitQuoteRequests,
+        Math.ceil(observedRequests / state.positions.length),
+      );
+  }
+
+  #getExitRequestCount(): number {
+    return this.#store.getHeliusRequestBudget(
+      this.#config.providers.helius.max_requests_per_utc_day,
+      this.#config.providers.helius.exit_reserved_requests_per_utc_day,
+    ).exitRequestsUsed;
+  }
+
+  #entryMonitorBudgetBlocker(): {
+    reasonCode: string;
+    evidence: Record<string, unknown>;
+  } | null {
+    const portfolio = this.#store.getPaperPortfolioState(this.#walletId);
+    const currentBudget = this.#store.getHeliusRequestBudget(
+      this.#config.providers.helius.max_requests_per_utc_day,
+      this.#config.providers.helius.exit_reserved_requests_per_utc_day,
+    );
+    const requestsPerPosition = Math.max(
+      this.#config.paper.position_monitor_estimated_rpc_requests,
+      this.#estimatedExitQuoteRequests,
+    );
+    const projectedPositions = portfolio.positions.length + 1;
+    const requiredDailyRequests = Math.ceil(
+      (projectedPositions * requestsPerPosition * 86_400_000) /
+        this.#config.paper.position_monitor_max_interval_ms,
+    );
+    const evidence = {
+      openPositions: portfolio.positions.length,
+      projectedPositions,
+      estimatedRpcRequestsPerPosition: requestsPerPosition,
+      requiredDailyExitRequests: requiredDailyRequests,
+      reservedExitRequestsPerDay: currentBudget.reservedForExits,
+      remainingHeliusRequests: currentBudget.remaining,
+      maximumMonitorIntervalMs:
+        this.#config.paper.position_monitor_max_interval_ms,
+    };
+    if (requiredDailyRequests > currentBudget.reservedForExits)
+      return { reasonCode: "EXIT_MONITOR_BUDGET_INSUFFICIENT", evidence };
+    if (currentBudget.remaining < requestsPerPosition * projectedPositions)
+      return { reasonCode: "EXIT_MONITOR_BUDGET_EXHAUSTED", evidence };
+    return null;
+  }
+
+  #nextPositionMonitorDelayMs(): number {
+    const base = this.#config.paper.position_monitor_interval_ms;
+    const max = this.#config.paper.position_monitor_max_interval_ms;
+    const openPositions = this.#store.getPaperPortfolioState(this.#walletId)
+      .positions.length;
+    if (openPositions === 0) return base;
+    const budget = this.#store.getHeliusRequestBudget(
+      this.#config.providers.helius.max_requests_per_utc_day,
+      this.#config.providers.helius.exit_reserved_requests_per_utc_day,
+    );
+    const now = new Date();
+    const nextUtcDay = Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() + 1,
+    );
+    const untilBudgetResetMs = Math.max(1000, nextUtcDay - now.getTime());
+    const requestsPerPosition = Math.max(
+      this.#config.paper.position_monitor_estimated_rpc_requests,
+      this.#estimatedExitQuoteRequests,
+    );
+    return computeAdaptivePositionMonitorDelayMs({
+      baseIntervalMs: base,
+      maxIntervalMs: max,
+      openPositions,
+      estimatedRpcRequestsPerPosition: requestsPerPosition,
+      remainingRpcRequests: budget.remaining,
+      untilBudgetResetMs,
+    });
+  }
+
+  #schedulePositionMonitor(delayMs: number): void {
+    if (this.#stopping) return;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      void this.tick().finally(() => {
+        if (!this.#stopping)
+          this.#schedulePositionMonitor(this.#nextPositionMonitorDelayMs());
+      });
+    }, delayMs);
   }
 
   async #considerEntries(candidateMint?: string): Promise<void> {
-    const tokens = this.#store
-      .listTokens(200)
-      .filter(
-        (token) => candidateMint === undefined || token.mint === candidateMint,
-      );
+    const tokens = candidateMint
+      ? [this.#store.getToken(candidateMint)].filter(
+          (token): token is NonNullable<typeof token> => token !== null,
+        )
+      : this.#store.listTokens(200).filter((token) => token.monitoringEligible);
     if (!this.#initialBalanceMatches) {
       this.#recordEntriesSkipped(
         tokens,
@@ -391,6 +506,15 @@ export class PaperRuntime {
       return;
     }
     for (const token of tokens) {
+      if (!token.monitoringEligible) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          this.#store.listRiskDecisions(token.mint, 1)[0] ?? null,
+          "SKIPPED",
+          "MONITORING_LEASE_INACTIVE",
+        );
+        continue;
+      }
       const decision = this.#store.listRiskDecisions(token.mint, 1)[0];
       if (!decision) {
         this.#recordEntryEvaluation(
@@ -511,6 +635,17 @@ export class PaperRuntime {
           "SKIPPED",
           "PAPER_MAX_TRADE_EXCEEDED",
           { configuredOrderSizeSol: this.#config.paper.order_size_sol },
+        );
+        continue;
+      }
+      const monitorBudgetBlocker = this.#entryMonitorBudgetBlocker();
+      if (monitorBudgetBlocker) {
+        this.#recordEntryEvaluation(
+          token.mint,
+          decision,
+          "SKIPPED",
+          monitorBudgetBlocker.reasonCode,
+          monitorBudgetBlocker.evidence,
         );
         continue;
       }
@@ -733,6 +868,16 @@ export class PaperRuntime {
       );
       return;
     }
+    const monitorBudgetBlocker = this.#entryMonitorBudgetBlocker();
+    if (monitorBudgetBlocker) {
+      this.#finishManual(
+        request,
+        "REJECTED",
+        monitorBudgetBlocker.reasonCode,
+        monitorBudgetBlocker.evidence,
+      );
+      return;
+    }
     const pair = { reasonCode: "EXIT_QUOTE_UNAVAILABLE" as string | null };
     let transientQuoteError: string | null = null;
     const quoteProvider: PaperQuoteProvider = {
@@ -778,6 +923,7 @@ export class PaperRuntime {
               ? { arrivalAtUtc: quoteRequest.arrivalAtUtc }
               : {}),
             maxAgeMs: quoteRequest.maxAgeMs,
+            priority: "CANDIDATE",
           });
         } catch (error) {
           transientQuoteError = retryableQuoteError(error);
@@ -1487,6 +1633,32 @@ export class PaperRuntime {
     );
     return new Date(Date.now() + delay).toISOString();
   }
+}
+
+/**
+ * Smooth exit polling across the remaining daily provider budget. This is a
+ * scheduling estimate, not a guarantee that an exit will execute in time.
+ */
+export function computeAdaptivePositionMonitorDelayMs(input: {
+  baseIntervalMs: number;
+  maxIntervalMs: number;
+  openPositions: number;
+  estimatedRpcRequestsPerPosition: number;
+  remainingRpcRequests: number;
+  untilBudgetResetMs: number;
+}): number {
+  if (input.openPositions <= 0) return input.baseIntervalMs;
+  if (input.remainingRpcRequests <= 0) return input.maxIntervalMs;
+  const estimatedCycleRequests =
+    input.openPositions * input.estimatedRpcRequestsPerPosition;
+  const budgetCadenceMs = Math.ceil(
+    (estimatedCycleRequests * input.untilBudgetResetMs) /
+      input.remainingRpcRequests,
+  );
+  return Math.min(
+    input.maxIntervalMs,
+    Math.max(input.baseIntervalMs, budgetCadenceMs),
+  );
 }
 
 function hash(value: string): string {

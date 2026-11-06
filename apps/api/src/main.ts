@@ -31,6 +31,11 @@ const server = createApiServer({
     config.config.analysis.min_independent_buyers,
     config.config.strategy.min_independent_buyers,
   ),
+  positionMonitorIntervalMs: config.config.paper.position_monitor_interval_ms,
+  positionMonitorMaxIntervalMs:
+    config.config.paper.position_monitor_max_interval_ms,
+  positionMonitorEstimatedRpcRequests:
+    config.config.paper.position_monitor_estimated_rpc_requests,
 });
 server.listen(config.apiPort, config.apiHost, () => {
   process.stdout.write(

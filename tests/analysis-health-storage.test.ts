@@ -74,9 +74,19 @@ test("analysis diagnostics report durable queue states and clear recovered error
     store.finishAnalysisJob(job.eventId);
     stats = store.getAnalysisPipelineStats();
     assert.equal(stats.analysis["COMPLETE"], 1);
+    assert.equal(stats.historicalAnalysis["COMPLETE"], 1);
     assert.deepEqual(stats.failureReasons, []);
     assert.equal(stats.latestCompletedAtUtc !== null, true);
     assert.equal(stats.oldestPendingAtUtc, null);
+    const retireToken = new DatabaseSync(store.path);
+    retireToken
+      .prepare("UPDATE tokens SET monitoring_eligible = 0 WHERE mint = ?")
+      .run(event.mint);
+    retireToken.close();
+    stats = store.getAnalysisPipelineStats();
+    assert.equal(stats.eligibleTokens, 0);
+    assert.equal(stats.analysis["COMPLETE"] ?? 0, 0);
+    assert.equal(stats.historicalAnalysis["COMPLETE"], 1);
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });
