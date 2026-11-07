@@ -50,6 +50,11 @@ export type ParsedReconciliationJob = {
   pagesScanned: number;
   attempts: number;
 };
+export type ParsedReconciliationFinalization = {
+  jobId: string;
+  mint: string;
+  status: "COMPLETE" | "PARTIAL";
+};
 
 export type ManualPaperRequest = {
   id: string;
@@ -166,6 +171,7 @@ export class SentinelStore {
       "015-paper-entry-evaluations.sql",
       "016-analysis-diagnostics.sql",
       "017-parsed-events-reconciliation.sql",
+      "018-reconciliation-finality-analysis-rerun.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -1230,7 +1236,14 @@ export class SentinelStore {
       .prepare(
         `INSERT OR IGNORE INTO parsed_event_reconciliation_jobs
         (id,mint,window_started_at_utc,window_expires_at_utc,status,priority,next_attempt_at_utc,created_at_utc,updated_at_utc)
-        VALUES (?,?,?,?,'PENDING',?,?,?,?)`,
+        VALUES (?,?,?,?,'PENDING',?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          status='PENDING', pagination_token=NULL, stopped_on=NULL,
+          scanned_through_slot=NULL, scanned_through_block_time=NULL,
+          pages_scanned=0, reason_code=NULL, next_attempt_at_utc=excluded.next_attempt_at_utc,
+          finality_ready_at_utc=NULL, finality_buffer_seconds=NULL,
+          updated_at_utc=excluded.updated_at_utc
+        WHERE parsed_event_reconciliation_jobs.reason_code='FINALITY_BOUNDARY_NOT_VERIFIED'`,
       )
       .run(
         id,
@@ -1268,28 +1281,34 @@ export class SentinelStore {
     return Number(result.changes);
   }
 
-  claimParsedReconciliationJob(): ParsedReconciliationJob | null {
+  claimParsedReconciliationJob(
+    finalityBufferSeconds = 0,
+  ): ParsedReconciliationJob | null {
     const now = utcNow();
+    const finalityEligibleThroughUtc = new Date(
+      Date.now() - Math.max(0, finalityBufferSeconds) * 1000,
+    ).toISOString();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const row = this.#db
         .prepare(
           `SELECT * FROM parsed_event_reconciliation_jobs
-           WHERE status IN ('PENDING','RETRY_WAIT') AND next_attempt_at_utc <= ?
+           WHERE (status IN ('PENDING','RETRY_WAIT') OR (status='PARTIAL' AND reason_code='RECONCILIATION_PAGE_LIMIT'))
+             AND next_attempt_at_utc <= ?
              AND window_expires_at_utc <= ?
              AND NOT EXISTS (SELECT 1 FROM parsed_event_reconciliation_transactions x WHERE x.job_id=parsed_event_reconciliation_jobs.id AND x.status='PENDING')
            ORDER BY priority ASC, created_at_utc ASC LIMIT 1`,
         )
-        .get(now, now) as SqlRow | undefined;
+        .get(now, finalityEligibleThroughUtc) as SqlRow | undefined;
       if (!row) {
         this.#db.exec("COMMIT");
         return null;
       }
       this.#db
         .prepare(
-          `UPDATE parsed_event_reconciliation_jobs SET status='PROCESSING', attempts=attempts+1, updated_at_utc=? WHERE id=?`,
+          `UPDATE parsed_event_reconciliation_jobs SET status='PROCESSING', attempts=attempts+1, pages_scanned=0, finality_ready_at_utc=COALESCE(finality_ready_at_utc,?), finality_buffer_seconds=COALESCE(finality_buffer_seconds,?), updated_at_utc=? WHERE id=?`,
         )
-        .run(now, String(row["id"]));
+        .run(now, Math.max(0, finalityBufferSeconds), now, String(row["id"]));
       this.#db.exec("COMMIT");
       return mapParsedJob({
         ...row,
@@ -1307,12 +1326,14 @@ export class SentinelStore {
     signature: string;
     slot: number;
     blockTime: number | null;
+    parsedMint: string | null;
+    expectedSide: "BUY" | "SELL" | null;
     windowStartedAtUtc: string;
     windowExpiresAtUtc: string;
   }> {
     const rows = this.#db
       .prepare(
-        `SELECT j.mint,x.signature,x.slot,x.block_time,j.window_started_at_utc,j.window_expires_at_utc
+        `SELECT j.mint,x.signature,x.slot,x.block_time,x.parsed_mint,x.expected_side,j.window_started_at_utc,j.window_expires_at_utc
        FROM parsed_event_reconciliation_transactions x JOIN parsed_event_reconciliation_jobs j ON j.id=x.job_id
        WHERE x.status='PENDING' AND x.next_attempt_at_utc <= ? ORDER BY j.priority,x.created_at_utc LIMIT ?`,
       )
@@ -1322,6 +1343,12 @@ export class SentinelStore {
       signature: String(row["signature"]),
       slot: Number(row["slot"]),
       blockTime: row["block_time"] === null ? null : Number(row["block_time"]),
+      parsedMint:
+        row["parsed_mint"] === null ? null : String(row["parsed_mint"]),
+      expectedSide:
+        row["expected_side"] === "BUY" || row["expected_side"] === "SELL"
+          ? row["expected_side"]
+          : null,
       windowStartedAtUtc: String(row["window_started_at_utc"]),
       windowExpiresAtUtc: String(row["window_expires_at_utc"]),
     }));
@@ -1331,7 +1358,7 @@ export class SentinelStore {
     id: string,
     reasonCode: string,
     retryAfterMs: number,
-  ): void {
+  ): boolean {
     const now = Date.now();
     const job = this.#db
       .prepare(
@@ -1372,18 +1399,22 @@ export class SentinelStore {
           `UPDATE parsed_event_reconciliation_jobs SET attempts=0 WHERE id=?`,
         )
         .run(id);
-    if (exhausted && !scanBudgetBlocked && job)
+    if (job)
       this.recordTradeObservationCoverage({
         mint: String(job["mint"]),
         source: "helius_parsed_events_scan",
-        status: "PARTIAL",
+        status: exhausted && !scanBudgetBlocked ? "PARTIAL" : "RECONCILING",
         windowStartedAtUtc: String(job["window_started_at_utc"]),
         windowExpiresAtUtc: String(job["window_expires_at_utc"]),
         lastEventAtUtc: null,
         reconnectCount: 0,
-        reasonCode: `RETRIES_EXHAUSTED:${reasonCode}`,
+        reasonCode:
+          exhausted && !scanBudgetBlocked
+            ? `RETRIES_EXHAUSTED:${reasonCode}`
+            : reasonCode,
         updatedAtUtc: nowUtc,
       });
+    return exhausted && !scanBudgetBlocked;
   }
 
   failParsedReconciliationJob(id: string, reasonCode: string): void {
@@ -1422,6 +1453,7 @@ export class SentinelStore {
       parsedProtocol?: string | null;
       parsedKind?: string | null;
       parsedMint?: string | null;
+      expectedSide?: "BUY" | "SELL" | null;
       instructionNames?: string[];
     }>;
     paginationToken: string | null;
@@ -1429,7 +1461,7 @@ export class SentinelStore {
     scannedThrough: { slot: number; blockTime: number | null } | null;
     creditsCharged: number;
     maxPages: number;
-  }): void {
+  }): ParsedReconciliationFinalization[] {
     const now = utcNow();
     this.#db.exec("BEGIN IMMEDIATE");
     try {
@@ -1437,8 +1469,8 @@ export class SentinelStore {
         this.#db
           .prepare(
             `INSERT OR IGNORE INTO parsed_event_reconciliation_transactions
-           (job_id,signature,slot,block_time,status,parsed_protocol,parsed_kind,parsed_mint,instruction_names_json,provenance,created_at_utc,updated_at_utc)
-           VALUES (?,?,?,?,'PENDING',?,?,?,?, 'HELIUS_PARSED_EVENTS_SCAN',?,?)`,
+           (job_id,signature,slot,block_time,status,parsed_protocol,parsed_kind,parsed_mint,instruction_names_json,provenance,created_at_utc,updated_at_utc,expected_side)
+           VALUES (?,?,?,?,'PENDING',?,?,?,?, 'HELIUS_PARSED_EVENTS_SCAN',?,?,?)`,
           )
           .run(
             input.jobId,
@@ -1451,6 +1483,7 @@ export class SentinelStore {
             JSON.stringify(item.instructionNames ?? []),
             now,
             now,
+            item.expectedSide ?? null,
           );
       }
       const row = this.#db
@@ -1516,7 +1549,7 @@ export class SentinelStore {
         updatedAtUtc: now,
       });
       this.#db.exec("COMMIT");
-      this.finalizeParsedReconciliationJobs();
+      return this.finalizeParsedReconciliationJobs();
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
@@ -1528,7 +1561,7 @@ export class SentinelStore {
     signature: string;
     status: "VERIFIED" | "IRRELEVANT" | "UNSUPPORTED" | "FAILED";
     reasonCode: string | null;
-  }): void {
+  }): ParsedReconciliationFinalization[] {
     this.#db
       .prepare(
         `UPDATE parsed_event_reconciliation_transactions SET status=?, reason_code=?, updated_at_utc=?
@@ -1541,7 +1574,7 @@ export class SentinelStore {
         input.signature,
         input.mint,
       );
-    this.finalizeParsedReconciliationJobs();
+    return this.finalizeParsedReconciliationJobs();
   }
 
   retryParsedReconciliationTransaction(input: {
@@ -1550,7 +1583,7 @@ export class SentinelStore {
     reasonCode: string;
     retryAfterMs: number;
     maxAttempts?: number;
-  }): void {
+  }): ParsedReconciliationFinalization[] {
     const now = Date.now();
     const row = this.#db
       .prepare(
@@ -1558,7 +1591,7 @@ export class SentinelStore {
        JOIN parsed_event_reconciliation_jobs j ON j.id=x.job_id WHERE j.mint=? AND x.signature=? LIMIT 1`,
       )
       .get(input.mint, input.signature) as SqlRow | undefined;
-    if (!row) return;
+    if (!row) return [];
     const attempts = Number(row["attempts"] ?? 0) + 1;
     const status = attempts >= (input.maxAttempts ?? 5) ? "FAILED" : "PENDING";
     this.#db
@@ -1574,17 +1607,17 @@ export class SentinelStore {
         String(row["job_id"]),
         input.signature,
       );
-    if (status === "FAILED") this.finalizeParsedReconciliationJobs();
+    return this.finalizeParsedReconciliationJobs();
   }
 
-  finalizeParsedReconciliationJobs(): number {
+  finalizeParsedReconciliationJobs(): ParsedReconciliationFinalization[] {
     const now = utcNow();
     const jobs = this.#db
       .prepare(
-        `SELECT j.* FROM parsed_event_reconciliation_jobs j WHERE j.status='PROCESSING' AND j.stopped_on='windowEnd' AND j.pagination_token IS NULL`,
+        `SELECT j.* FROM parsed_event_reconciliation_jobs j WHERE j.status='PROCESSING' AND j.stopped_on='windowEnd' AND j.pagination_token IS NULL AND j.finality_ready_at_utc IS NOT NULL`,
       )
       .all() as SqlRow[];
-    let finalized = 0;
+    const finalized: ParsedReconciliationFinalization[] = [];
     for (const job of jobs) {
       const counts = this.#db
         .prepare(
@@ -1617,7 +1650,11 @@ export class SentinelStore {
         reasonCode: reason,
         updatedAtUtc: now,
       });
-      finalized += 1;
+      finalized.push({
+        jobId: String(job["id"]),
+        mint: String(job["mint"]),
+        status,
+      });
     }
     return finalized;
   }
@@ -1850,7 +1887,7 @@ export class SentinelStore {
           : "analysis_jobs";
       const changed = this.#db
         .prepare(
-          `UPDATE ${table} SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?
+          `UPDATE ${table} SET status = 'PROCESSING', attempts = attempts + 1, updated_at_utc = ?, rerun_requested = 0
           WHERE event_id = ? AND status = 'PENDING'`,
         )
         .run(now, String(row["event_id"]));
@@ -1874,20 +1911,26 @@ export class SentinelStore {
     errorCode: string | null = null,
   ): void {
     const now = utcNow();
-    const args = [
-      retryDelayMs > 0 || errorCode ? "PENDING" : "COMPLETE",
-      new Date(Date.now() + retryDelayMs).toISOString(),
-      now,
-      errorCode,
-      eventId,
-    ] as const;
+    const retrying = retryDelayMs > 0 || Boolean(errorCode);
     for (const table of ["analysis_jobs", "migration_analysis_jobs"])
       this.#db
         .prepare(
-          `UPDATE ${table} SET status = ?, next_attempt_at_utc = ?, updated_at_utc = ?, last_error_code = ?
-          WHERE event_id = ?`,
+          `UPDATE ${table} SET
+          status = CASE WHEN ? = 0 AND rerun_requested = 1 THEN 'PENDING' WHEN ? = 1 THEN 'PENDING' ELSE 'COMPLETE' END,
+          next_attempt_at_utc = CASE WHEN ? = 0 AND rerun_requested = 1 THEN ? ELSE ? END,
+          updated_at_utc = ?, last_error_code = ?, rerun_requested = 0
+         WHERE event_id = ?`,
         )
-        .run(...args);
+        .run(
+          Number(retrying),
+          Number(retrying),
+          Number(retrying),
+          now,
+          new Date(Date.now() + retryDelayMs).toISOString(),
+          now,
+          errorCode,
+          eventId,
+        );
   }
 
   recoverInterruptedAnalysisJobs(): number {
@@ -2381,9 +2424,9 @@ export class SentinelStore {
     }));
   }
 
-  saveLaunchTradeObservation(input: LaunchTradeObservation): void {
+  saveLaunchTradeObservation(input: LaunchTradeObservation): boolean {
     const observation = LaunchTradeObservationSchema.parse(input);
-    this.#db
+    const result = this.#db
       .prepare(
         `INSERT OR IGNORE INTO launch_trade_observations
         (id, event_index, mint, signature, slot, block_time_utc, event_time_utc,
@@ -2415,20 +2458,73 @@ export class SentinelStore {
         observation.validationConfidenceBps,
         observation.payloadRef,
       );
+    return Number(result.changes) === 1;
   }
 
-  requeueLatestAnalysisForMint(mint: string, delayMs = 0): boolean {
-    const nextAttemptAtUtc = new Date(
-      Date.now() + Math.max(0, delayMs),
-    ).toISOString();
-    const changed = this.#db
-      .prepare(
-        `UPDATE analysis_jobs SET status='PENDING', next_attempt_at_utc=?, updated_at_utc=?
-         WHERE event_id=(SELECT id FROM market_events WHERE mint=? AND kind='TOKEN_CREATED'
-         ORDER BY first_seen_at_utc ASC, received_at_utc ASC LIMIT 1) AND status='COMPLETE'`,
-      )
-      .run(nextAttemptAtUtc, utcNow(), mint);
-    return Number(changed.changes) === 1;
+  requeueLatestAnalysisForMint(
+    mint: string,
+    triggerKey: string,
+    delayMs = 1000,
+  ): boolean {
+    if (!triggerKey || triggerKey.length > 256) return false;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.#db
+        .prepare(
+          `SELECT event_id,status,job_type FROM (
+             SELECT j.event_id,j.status,'CREATE' AS job_type,e.first_seen_at_utc,e.received_at_utc
+             FROM analysis_jobs j JOIN market_events e ON e.id=j.event_id
+             WHERE j.mint=? AND e.kind='TOKEN_CREATED'
+             UNION ALL
+             SELECT j.event_id,j.status,'MIGRATION' AS job_type,e.first_seen_at_utc,e.received_at_utc
+             FROM migration_analysis_jobs j JOIN market_events e ON e.id=j.event_id
+             WHERE j.mint=? AND e.kind='TOKEN_MIGRATED'
+           ) ORDER BY CASE job_type WHEN 'CREATE' THEN 0 ELSE 1 END,first_seen_at_utc,received_at_utc LIMIT 1`,
+        )
+        .get(mint, mint) as SqlRow | undefined;
+      if (!job) {
+        this.#db.exec("COMMIT");
+        return false;
+      }
+      const eventId = String(job["event_id"]);
+      const table =
+        job["job_type"] === "MIGRATION"
+          ? "migration_analysis_jobs"
+          : "analysis_jobs";
+      const now = utcNow();
+      const request = this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO analysis_requeue_triggers(event_id,trigger_key,created_at_utc) VALUES (?,?,?)`,
+        )
+        .run(eventId, triggerKey, now);
+      if (Number(request.changes) !== 1) {
+        this.#db.exec("COMMIT");
+        return false;
+      }
+      const status = String(job["status"]);
+      if (status === "PROCESSING") {
+        this.#db
+          .prepare(
+            `UPDATE ${table} SET rerun_requested=1,updated_at_utc=? WHERE event_id=? AND status='PROCESSING'`,
+          )
+          .run(now, eventId);
+      } else if (status === "COMPLETE") {
+        const nextAttemptAtUtc = new Date(
+          Date.now() + Math.max(0, delayMs),
+        ).toISOString();
+        this.#db
+          .prepare(
+            `UPDATE ${table} SET status='PENDING',next_attempt_at_utc=?,updated_at_utc=?,last_error_code=NULL
+             WHERE event_id=? AND status='COMPLETE'`,
+          )
+          .run(nextAttemptAtUtc, now, eventId);
+      }
+      this.#db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   recordAnalysisStageTiming(input: {
@@ -2563,7 +2659,7 @@ export class SentinelStore {
               AND excluded.status <> 'COMPLETE'
             THEN trade_observation_coverage.status
             WHEN trade_observation_coverage.status IN ('GAP_DETECTED', 'PARTIAL')
-              AND excluded.status = 'UNVERIFIED'
+              AND excluded.status IN ('UNVERIFIED', 'RECONCILING')
             THEN trade_observation_coverage.status
             ELSE excluded.status
           END,
@@ -2575,7 +2671,7 @@ export class SentinelStore {
               AND excluded.status <> 'COMPLETE'
             THEN trade_observation_coverage.reason_code
             WHEN trade_observation_coverage.status IN ('GAP_DETECTED', 'PARTIAL')
-              AND excluded.status = 'UNVERIFIED'
+              AND excluded.status IN ('UNVERIFIED', 'RECONCILING')
             THEN trade_observation_coverage.reason_code
             ELSE excluded.reason_code
           END,

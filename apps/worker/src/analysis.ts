@@ -506,7 +506,7 @@ export class TokenAnalysisScheduler {
       mint,
       firstSeenAtUtc,
       effectiveEndUtc,
-      evidence.asOfSlot,
+      null,
     );
     const coverage = this.#store.getLatestTradeObservationCoverage(mint);
     const complete =
@@ -532,7 +532,7 @@ export class TokenAnalysisScheduler {
       windowStartedAtUtc: firstSeenAtUtc,
       observedAtUtc,
       windowSeconds,
-      throughSlot: evidence.asOfSlot,
+      throughSlot: null,
       complete,
       gapReason: complete
         ? null

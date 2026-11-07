@@ -24,8 +24,8 @@ const ScanItem = z
                 type: z.string().optional(),
                 protocol: z.string().optional(),
                 kind: z.string().optional(),
-                input_mint: z.string().optional(),
-                output_mint: z.string().optional(),
+                input_mint: PubkeySchema.optional(),
+                output_mint: PubkeySchema.optional(),
               })
               .passthrough()
               .nullable()
@@ -78,6 +78,7 @@ export const HELIUS_TRADE_PROGRAMS = [
   HELIUS_PUMP_PROGRAM,
   HELIUS_PUMPSWAP_PROGRAM,
 ] as const;
+export const HELIUS_WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 export type ParsedTradeScanRequest = {
   mint: string;
@@ -95,7 +96,9 @@ export type ParsedTradeScanPage = {
     parsedProtocol: string | null;
     parsedKind: string | null;
     parsedMint: string | null;
+    expectedSide: "BUY" | "SELL" | null;
     classification: "TRADE_CANDIDATE" | "NON_TRADE" | "UNSUPPORTED";
+    reasonCode: string | null;
     instructionNames: string[];
   }>;
   paginationToken: string | null;
@@ -210,6 +213,18 @@ export class HeliusParsedEventsScanClient {
       )
         throw new Error("MALFORMED_PARSED_SCAN_RESPONSE");
       if (
+        page.data.some(
+          (item) =>
+            (item.slot !== undefined &&
+              item.parsed?.slot !== undefined &&
+              item.slot !== item.parsed.slot) ||
+            (item.blockTime !== undefined &&
+              item.parsed?.blockTime !== undefined &&
+              item.blockTime !== item.parsed.blockTime),
+        )
+      )
+        throw new Error("CONFLICTING_PARSED_SCAN_TIME_METADATA");
+      if (
         page.data.length > page.scan.matchedTransactions ||
         (page.scan.scannedTransactions > 0 && page.scan.scannedThrough === null)
       )
@@ -222,7 +237,12 @@ export class HeliusParsedEventsScanClient {
       return {
         items: page.data.map((item) => {
           const protocol = item.parsed?.summary?.parsedData?.protocol ?? null;
-          const kind = item.parsed?.summary?.parsedData?.kind ?? null;
+          const kind =
+            item.parsed?.summary?.parsedData?.kind?.toLowerCase() ?? null;
+          const inputMint =
+            item.parsed?.summary?.parsedData?.input_mint ?? null;
+          const outputMint =
+            item.parsed?.summary?.parsedData?.output_mint ?? null;
           const targetInstructions = (item.parsed?.instructions ?? []).filter(
             (instruction) =>
               HELIUS_TRADE_PROGRAMS.includes(
@@ -247,14 +267,37 @@ export class HeliusParsedEventsScanClient {
             blockTime !== null &&
             blockTime >= request.fromUnixSeconds &&
             blockTime < request.toUnixSeconds;
+          const expectedSide =
+            inputMint === HELIUS_WSOL_MINT && outputMint === request.mint
+              ? "BUY"
+              : inputMint === request.mint && outputMint === HELIUS_WSOL_MINT
+                ? "SELL"
+                : null;
+          const protocolProgramMatches =
+            (protocol === "pump_fun" &&
+              targetInstructions.some(
+                (instruction) => instruction.programId === HELIUS_PUMP_PROGRAM,
+              )) ||
+            (["pump_amm", "pumpswap"].includes(protocol ?? "") &&
+              targetInstructions.some(
+                (instruction) =>
+                  instruction.programId === HELIUS_PUMPSWAP_PROGRAM,
+              ));
+          const summarySideMatches =
+            (expectedSide === "BUY" && kind === "buy") ||
+            (expectedSide === "SELL" && kind === "sell");
+          const transactionParsedSuccessfully =
+            item.parserStatus === "OK" &&
+            item.parsed?.transactionStatus === "OK";
           const classification =
             inRequestedTime &&
-            protocol &&
-            ["pump_fun", "pump_amm", "pumpswap"].includes(protocol) &&
-            ["buy", "sell"].includes(kind ?? "")
+            expectedSide !== null &&
+            summarySideMatches &&
+            protocolProgramMatches &&
+            transactionParsedSuccessfully
               ? ("TRADE_CANDIDATE" as const)
               : inRequestedTime &&
-                  item.parserStatus === "OK" &&
+                  transactionParsedSuccessfully &&
                   targetInstructions.length > 0 &&
                   targetInstructions.every(
                     (instruction) =>
@@ -263,17 +306,32 @@ export class HeliusParsedEventsScanClient {
                   )
                 ? ("NON_TRADE" as const)
                 : ("UNSUPPORTED" as const);
+          const reasonCode =
+            classification === "TRADE_CANDIDATE" ||
+            classification === "NON_TRADE"
+              ? null
+              : !inRequestedTime
+                ? "SCAN_EVENT_OUTSIDE_REQUESTED_WINDOW"
+                : protocol &&
+                    ["pump_fun", "pump_amm", "pumpswap"].includes(protocol)
+                  ? !expectedSide
+                    ? "TRADE_MINT_OR_WSOL_PAIR_AMBIGUOUS"
+                    : !summarySideMatches
+                      ? "TRADE_SUMMARY_DIRECTION_MISMATCH"
+                      : !protocolProgramMatches
+                        ? "TRADE_PROTOCOL_PROGRAM_MISMATCH"
+                        : "TRADE_PARSE_STATUS_UNVERIFIED"
+                  : "SCAN_INSTRUCTION_UNSUPPORTED";
           return {
             signature: item.signature,
             slot: item.slot ?? item.parsed?.slot ?? -1,
             blockTime,
             parsedProtocol: protocol,
             parsedKind: kind,
-            parsedMint:
-              item.parsed?.summary?.parsedData?.output_mint ??
-              item.parsed?.summary?.parsedData?.input_mint ??
-              null,
+            parsedMint: expectedSide ? request.mint : null,
+            expectedSide,
             classification,
+            reasonCode,
             instructionNames,
           };
         }),

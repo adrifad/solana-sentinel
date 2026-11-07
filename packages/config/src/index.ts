@@ -62,6 +62,12 @@ export const AppConfigSchema = z
               .min(1)
               .max(4)
               .default(1),
+            parsed_events_scan_finality_buffer_seconds: z
+              .number()
+              .int()
+              .min(0)
+              .max(3600)
+              .default(60),
           })
           .strict(),
         pumpportal: z

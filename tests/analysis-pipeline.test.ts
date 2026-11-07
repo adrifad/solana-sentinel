@@ -32,6 +32,19 @@ async function waitForDecision(
   assert.fail("analysis report was not persisted before timeout");
 }
 
+async function waitForDecisionCount(
+  store: SentinelStore,
+  mint: string,
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (store.listRiskDecisions(mint).length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`analysis did not persist ${count} decisions before timeout`);
+}
+
 function base58Decode(value: string): Uint8Array {
   const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
   let integer = 0n;
@@ -187,6 +200,105 @@ test("detected launch gets persistent fail-closed reports without Helius credent
     assert.equal(
       latencies.find((item) => item.stage === "TOTAL_ANALYSIS")?.p95Ms,
       null,
+    );
+  } finally {
+    await scheduler.stop();
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("new reconciled evidence requeues completed analysis and refreshes its decision", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-analysis-requeue-"));
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  const loaded = await loadConfig({});
+  let nowMs = Date.now();
+  const scheduler = new TokenAnalysisScheduler({
+    store,
+    helius: undefined,
+    config: loaded.config,
+    configVersion: loaded.configVersion,
+    concurrency: 1,
+    now: () => nowMs,
+  });
+  try {
+    const event = parsePumpPortalMessage(fixture, nowMs);
+    store.ingestEvent(event, 10, false);
+    scheduler.start();
+    await waitForDecision(store, event.mint);
+    const initialDecision = store.listRiskDecisions(event.mint)[0];
+    assert.ok(initialDecision);
+
+    const startMs = Date.parse(event.firstSeenAtUtc);
+    const windowEndMs =
+      startMs + loaded.config.analysis.token_observation_seconds * 1000;
+    nowMs = windowEndMs + 1000;
+    const observedAtUtc = new Date(startMs + 5_000).toISOString();
+    const inserted = store.saveLaunchTradeObservation({
+      id: "reconciled-trade-evidence-1",
+      eventIndex: 0,
+      mint: event.mint,
+      signature: "reconciled-signature-1",
+      slot: (event.slot ?? 341197053) + 10,
+      blockTimeUtc: observedAtUtc,
+      eventTimeUtc: observedAtUtc,
+      eventTimeSource: "PUMP_TRADE_EVENT_TIMESTAMP",
+      receivedAtUtc: observedAtUtc,
+      ingestedAtUtc: new Date(nowMs).toISOString(),
+      side: "BUY",
+      traderWallet: "11111111111111111111111111111111",
+      tokenAmountRaw: "100",
+      quoteAmountRaw: "5000",
+      quoteMint: "So11111111111111111111111111111111111111112",
+      venue: "PUMP_BONDING_CURVE",
+      source: "synthetic-reconciliation-test",
+      decoderVersion: "SYNTHETIC_TEST_FIXTURE",
+      validationStatus: "VERIFIED",
+      validationConfidenceBps: 10000,
+      payloadRef: `sha256:${createHash("sha256").update("reconciled").digest("hex")}`,
+    });
+    assert.equal(inserted, true);
+    store.recordTradeObservationCoverage({
+      mint: event.mint,
+      source: "helius_parsed_events_scan",
+      status: "COMPLETE",
+      windowStartedAtUtc: event.firstSeenAtUtc,
+      windowExpiresAtUtc: new Date(windowEndMs).toISOString(),
+      lastEventAtUtc: observedAtUtc,
+      reconnectCount: 0,
+      reasonCode: "FINALIZED_SCAN_WINDOW_COMPLETE",
+      updatedAtUtc: new Date(nowMs).toISOString(),
+    });
+    assert.equal(
+      store.requeueLatestAnalysisForMint(
+        event.mint,
+        "reconciliation:test:COMPLETE",
+        0,
+      ),
+      true,
+    );
+    scheduler.wake();
+    await waitForDecisionCount(store, event.mint, 2);
+
+    const decisions = store.listRiskDecisions(event.mint);
+    const updatedDecision = decisions[0];
+    assert.ok(updatedDecision);
+    assert.notEqual(updatedDecision.id, initialDecision.id);
+    const snapshots = store.listLaunchBehaviorSnapshots(event.mint);
+    const updatedBehavior = snapshots[0];
+    assert.ok(updatedBehavior);
+    assert.equal(updatedBehavior.complete, true);
+    assert.equal(updatedBehavior.buyCount, 1);
+    assert.ok(
+      updatedBehavior.evidenceRefs.includes(
+        "launch_trade:reconciled-trade-evidence-1",
+      ),
+    );
+    assert.ok(
+      updatedDecision.evidenceRefs.includes(
+        `launch_behavior:${updatedBehavior.id}`,
+      ),
     );
   } finally {
     await scheduler.stop();

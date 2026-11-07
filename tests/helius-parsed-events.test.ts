@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { HeliusParsedEventsScanClient } from "@sentinel/providers";
 
-const mint = "So11111111111111111111111111111111111111112";
+const mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const wsol = "So11111111111111111111111111111111111111112";
 const signature =
   "5TKad77QinBX7wpSJABiiH2w7FnSgseEHdjTzTHgT9bcYJAa9xrKyTTfVHifoXXqHZdy1wBfbFHmrVCebBBsfev2";
 
@@ -63,12 +64,14 @@ test("Parsed Events Scan classifies supported swap and leaves unknown program in
         parsed: {
           slot: 460869102,
           blockTime: 1792848886,
+          transactionStatus: "OK",
           summary: {
             type: "swap",
             parsedData: {
               type: "swap",
               protocol: "pump_fun",
               kind: "buy",
+              input_mint: wsol,
               output_mint: mint,
             },
           },
@@ -87,6 +90,7 @@ test("Parsed Events Scan classifies supported swap and leaves unknown program in
         parsed: {
           slot: 460869103,
           blockTime: 1792848887,
+          transactionStatus: "OK",
           summary: { type: "instruction", parsedData: null },
           instructions: [
             {
@@ -119,7 +123,181 @@ test("Parsed Events Scan classifies supported swap and leaves unknown program in
   });
   assert.equal(page.items[0]?.classification, "TRADE_CANDIDATE");
   assert.equal(page.items[0]?.parsedMint, mint);
+  assert.equal(page.items[0]?.expectedSide, "BUY");
   assert.equal(page.items[1]?.classification, "UNSUPPORTED");
+});
+
+test("Parsed Events Scan identifies SELL mint from input side when output is WSOL", async () => {
+  const client = new HeliusParsedEventsScanClient({
+    apiKey: "test",
+    timeoutMs: 1000,
+    creditReservation: { reserve: () => "2026-11-07", settle: () => undefined },
+    fetchImpl: async () =>
+      Response.json({
+        data: [
+          {
+            signature,
+            parserStatus: "OK",
+            slot: 460869102,
+            blockTime: 1792848886,
+            parsed: {
+              slot: 460869102,
+              blockTime: 1792848886,
+              transactionStatus: "OK",
+              summary: {
+                type: "swap",
+                parsedData: {
+                  protocol: "pump_amm",
+                  kind: "sell",
+                  input_mint: mint,
+                  output_mint: wsol,
+                },
+              },
+              instructions: [
+                {
+                  programId: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+                  instructionName: "sell",
+                },
+              ],
+            },
+          },
+        ],
+        scan: {
+          stoppedOn: "windowEnd",
+          scannedTransactions: 1,
+          matchedTransactions: 1,
+          scannedThrough: { slot: 460869102, blockTime: 1792848886 },
+          creditsCharged: 10,
+        },
+      }),
+  });
+  const page = await client.scanMintWindow({
+    mint,
+    fromUnixSeconds: 1792848886,
+    toUnixSeconds: 1792848887,
+    maxScannedTransactions: 1000,
+  });
+  assert.equal(page.items[0]?.classification, "TRADE_CANDIDATE");
+  assert.equal(page.items[0]?.parsedMint, mint);
+  assert.equal(page.items[0]?.expectedSide, "SELL");
+});
+
+test("Parsed Events Scan rejects mint, direction, program, and metadata conflicts", async () => {
+  const candidates = [
+    {
+      protocol: "pump_fun",
+      kind: "buy",
+      input_mint: mint,
+      output_mint: wsol,
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      reason: "TRADE_SUMMARY_DIRECTION_MISMATCH",
+    },
+    {
+      protocol: "pump_fun",
+      kind: "buy",
+      input_mint: "11111111111111111111111111111111",
+      output_mint: mint,
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      reason: "TRADE_MINT_OR_WSOL_PAIR_AMBIGUOUS",
+    },
+    {
+      protocol: "pump_fun",
+      kind: "buy",
+      input_mint: wsol,
+      output_mint: mint,
+      programId: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+      reason: "TRADE_PROTOCOL_PROGRAM_MISMATCH",
+    },
+  ];
+  const client = new HeliusParsedEventsScanClient({
+    apiKey: "test",
+    timeoutMs: 1000,
+    creditReservation: { reserve: () => "2026-11-07", settle: () => undefined },
+    fetchImpl: async () =>
+      Response.json({
+        data: candidates.map((item, index) => ({
+          signature,
+          parserStatus: "OK",
+          slot: 460869102 + index,
+          blockTime: 1792848886 + index,
+          parsed: {
+            slot: 460869102 + index,
+            blockTime: 1792848886 + index,
+            transactionStatus: "OK",
+            summary: {
+              type: "swap",
+              parsedData: {
+                protocol: item.protocol,
+                kind: item.kind,
+                input_mint: item.input_mint,
+                output_mint: item.output_mint,
+              },
+            },
+            instructions: [
+              { programId: item.programId, instructionName: "buy_v2" },
+            ],
+          },
+        })),
+        scan: {
+          stoppedOn: "windowEnd",
+          scannedTransactions: candidates.length,
+          matchedTransactions: candidates.length,
+          scannedThrough: { slot: 460869104, blockTime: 1792848888 },
+          creditsCharged: 11,
+        },
+      }),
+  });
+  const page = await client.scanMintWindow({
+    mint,
+    fromUnixSeconds: 1792848886,
+    toUnixSeconds: 1792848890,
+    maxScannedTransactions: 1000,
+  });
+  assert.deepEqual(
+    page.items.map((item) => item.reasonCode),
+    candidates.map((item) => item.reason),
+  );
+  await assert.rejects(
+    () =>
+      new HeliusParsedEventsScanClient({
+        apiKey: "test",
+        timeoutMs: 1000,
+        creditReservation: {
+          reserve: () => "2026-11-07",
+          settle: () => undefined,
+        },
+        fetchImpl: async () =>
+          Response.json({
+            data: [
+              {
+                signature,
+                parserStatus: "OK",
+                slot: 1,
+                blockTime: 2,
+                parsed: {
+                  slot: 1,
+                  blockTime: 3,
+                  transactionStatus: "OK",
+                  summary: { parsedData: null },
+                },
+              },
+            ],
+            scan: {
+              stoppedOn: "windowEnd",
+              scannedTransactions: 1,
+              matchedTransactions: 1,
+              scannedThrough: { slot: 1, blockTime: 2 },
+              creditsCharged: 10,
+            },
+          }),
+      }).scanMintWindow({
+        mint,
+        fromUnixSeconds: 1,
+        toUnixSeconds: 3,
+        maxScannedTransactions: 10,
+      }),
+    /CONFLICTING_PARSED_SCAN_TIME_METADATA/,
+  );
 });
 
 test("Parsed Events Scan never treats an empty page as complete without windowEnd evidence", async () => {

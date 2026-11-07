@@ -1,7 +1,43 @@
 import { createHash } from "node:crypto";
 import type { HeliusParsedEventsScanClient } from "@sentinel/providers";
-import type { SentinelStore } from "@sentinel/storage";
+import type {
+  ParsedReconciliationFinalization,
+  SentinelStore,
+} from "@sentinel/storage";
 import type { BoundedTradeVerificationQueue } from "./trade-verification.ts";
+
+export function parsedScanMatchesVerifiedTrades(input: {
+  expectedMint: string | null | undefined;
+  expectedSide: "BUY" | "SELL" | null | undefined;
+  observations: Array<{ mint: string; side: "BUY" | "SELL" }>;
+}): boolean {
+  return Boolean(
+    input.expectedMint &&
+    input.expectedSide &&
+    input.observations.length > 0 &&
+    input.observations.every(
+      (observation) =>
+        observation.mint === input.expectedMint &&
+        observation.side === input.expectedSide,
+    ),
+  );
+}
+
+export function parsedScanEventWithinExactWindow(input: {
+  blockTime: number;
+  windowStartedAtUtc: string;
+  windowExpiresAtUtc: string;
+}): boolean {
+  const startedAt = Date.parse(input.windowStartedAtUtc);
+  const expiresAt = Date.parse(input.windowExpiresAtUtc);
+  const blockTimeMs = input.blockTime * 1000;
+  return (
+    Number.isFinite(startedAt) &&
+    Number.isFinite(expiresAt) &&
+    blockTimeMs >= startedAt &&
+    blockTimeMs < expiresAt
+  );
+}
 
 export class TradeReconciliationWorker {
   readonly #store: SentinelStore;
@@ -10,7 +46,8 @@ export class TradeReconciliationWorker {
   readonly #maxPagesPerJob: number;
   readonly #maxScannedTransactions: number;
   readonly #concurrency: number;
-  readonly #onEvidence: () => void;
+  readonly #onEvidence: (input: { mint: string; triggerKey: string }) => void;
+  readonly #finalityBufferSeconds: number;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #running = false;
   #stopped = false;
@@ -22,7 +59,8 @@ export class TradeReconciliationWorker {
     maxPagesPerJob: number;
     maxScannedTransactions: number;
     concurrency: number;
-    onEvidence: () => void;
+    finalityBufferSeconds: number;
+    onEvidence: (input: { mint: string; triggerKey: string }) => void;
   }) {
     this.#store = input.store;
     this.#scan = input.scan;
@@ -30,6 +68,7 @@ export class TradeReconciliationWorker {
     this.#maxPagesPerJob = input.maxPagesPerJob;
     this.#maxScannedTransactions = input.maxScannedTransactions;
     this.#concurrency = input.concurrency;
+    this.#finalityBufferSeconds = input.finalityBufferSeconds;
     this.#onEvidence = input.onEvidence;
   }
 
@@ -55,6 +94,8 @@ export class TradeReconciliationWorker {
         signature: item.signature,
         slot: item.slot,
         providerBlockTime: item.blockTime,
+        expectedMint: item.parsedMint,
+        expectedSide: item.expectedSide,
         logs: [],
         observedAtUtc: new Date().toISOString(),
         payloadRef: `parsed-scan:${item.signature}`,
@@ -76,13 +117,15 @@ export class TradeReconciliationWorker {
     this.#running = true;
     try {
       this.#restorePendingTransactions();
-      this.#store.finalizeParsedReconciliationJobs();
+      this.#notifyFinalized(this.#store.finalizeParsedReconciliationJobs());
       for (
         let index = 0;
         index < this.#concurrency && !this.#stopped;
         index += 1
       ) {
-        const job = this.#store.claimParsedReconciliationJob();
+        const job = this.#store.claimParsedReconciliationJob(
+          this.#finalityBufferSeconds,
+        );
         if (!job) break;
         try {
           // Chain blockTime has one-second resolution. Round the start inward
@@ -98,7 +141,7 @@ export class TradeReconciliationWorker {
               : {}),
             maxScannedTransactions: this.#maxScannedTransactions,
           });
-          this.#store.saveParsedReconciliationPage({
+          const finalized = this.#store.saveParsedReconciliationPage({
             jobId: job.id,
             mint: job.mint,
             items: page.items,
@@ -108,14 +151,36 @@ export class TradeReconciliationWorker {
             creditsCharged: page.creditsCharged,
             maxPages: this.#maxPagesPerJob,
           });
+          this.#notifyFinalized(finalized);
           for (const item of page.items) {
+            if (
+              item.blockTime !== null &&
+              !parsedScanEventWithinExactWindow({
+                blockTime: item.blockTime,
+                windowStartedAtUtc: job.windowStartedAtUtc,
+                windowExpiresAtUtc: job.windowExpiresAtUtc,
+              })
+            ) {
+              this.#notifyFinalized(
+                this.#store.setParsedReconciliationTransactionStatus({
+                  mint: job.mint,
+                  signature: item.signature,
+                  status: "IRRELEVANT",
+                  reasonCode: "SCAN_EVENT_OUTSIDE_EXACT_OBSERVATION_WINDOW",
+                }),
+              );
+              continue;
+            }
             if (item.classification === "NON_TRADE") {
-              this.#store.setParsedReconciliationTransactionStatus({
-                mint: job.mint,
-                signature: item.signature,
-                status: "IRRELEVANT",
-                reasonCode: "VERIFIED_NON_TRADE_PROGRAM_INSTRUCTION",
-              });
+              this.#notifyFinalized(
+                this.#store.setParsedReconciliationTransactionStatus({
+                  mint: job.mint,
+                  signature: item.signature,
+                  status: "IRRELEVANT",
+                  reasonCode:
+                    item.reasonCode ?? "VERIFIED_NON_TRADE_PROGRAM_INSTRUCTION",
+                }),
+              );
               continue;
             }
             if (
@@ -124,15 +189,18 @@ export class TradeReconciliationWorker {
               item.blockTime === null ||
               item.slot < 0
             ) {
-              this.#store.setParsedReconciliationTransactionStatus({
-                mint: job.mint,
-                signature: item.signature,
-                status: "UNSUPPORTED",
-                reasonCode:
-                  item.parsedMint && item.parsedMint !== job.mint
-                    ? "SCAN_MINT_MISMATCH"
-                    : "SCAN_INSTRUCTION_UNSUPPORTED",
-              });
+              this.#notifyFinalized(
+                this.#store.setParsedReconciliationTransactionStatus({
+                  mint: job.mint,
+                  signature: item.signature,
+                  status: "UNSUPPORTED",
+                  reasonCode:
+                    item.reasonCode ??
+                    (item.parsedMint && item.parsedMint !== job.mint
+                      ? "SCAN_MINT_MISMATCH"
+                      : "SCAN_INSTRUCTION_UNSUPPORTED"),
+                }),
+              );
               continue;
             }
             const queued = this.#queue.enqueue({
@@ -140,6 +208,8 @@ export class TradeReconciliationWorker {
               signature: item.signature,
               slot: item.slot,
               providerBlockTime: item.blockTime,
+              expectedMint: item.parsedMint,
+              expectedSide: item.expectedSide,
               logs: [],
               observedAtUtc: new Date().toISOString(),
               payloadRef: `parsed-scan:${createHash("sha256").update(item.signature).digest("hex")}`,
@@ -148,14 +218,15 @@ export class TradeReconciliationWorker {
               reconnectCount: 0,
             });
             if (queued === "FULL")
-              this.#store.setParsedReconciliationTransactionStatus({
-                mint: job.mint,
-                signature: item.signature,
-                status: "FAILED",
-                reasonCode: "TRADE_VERIFICATION_QUEUE_FULL",
-              });
+              this.#notifyFinalized(
+                this.#store.setParsedReconciliationTransactionStatus({
+                  mint: job.mint,
+                  signature: item.signature,
+                  status: "FAILED",
+                  reasonCode: "TRADE_VERIFICATION_QUEUE_FULL",
+                }),
+              );
           }
-          this.#onEvidence();
         } catch (error) {
           const message =
             error instanceof Error ? error.message : "PARSED_SCAN_FAILED";
@@ -166,24 +237,41 @@ export class TradeReconciliationWorker {
             "INCONSISTENT_SCAN_COMPLETION",
             "PARSED_SCAN_CHARGE_EXCEEDS_RESERVATION",
           ].some((code) => message.startsWith(code));
-          if (permanent)
+          if (permanent) {
             this.#store.failParsedReconciliationJob(
               job.id,
               message.slice(0, 96),
             );
-          else
-            this.#store.deferParsedReconciliationJob(
+            this.#onEvidence({
+              mint: job.mint,
+              triggerKey: `scan-failed:${job.id}:${message.slice(0, 96)}`,
+            });
+          } else {
+            const terminal = this.#store.deferParsedReconciliationJob(
               job.id,
               message.slice(0, 96),
               retryDelay(job.attempts),
             );
-          this.#onEvidence();
+            if (terminal)
+              this.#onEvidence({
+                mint: job.mint,
+                triggerKey: `scan-retries-exhausted:${job.id}:${message.slice(0, 96)}`,
+              });
+          }
         }
       }
     } finally {
       this.#running = false;
       this.#schedule(1000);
     }
+  }
+
+  #notifyFinalized(items: ParsedReconciliationFinalization[]): void {
+    for (const item of items)
+      this.#onEvidence({
+        mint: item.mint,
+        triggerKey: `reconciliation:${item.jobId}:${item.status}`,
+      });
   }
 }
 

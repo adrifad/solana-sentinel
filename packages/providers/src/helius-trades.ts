@@ -30,6 +30,8 @@ export type HeliusLogTradeInput = {
   signature: string;
   slot: number;
   providerBlockTime?: number | null;
+  expectedMint?: string | null;
+  expectedSide?: "BUY" | "SELL" | null;
   logs: string[];
   observedAtUtc: string;
   payloadRef: string;

@@ -19,7 +19,10 @@ import { SentinelStore } from "@sentinel/storage";
 import { EnrichmentScheduler } from "./enrichment.ts";
 import { TokenAnalysisScheduler } from "./analysis.ts";
 import { PaperRuntime } from "./paper-runtime.ts";
-import { TradeReconciliationWorker } from "./trade-reconciliation.ts";
+import {
+  parsedScanMatchesVerifiedTrades,
+  TradeReconciliationWorker,
+} from "./trade-reconciliation.ts";
 import { BoundedTradeVerificationQueue } from "./trade-verification.ts";
 import { log } from "./logger.ts";
 
@@ -180,6 +183,23 @@ async function main(): Promise<void> {
     string,
     { poolAddress: string; baseMint: string; quoteMint: string }
   >();
+  const notifyAnalysisForReconciliation = (
+    items: Array<{
+      jobId: string;
+      mint: string;
+      status: "COMPLETE" | "PARTIAL";
+    }>,
+  ) => {
+    for (const item of items) {
+      if (
+        store.requeueLatestAnalysisForMint(
+          item.mint,
+          `reconciliation:${item.jobId}:${item.status}`,
+        )
+      )
+        analysis.wake();
+    }
+  };
   const tradeVerifier =
     (loaded.config.providers.helius.enable_trade_stream ||
       loaded.config.providers.helius.parsed_events_scan_enabled) &&
@@ -201,12 +221,14 @@ async function main(): Promise<void> {
               input.payloadRef.startsWith("parsed-scan:") &&
               transaction === null
             ) {
-              store.retryParsedReconciliationTransaction({
-                mint: input.mint,
-                signature: input.signature,
-                reasonCode: "TRADE_TRANSACTION_NOT_FOUND",
-                retryAfterMs: 2_000,
-              });
+              notifyAnalysisForReconciliation(
+                store.retryParsedReconciliationTransaction({
+                  mint: input.mint,
+                  signature: input.signature,
+                  reasonCode: "TRADE_TRANSACTION_NOT_FOUND",
+                  retryAfterMs: 2_000,
+                }),
+              );
               return;
             }
             if (
@@ -218,24 +240,34 @@ async function main(): Promise<void> {
               const reasonCode = transaction
                 ? "SCAN_TRANSACTION_BLOCK_TIME_MISMATCH"
                 : "TRADE_TRANSACTION_NOT_FOUND";
-              store.setParsedReconciliationTransactionStatus({
-                mint: input.mint,
-                signature: input.signature,
-                status: "FAILED",
-                reasonCode,
-              });
-              store.recordTradeObservationCoverage({
-                mint: input.mint,
-                source: tradeCoverageSource,
-                status: "PARTIAL",
-                windowStartedAtUtc: input.windowStartedAtUtc,
-                windowExpiresAtUtc: input.windowExpiresAtUtc,
-                lastEventAtUtc: input.observedAtUtc,
-                reconnectCount: input.reconnectCount,
-                reasonCode,
-                updatedAtUtc: utcNow(),
-              });
-              analysis.wake();
+              notifyAnalysisForReconciliation(
+                store.setParsedReconciliationTransactionStatus({
+                  mint: input.mint,
+                  signature: input.signature,
+                  status: "FAILED",
+                  reasonCode,
+                }),
+              );
+              if (!input.payloadRef.startsWith("parsed-scan:")) {
+                store.recordTradeObservationCoverage({
+                  mint: input.mint,
+                  source: tradeCoverageSource,
+                  status: "PARTIAL",
+                  windowStartedAtUtc: input.windowStartedAtUtc,
+                  windowExpiresAtUtc: input.windowExpiresAtUtc,
+                  lastEventAtUtc: input.observedAtUtc,
+                  reconnectCount: input.reconnectCount,
+                  reasonCode,
+                  updatedAtUtc: utcNow(),
+                });
+                if (
+                  store.requeueLatestAnalysisForMint(
+                    input.mint,
+                    `coverage:${input.mint}:${input.windowStartedAtUtc}:${reasonCode}`,
+                  )
+                )
+                  analysis.wake();
+              }
               return;
             }
             let pumpSwapPools:
@@ -267,25 +299,46 @@ async function main(): Promise<void> {
               transaction,
               ...(pumpSwapPools ? { pumpSwapPools } : {}),
             });
-            if (validated.status !== "VERIFIED") {
-              store.setParsedReconciliationTransactionStatus({
-                mint: input.mint,
-                signature: input.signature,
-                status: "UNSUPPORTED",
-                reasonCode: validated.reasonCode ?? "TRADE_EVIDENCE_UNVERIFIED",
+            const parsedScanMismatch =
+              input.payloadRef.startsWith("parsed-scan:") &&
+              validated.status === "VERIFIED" &&
+              !parsedScanMatchesVerifiedTrades({
+                expectedMint: input.expectedMint,
+                expectedSide: input.expectedSide,
+                observations: validated.observations,
               });
-              store.recordTradeObservationCoverage({
-                mint: input.mint,
-                source: tradeCoverageSource,
-                status: "UNVERIFIED",
-                windowStartedAtUtc: input.windowStartedAtUtc,
-                windowExpiresAtUtc: input.windowExpiresAtUtc,
-                lastEventAtUtc: input.observedAtUtc,
-                reconnectCount: input.reconnectCount,
-                reasonCode: validated.reasonCode ?? "TRADE_VALIDATION_UNKNOWN",
-                updatedAtUtc: utcNow(),
-              });
-              analysis.wake();
+            if (validated.status !== "VERIFIED" || parsedScanMismatch) {
+              const reasonCode = parsedScanMismatch
+                ? "SCAN_TRADE_MINT_OR_SIDE_MISMATCH"
+                : (validated.reasonCode ?? "TRADE_EVIDENCE_UNVERIFIED");
+              notifyAnalysisForReconciliation(
+                store.setParsedReconciliationTransactionStatus({
+                  mint: input.mint,
+                  signature: input.signature,
+                  status: "UNSUPPORTED",
+                  reasonCode,
+                }),
+              );
+              if (!input.payloadRef.startsWith("parsed-scan:")) {
+                store.recordTradeObservationCoverage({
+                  mint: input.mint,
+                  source: tradeCoverageSource,
+                  status: "UNVERIFIED",
+                  windowStartedAtUtc: input.windowStartedAtUtc,
+                  windowExpiresAtUtc: input.windowExpiresAtUtc,
+                  lastEventAtUtc: input.observedAtUtc,
+                  reconnectCount: input.reconnectCount,
+                  reasonCode,
+                  updatedAtUtc: utcNow(),
+                });
+                if (
+                  store.requeueLatestAnalysisForMint(
+                    input.mint,
+                    `coverage:${input.mint}:${input.windowStartedAtUtc}:${reasonCode}`,
+                  )
+                )
+                  analysis.wake();
+              }
               return;
             }
             const transactionPayloadRef = `sha256:${createHash("sha256")
@@ -301,7 +354,7 @@ async function main(): Promise<void> {
               const id = createHash("sha256")
                 .update(`${event.signature}:${event.eventIndex}:${event.mint}`)
                 .digest("hex");
-              store.saveLaunchTradeObservation({
+              const inserted = store.saveLaunchTradeObservation({
                 id,
                 eventIndex: event.eventIndex,
                 mint: event.mint,
@@ -327,25 +380,32 @@ async function main(): Promise<void> {
                 validationConfidenceBps: event.validationConfidenceBps,
                 payloadRef: transactionPayloadRef,
               });
+              if (inserted) {
+                const triggerKey = `trade:${id}`;
+                if (store.requeueLatestAnalysisForMint(input.mint, triggerKey))
+                  analysis.wake();
+              }
             }
-            store.setParsedReconciliationTransactionStatus({
+            const finalized = store.setParsedReconciliationTransactionStatus({
               mint: input.mint,
               signature: input.signature,
               status: "VERIFIED",
               reasonCode: null,
             });
-            store.recordTradeObservationCoverage({
-              mint: input.mint,
-              source: tradeCoverageSource,
-              status: "UNVERIFIED",
-              windowStartedAtUtc: input.windowStartedAtUtc,
-              windowExpiresAtUtc: input.windowExpiresAtUtc,
-              lastEventAtUtc: input.observedAtUtc,
-              reconnectCount: input.reconnectCount,
-              reasonCode: "TRADE_EVENTS_VALIDATED_WINDOW_NOT_RECONCILED",
-              updatedAtUtc: utcNow(),
-            });
-            analysis.wake();
+            notifyAnalysisForReconciliation(finalized);
+            if (!input.payloadRef.startsWith("parsed-scan:"))
+              store.recordTradeObservationCoverage({
+                mint: input.mint,
+                source: tradeCoverageSource,
+                status: "UNVERIFIED",
+                windowStartedAtUtc: input.windowStartedAtUtc,
+                windowExpiresAtUtc: input.windowExpiresAtUtc,
+                lastEventAtUtc: input.observedAtUtc,
+                reconnectCount: input.reconnectCount,
+                reasonCode: "TRADE_EVENTS_VALIDATED_WINDOW_NOT_RECONCILED",
+                updatedAtUtc: utcNow(),
+              });
+            if (validated.observations.length === 0) analysis.wake();
           },
           onFailure(input, error) {
             const code =
@@ -361,19 +421,23 @@ async function main(): Promise<void> {
                 "REQUEST_BUDGET_EXHAUSTED",
               ].includes(code)
             )
-              store.retryParsedReconciliationTransaction({
-                mint: input.mint,
-                signature: input.signature,
-                reasonCode: code,
-                retryAfterMs: Math.min(120_000, 1000 * 2 ** Math.min(7, 1)),
-              });
+              notifyAnalysisForReconciliation(
+                store.retryParsedReconciliationTransaction({
+                  mint: input.mint,
+                  signature: input.signature,
+                  reasonCode: code,
+                  retryAfterMs: Math.min(120_000, 1000 * 2 ** Math.min(7, 1)),
+                }),
+              );
             else
-              store.setParsedReconciliationTransactionStatus({
-                mint: input.mint,
-                signature: input.signature,
-                status: "FAILED",
-                reasonCode: code,
-              });
+              notifyAnalysisForReconciliation(
+                store.setParsedReconciliationTransactionStatus({
+                  mint: input.mint,
+                  signature: input.signature,
+                  status: "FAILED",
+                  reasonCode: code,
+                }),
+              );
             store.recordTradeObservationCoverage({
               mint: input.mint,
               source: tradeCoverageSource,
@@ -386,7 +450,13 @@ async function main(): Promise<void> {
               updatedAtUtc: utcNow(),
             });
             store.recordProviderIssue("helius", code);
-            analysis.wake();
+            if (
+              store.requeueLatestAnalysisForMint(
+                input.mint,
+                `trade-validation-error:${input.mint}:${input.signature}:${code}`,
+              )
+            )
+              analysis.wake();
           },
         })
       : undefined;
@@ -430,7 +500,13 @@ async function main(): Promise<void> {
             .parsed_events_scan_max_scanned_transactions,
         concurrency:
           loaded.config.providers.helius.parsed_events_scan_concurrency,
-        onEvidence: () => analysis.wake(),
+        finalityBufferSeconds:
+          loaded.config.providers.helius
+            .parsed_events_scan_finality_buffer_seconds,
+        onEvidence: ({ mint, triggerKey }) => {
+          if (store.requeueLatestAnalysisForMint(mint, triggerKey))
+            analysis.wake();
+        },
       })
     : undefined;
   if (parsedScanEnabled) {
@@ -474,10 +550,11 @@ async function main(): Promise<void> {
               reasonCode: input.reasonCode,
               updatedAtUtc: input.observedAtUtc,
             });
-            if (
-              input.reasonCode === "OBSERVATION_WINDOW_EXPIRED" &&
-              store.requeueLatestAnalysisForMint(input.mint)
-            )
+            const triggerKey =
+              input.reasonCode === "OBSERVATION_WINDOW_EXPIRED"
+                ? `stream-window:${input.mint}:${input.windowStartedAtUtc}:${input.windowExpiresAtUtc}`
+                : `stream-coverage:${input.mint}:${input.status}:${input.reasonCode}:${input.windowStartedAtUtc}`;
+            if (store.requeueLatestAnalysisForMint(input.mint, triggerKey))
               analysis.wake();
           },
           onHealth(state, errorCode, reconnectCount) {
