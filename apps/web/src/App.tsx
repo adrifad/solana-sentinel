@@ -1034,9 +1034,11 @@ function CandidateRow({ candidate }: { candidate: Candidate }) {
       <td className="px-4 py-3.5">
         <StatusBadge value={coverage} compact />
         <p className="mt-1.5 max-w-[130px] truncate text-[9px] text-[#777e92]">
-          {candidate.tradeCoverage?.reasonCode
-            ? formatReason(candidate.tradeCoverage.reasonCode)
-            : "No coverage proof"}
+          {candidate.tradeReconciliation
+            ? `${candidate.tradeReconciliation.status} · ${candidate.tradeReconciliation.pagesScanned} pages · ${candidate.tradeReconciliation.pendingTransactions} pending`
+            : candidate.tradeCoverage?.reasonCode
+              ? formatReason(candidate.tradeCoverage.reasonCode)
+              : "No coverage proof"}
         </p>
       </td>
       <td className="px-4 py-3.5">
@@ -1395,6 +1397,44 @@ function AnalysisDiagnostics({
           Verified trades:{" "}
           {number(tradeData["verifiedObservationCount"] as number | undefined)}{" "}
           / {number(tradeData["observationCount"] as number | undefined)}
+        </span>
+        <span>
+          Verified BUY / SELL:{" "}
+          {number(tradeData["verifiedBuyCount"] as number | undefined)} /{" "}
+          {number(tradeData["verifiedSellCount"] as number | undefined)}
+        </span>
+        <span>
+          Parsed Scan credits:{" "}
+          {number(
+            (
+              tradeData["parsedScanCredits"] as
+                Record<string, number> | undefined
+            )?.["used"],
+          )}{" "}
+          used ·{" "}
+          {number(
+            (
+              tradeData["parsedScanCredits"] as
+                Record<string, number> | undefined
+            )?.["reserved"],
+          )}{" "}
+          reserved ·{" "}
+          {number(
+            (
+              tradeData["parsedScanCredits"] as
+                Record<string, number> | undefined
+            )?.["remaining"],
+          )}{" "}
+          remaining
+        </span>
+        <span>
+          Reconciliation:{" "}
+          {Object.entries(
+            (tradeData["reconciliationByStatus"] as
+              Record<string, number> | undefined) ?? {},
+          )
+            .map(([state, count]) => `${state} ${number(count)}`)
+            .join(" · ") || "No jobs"}
         </span>
       </div>
       {coverageStatuses.length > 0 && (

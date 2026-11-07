@@ -11,9 +11,11 @@ export type ApiOptions = {
   mode: AppConfig["mode"];
   staleFeedSeconds: number;
   tradeStreamEnabled: boolean;
+  parsedScanEnabled?: boolean;
   automaticEntriesEnabled: boolean;
   heliusMaxRequestsPerUtcDay?: number;
   heliusExitReservedRequestsPerUtcDay?: number;
+  parsedScanCreditsPerUtcDay?: number;
   paperWalletId: string;
   operatorToken?: string;
   maxTradeSol?: string;
@@ -257,6 +259,9 @@ async function handleRequest(
             }
           : null,
         tradeCoverage: coverage,
+        tradeReconciliation: options.store.getParsedReconciliationStatus(
+          token.mint,
+        ),
         launchBehavior: behavior
           ? {
               id: behavior.id,
@@ -563,19 +568,24 @@ export function getOperationalReadiness(options: ApiOptions) {
     latestCompletedAtUtc: null,
     oldestPendingAtUtc: null,
   };
-  const tradeCoverageStats =
-    options.store.getTradeObservationCoverageStats?.() ?? {
-      monitoredTokens: monitoredTokens.length,
-      byStatus: {},
-      completeTokens: monitoredTokens.filter(
-        (token) =>
-          options.store.getLatestTradeObservationCoverage(token.mint)
-            ?.status === "COMPLETE",
-      ).length,
-      observationCount: 0,
-      verifiedObservationCount: 0,
-      latestObservationAtUtc: null,
-    };
+  const tradeCoverageStats = options.store.getTradeObservationCoverageStats?.(
+    options.parsedScanCreditsPerUtcDay ?? 0,
+  ) ?? {
+    monitoredTokens: monitoredTokens.length,
+    byStatus: {},
+    completeTokens: monitoredTokens.filter(
+      (token) =>
+        options.store.getLatestTradeObservationCoverage(token.mint)?.status ===
+        "COMPLETE",
+    ).length,
+    observationCount: 0,
+    verifiedObservationCount: 0,
+    latestObservationAtUtc: null,
+    verifiedBuyCount: 0,
+    verifiedSellCount: 0,
+    reconciliationByStatus: {},
+    parsedScanBudget: { used: 0, reserved: 0, remaining: 0, requests: 0 },
+  };
   const analysisPending = analysisStats.analysis["PENDING"] ?? 0;
   const analysisProcessing = analysisStats.analysis["PROCESSING"] ?? 0;
   const analysisCompleted = analysisStats.analysis["COMPLETE"] ?? 0;
@@ -636,16 +646,25 @@ export function getOperationalReadiness(options: ApiOptions) {
               ? "READY"
               : "BLOCKED";
   const tradeObservationReady =
-    options.tradeStreamEnabled &&
-    heliusTradeStream?.state === "HEALTHY" &&
+    ((options.tradeStreamEnabled && heliusTradeStream?.state === "HEALTHY") ||
+      options.parsedScanEnabled === true) &&
     tradeCoverageStats.monitoredTokens > 0 &&
     tradeCoverageStats.completeTokens === tradeCoverageStats.monitoredTokens;
+  const reconciliationActive =
+    (tradeCoverageStats.reconciliationByStatus?.["PENDING"] ?? 0) > 0 ||
+    (tradeCoverageStats.reconciliationByStatus?.["PROCESSING"] ?? 0) > 0 ||
+    (tradeCoverageStats.reconciliationByStatus?.["RETRY_WAIT"] ?? 0) > 0;
   const blockers: string[] = [];
   const analysisBlockers: string[] = [];
   const discoveryReady = pumpFresh && pump?.state === "HEALTHY";
   if (!discoveryReady) blockers.push("PUMPPORTAL_DISCOVERY_NOT_HEALTHY");
-  if (!options.tradeStreamEnabled) blockers.push("TRADE_STREAM_DISABLED");
-  if (options.tradeStreamEnabled && heliusTradeStream?.state !== "HEALTHY")
+  if (!options.tradeStreamEnabled && !options.parsedScanEnabled)
+    blockers.push("TRADE_OBSERVATION_DISABLED");
+  if (
+    options.tradeStreamEnabled &&
+    heliusTradeStream?.state !== "HEALTHY" &&
+    !options.parsedScanEnabled
+  )
     blockers.push("HELIUS_TRADE_STREAM_NOT_HEALTHY");
   if (!tradeObservationReady) blockers.push("TRADE_STREAM_COVERAGE_UNVERIFIED");
   if (analysisStats.eligibleTokens === 0)
@@ -738,7 +757,8 @@ export function getOperationalReadiness(options: ApiOptions) {
     tradeObservationReady &&
     !budgetBlocked &&
     Boolean(helius?.state === "HEALTHY") &&
-    Boolean(heliusTradeStream?.state === "HEALTHY") &&
+    ((options.tradeStreamEnabled && heliusTradeStream?.state === "HEALTHY") ||
+      options.parsedScanEnabled === true) &&
     paperRuntimeReady &&
     positionMonitorBudgetReady &&
     (paperAccount?.latestMark?.unpriceablePositions ?? 0) === 0;
@@ -992,13 +1012,16 @@ export function getOperationalReadiness(options: ApiOptions) {
       oldestPendingAtUtc: analysisStats.oldestPendingAtUtc,
     },
     tradeObservationReady,
-    tradeObservationStatus: !options.tradeStreamEnabled
-      ? "DISABLED"
-      : tradeObservationReady
-        ? "READY"
-        : heliusTradeStream?.state === "HEALTHY"
-          ? "DEGRADED"
-          : "BLOCKED",
+    tradeObservationStatus:
+      !options.tradeStreamEnabled && !options.parsedScanEnabled
+        ? "DISABLED"
+        : tradeObservationReady
+          ? "READY"
+          : reconciliationActive
+            ? "RECONCILING"
+            : heliusTradeStream?.state === "HEALTHY"
+              ? "DEGRADED"
+              : "BLOCKED",
     tradeObservationDiagnostics: {
       monitoredTokens: tradeCoverageStats.monitoredTokens,
       completeTokens: tradeCoverageStats.completeTokens,
@@ -1007,8 +1030,19 @@ export function getOperationalReadiness(options: ApiOptions) {
       verifiedObservationCount:
         tradeCoverageStats.verifiedObservationCount ?? 0,
       latestObservationAtUtc: tradeCoverageStats.latestObservationAtUtc ?? null,
+      verifiedBuyCount: tradeCoverageStats.verifiedBuyCount ?? 0,
+      verifiedSellCount: tradeCoverageStats.verifiedSellCount ?? 0,
+      reconciliationByStatus: tradeCoverageStats.reconciliationByStatus ?? {},
+      parsedScanCredits: tradeCoverageStats.parsedScanBudget ?? {
+        used: 0,
+        reserved: 0,
+        remaining: 0,
+        requests: 0,
+      },
       streamHealth: heliusTradeStream?.state ?? "UNKNOWN",
-      completenessReason: "HELIUS_LOGS_SUBSCRIBE_HAS_NO_REPLAY_CURSOR",
+      parsedScanEnabled: options.parsedScanEnabled ?? false,
+      completenessReason:
+        "COMPLETE_REQUIRES_FINALIZED_SCAN_WINDOW_AND_VERIFIED_MATCHES",
     },
     paperRuntimeReady,
     paperManualEntryReady,

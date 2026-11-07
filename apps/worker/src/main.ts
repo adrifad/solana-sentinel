@@ -5,6 +5,7 @@ import type { ProviderHealth } from "@sentinel/domain";
 import {
   HeliusTradeStream,
   HeliusRpcClient,
+  HeliusParsedEventsScanClient,
   JupiterQuoteClient,
   PumpPortalClient,
   PumpSwapStateLoader,
@@ -18,6 +19,7 @@ import { SentinelStore } from "@sentinel/storage";
 import { EnrichmentScheduler } from "./enrichment.ts";
 import { TokenAnalysisScheduler } from "./analysis.ts";
 import { PaperRuntime } from "./paper-runtime.ts";
+import { TradeReconciliationWorker } from "./trade-reconciliation.ts";
 import { BoundedTradeVerificationQueue } from "./trade-verification.ts";
 import { log } from "./logger.ts";
 
@@ -179,14 +181,63 @@ async function main(): Promise<void> {
     { poolAddress: string; baseMint: string; quoteMint: string }
   >();
   const tradeVerifier =
-    loaded.config.providers.helius.enable_trade_stream && helius
+    (loaded.config.providers.helius.enable_trade_stream ||
+      loaded.config.providers.helius.parsed_events_scan_enabled) &&
+    helius
       ? new BoundedTradeVerificationQueue({
           maxPending:
             loaded.config.providers.helius.max_pending_trade_verifications,
           concurrency:
             loaded.config.providers.helius.trade_verification_concurrency,
           async process(input) {
-            const transaction = await helius!.getTransaction(input.signature);
+            const transaction = await helius!.getTransaction(
+              input.signature,
+              input.payloadRef.startsWith("parsed-scan:")
+                ? "CANDIDATE"
+                : "BACKGROUND",
+              input.mint,
+            );
+            if (
+              input.payloadRef.startsWith("parsed-scan:") &&
+              transaction === null
+            ) {
+              store.retryParsedReconciliationTransaction({
+                mint: input.mint,
+                signature: input.signature,
+                reasonCode: "TRADE_TRANSACTION_NOT_FOUND",
+                retryAfterMs: 2_000,
+              });
+              return;
+            }
+            if (
+              input.payloadRef.startsWith("parsed-scan:") &&
+              (input.providerBlockTime === undefined ||
+                input.providerBlockTime === null ||
+                transaction?.blockTime !== input.providerBlockTime)
+            ) {
+              const reasonCode = transaction
+                ? "SCAN_TRANSACTION_BLOCK_TIME_MISMATCH"
+                : "TRADE_TRANSACTION_NOT_FOUND";
+              store.setParsedReconciliationTransactionStatus({
+                mint: input.mint,
+                signature: input.signature,
+                status: "FAILED",
+                reasonCode,
+              });
+              store.recordTradeObservationCoverage({
+                mint: input.mint,
+                source: tradeCoverageSource,
+                status: "PARTIAL",
+                windowStartedAtUtc: input.windowStartedAtUtc,
+                windowExpiresAtUtc: input.windowExpiresAtUtc,
+                lastEventAtUtc: input.observedAtUtc,
+                reconnectCount: input.reconnectCount,
+                reasonCode,
+                updatedAtUtc: utcNow(),
+              });
+              analysis.wake();
+              return;
+            }
             let pumpSwapPools:
               Map<string, { baseMint: string; quoteMint: string }> | undefined;
             if (
@@ -217,6 +268,12 @@ async function main(): Promise<void> {
               ...(pumpSwapPools ? { pumpSwapPools } : {}),
             });
             if (validated.status !== "VERIFIED") {
+              store.setParsedReconciliationTransactionStatus({
+                mint: input.mint,
+                signature: input.signature,
+                status: "UNSUPPORTED",
+                reasonCode: validated.reasonCode ?? "TRADE_EVIDENCE_UNVERIFIED",
+              });
               store.recordTradeObservationCoverage({
                 mint: input.mint,
                 source: tradeCoverageSource,
@@ -228,6 +285,7 @@ async function main(): Promise<void> {
                 reasonCode: validated.reasonCode ?? "TRADE_VALIDATION_UNKNOWN",
                 updatedAtUtc: utcNow(),
               });
+              analysis.wake();
               return;
             }
             const transactionPayloadRef = `sha256:${createHash("sha256")
@@ -270,6 +328,12 @@ async function main(): Promise<void> {
                 payloadRef: transactionPayloadRef,
               });
             }
+            store.setParsedReconciliationTransactionStatus({
+              mint: input.mint,
+              signature: input.signature,
+              status: "VERIFIED",
+              reasonCode: null,
+            });
             store.recordTradeObservationCoverage({
               mint: input.mint,
               source: tradeCoverageSource,
@@ -288,6 +352,28 @@ async function main(): Promise<void> {
               error && typeof error === "object" && "code" in error
                 ? String(error.code)
                 : "TRADE_TRANSACTION_VALIDATION_FAILED";
+            if (
+              [
+                "TIMEOUT",
+                "RATE_LIMITED",
+                "PROVIDER_UNAVAILABLE",
+                "CIRCUIT_OPEN",
+                "REQUEST_BUDGET_EXHAUSTED",
+              ].includes(code)
+            )
+              store.retryParsedReconciliationTransaction({
+                mint: input.mint,
+                signature: input.signature,
+                reasonCode: code,
+                retryAfterMs: Math.min(120_000, 1000 * 2 ** Math.min(7, 1)),
+              });
+            else
+              store.setParsedReconciliationTransactionStatus({
+                mint: input.mint,
+                signature: input.signature,
+                status: "FAILED",
+                reasonCode: code,
+              });
             store.recordTradeObservationCoverage({
               mint: input.mint,
               source: tradeCoverageSource,
@@ -300,9 +386,67 @@ async function main(): Promise<void> {
               updatedAtUtc: utcNow(),
             });
             store.recordProviderIssue("helius", code);
+            analysis.wake();
           },
         })
       : undefined;
+
+  const parsedScanEnabled =
+    loaded.config.providers.helius.parsed_events_scan_enabled &&
+    loaded.config.providers.helius.parsed_events_scan_max_credits_per_utc_day >
+      0 &&
+    Boolean(helius && loaded.heliusApiKey) &&
+    Boolean(tradeVerifier);
+  const reconciliation = parsedScanEnabled
+    ? new TradeReconciliationWorker({
+        store,
+        scan: new HeliusParsedEventsScanClient({
+          apiKey: loaded.heliusApiKey!,
+          timeoutMs: loaded.config.providers.helius.request_timeout_ms,
+          creditReservation: {
+            reserve: (credits) =>
+              store.reserveParsedEventsScanCredits(
+                loaded.config.providers.helius
+                  .parsed_events_scan_max_credits_per_utc_day,
+                credits,
+              ),
+            settle: (reservationDay, credits) =>
+              store.settleParsedEventsScanCredits(
+                reservationDay,
+                10 +
+                  Math.ceil(
+                    loaded.config.providers.helius
+                      .parsed_events_scan_max_scanned_transactions / 1000,
+                  ),
+                credits,
+              ),
+          },
+        }),
+        verificationQueue: tradeVerifier!,
+        maxPagesPerJob:
+          loaded.config.providers.helius.parsed_events_scan_max_pages_per_job,
+        maxScannedTransactions:
+          loaded.config.providers.helius
+            .parsed_events_scan_max_scanned_transactions,
+        concurrency:
+          loaded.config.providers.helius.parsed_events_scan_concurrency,
+        onEvidence: () => analysis.wake(),
+      })
+    : undefined;
+  if (parsedScanEnabled) {
+    for (const token of store.listTokens(200)) {
+      if (!token.monitoringEligible) continue;
+      const start = Date.parse(token.firstSeenAtUtc);
+      if (!Number.isFinite(start)) continue;
+      const seconds = loaded.config.analysis.token_observation_seconds;
+      store.enqueueTradeReconciliation({
+        mint: token.mint,
+        windowStartedAtUtc: token.firstSeenAtUtc,
+        windowExpiresAtUtc: new Date(start + seconds * 1000).toISOString(),
+      });
+    }
+    reconciliation?.start();
+  }
 
   const tradeStream =
     loaded.config.providers.helius.enable_trade_stream &&
@@ -458,6 +602,22 @@ async function main(): Promise<void> {
         tradeStream
       )
         tradeStream.subscribeMint(event.mint);
+      if (
+        event.kind === "TOKEN_CREATED" &&
+        outcome.monitoringEligible &&
+        parsedScanEnabled
+      ) {
+        const windowStart = event.firstSeenAtUtc;
+        const windowEnd = new Date(
+          Date.parse(windowStart) +
+            loaded.config.analysis.token_observation_seconds * 1000,
+        ).toISOString();
+        store.enqueueTradeReconciliation({
+          mint: event.mint,
+          windowStartedAtUtc: windowStart,
+          windowExpiresAtUtc: windowEnd,
+        });
+      }
     },
     async onEvent() {
       enrichment?.wake();
@@ -480,6 +640,7 @@ async function main(): Promise<void> {
         await analysis.stop();
         await paper?.stop();
         await tradeStream?.stop();
+        await reconciliation?.stop();
         await tradeVerifier?.stop();
         if (pumpStopError) throw pumpStopError;
       } finally {

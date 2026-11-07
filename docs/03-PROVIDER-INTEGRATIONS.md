@@ -22,6 +22,16 @@
 - RPC requests use an internal daily cap. `exit_reserved_requests_per_utc_day` reserves capacity from candidate/background calls for exit and risk-critical monitoring; this application request budget is not a measure of Helius credits or provider-side entitlement.
 - Per-attempt diagnostics retain RPC method, priority, component, purpose, subject mint when known, attempt, outcome, and safe provider error code. Readiness exposes internal daily usage and per-method totals. Healthy RPC does not imply trade-stream access or observation completeness.
 
+### Parsed Events Scan reconciliation
+
+The optional historical reconciler calls Helius `POST /v1/parsed-events/scan` for each monitored mint and matches all instructions from the Pump.fun and PumpSwap programs. It intentionally omits instruction-name filters so a newer instruction variant cannot be silently excluded. Results are candidate transactions only: finalized `getTransaction` data still passes the existing signature, slot, program-log, signer, token-balance and amount checks before any trade observation is stored.
+
+The worker resumes `paginationToken` from SQLite. Empty `data` is not completion evidence. Coverage becomes `COMPLETE` only after Helius reports `stoppedOn: windowEnd` with no cursor and every matched transaction is verified or explicitly classified as a recognized non-trade. Unsupported instructions, failed verification, provider errors, budget exhaustion, or page-limit exhaustion keep coverage partial or unverified. Scan credits have their own persistent UTC-day budget, separate from JSON-RPC request counts. The feature defaults off and its credit cap defaults to zero; enabling it can consume Parsed Events credits.
+
+Stored scan windows have outward-rounded Unix-second query bounds. Launch behavior still clips events to its own window and decision timestamp. A later reconciliation causes new analysis; it does not rewrite prior decisions using evidence that was unavailable at their decision time.
+
+See the official [Parsed Events Scan API](https://www.helius.dev/docs/api-reference/parsed-events/scan). Live entitlement, account-specific credit pricing, and decoder compatibility against live trade transactions remain unverified unless a bounded mainnet run is recorded separately.
+
 ## DEX Screener — supplemental market/social metadata
 
 - Endpoint: `GET https://api.dexscreener.com/token-pairs/v1/solana/{tokenAddress}`.

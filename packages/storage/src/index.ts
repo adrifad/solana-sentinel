@@ -39,6 +39,18 @@ type SqlRow = Record<
 type JobChainTimeStatus =
   "UNKNOWN" | "RESOLVED" | "UNAVAILABLE" | "PROVIDER_ERROR";
 
+export type ParsedReconciliationJob = {
+  id: string;
+  mint: string;
+  windowStartedAtUtc: string;
+  windowExpiresAtUtc: string;
+  status: "PENDING" | "PROCESSING" | "RETRY_WAIT" | "COMPLETE" | "PARTIAL";
+  paginationToken: string | null;
+  stoppedOn: string | null;
+  pagesScanned: number;
+  attempts: number;
+};
+
 export type ManualPaperRequest = {
   id: string;
   idempotencyKey: string;
@@ -153,6 +165,7 @@ export class SentinelStore {
       "014-telegram-outbox.sql",
       "015-paper-entry-evaluations.sql",
       "016-analysis-diagnostics.sql",
+      "017-parsed-events-reconciliation.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -1129,13 +1142,22 @@ export class SentinelStore {
     };
   }
 
-  getTradeObservationCoverageStats(): {
+  getTradeObservationCoverageStats(maxParsedScanCreditsPerUtcDay = 0): {
     monitoredTokens: number;
     byStatus: Record<string, number>;
     completeTokens: number;
     observationCount: number;
     verifiedObservationCount: number;
     latestObservationAtUtc: string | null;
+    verifiedBuyCount: number;
+    verifiedSellCount: number;
+    reconciliationByStatus: Record<string, number>;
+    parsedScanBudget: {
+      used: number;
+      reserved: number;
+      remaining: number;
+      requests: number;
+    };
   } {
     const now = utcNow();
     const monitored = this.#db
@@ -1147,7 +1169,7 @@ export class SentinelStore {
     const rows = this.#db
       .prepare(
         `SELECT status, COUNT(*) AS count FROM (
-          SELECT c.status, ROW_NUMBER() OVER (PARTITION BY c.mint ORDER BY c.updated_at_utc DESC, c.id DESC) AS rank
+          SELECT c.status, ROW_NUMBER() OVER (PARTITION BY c.mint ORDER BY c.window_started_at_utc DESC, (c.status='COMPLETE') DESC, c.updated_at_utc DESC, c.id DESC) AS rank
           FROM trade_observation_coverage c JOIN tokens t ON t.mint = c.mint
           WHERE t.monitoring_eligible = 1
             AND (t.monitoring_lease_until_utc IS NULL OR t.monitoring_lease_until_utc > ?)
@@ -1161,10 +1183,17 @@ export class SentinelStore {
       .prepare(
         `SELECT COUNT(*) AS total,
           SUM(CASE WHEN validation_status = 'VERIFIED' THEN 1 ELSE 0 END) AS verified,
+          SUM(CASE WHEN validation_status = 'VERIFIED' AND side='BUY' THEN 1 ELSE 0 END) AS buys,
+          SUM(CASE WHEN validation_status = 'VERIFIED' AND side='SELL' THEN 1 ELSE 0 END) AS sells,
           MAX(received_at_utc) AS latest
          FROM launch_trade_observations`,
       )
       .get() as SqlRow;
+    const reconciliationRows = this.#db
+      .prepare(
+        `SELECT status,COUNT(*) AS count FROM parsed_event_reconciliation_jobs GROUP BY status`,
+      )
+      .all() as SqlRow[];
     return {
       monitoredTokens: Number(monitored["count"] ?? 0),
       byStatus,
@@ -1173,7 +1202,506 @@ export class SentinelStore {
       verifiedObservationCount: Number(observations["verified"] ?? 0),
       latestObservationAtUtc:
         observations["latest"] === null ? null : String(observations["latest"]),
+      verifiedBuyCount: Number(observations["buys"] ?? 0),
+      verifiedSellCount: Number(observations["sells"] ?? 0),
+      reconciliationByStatus: Object.fromEntries(
+        reconciliationRows.map((row) => [
+          String(row["status"]),
+          Number(row["count"]),
+        ]),
+      ),
+      parsedScanBudget: this.parsedEventsScanBudget(
+        maxParsedScanCreditsPerUtcDay,
+      ),
     };
+  }
+
+  enqueueTradeReconciliation(input: {
+    mint: string;
+    windowStartedAtUtc: string;
+    windowExpiresAtUtc: string;
+    priority?: number;
+  }): string {
+    const id = createHash("sha256")
+      .update(`${input.mint}:${input.windowStartedAtUtc}`)
+      .digest("hex");
+    const now = utcNow();
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO parsed_event_reconciliation_jobs
+        (id,mint,window_started_at_utc,window_expires_at_utc,status,priority,next_attempt_at_utc,created_at_utc,updated_at_utc)
+        VALUES (?,?,?,?,'PENDING',?,?,?,?)`,
+      )
+      .run(
+        id,
+        input.mint,
+        input.windowStartedAtUtc,
+        input.windowExpiresAtUtc,
+        input.priority ?? 100,
+        now,
+        now,
+        now,
+      );
+    this.recordTradeObservationCoverage({
+      mint: input.mint,
+      source: "helius_parsed_events_scan",
+      status: "UNVERIFIED",
+      windowStartedAtUtc: input.windowStartedAtUtc,
+      windowExpiresAtUtc: input.windowExpiresAtUtc,
+      lastEventAtUtc: null,
+      reconnectCount: 0,
+      reasonCode: "RECONCILIATION_QUEUED",
+      updatedAtUtc: now,
+    });
+    return id;
+  }
+
+  recoverParsedReconciliationJobs(): number {
+    const now = utcNow();
+    const result = this.#db
+      .prepare(
+        `UPDATE parsed_event_reconciliation_jobs SET status='RETRY_WAIT',
+         reason_code='WORKER_RESTART_RECOVERY', next_attempt_at_utc=?, updated_at_utc=?
+         WHERE status='PROCESSING' AND stopped_on IS NOT 'windowEnd'`,
+      )
+      .run(now, now);
+    return Number(result.changes);
+  }
+
+  claimParsedReconciliationJob(): ParsedReconciliationJob | null {
+    const now = utcNow();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db
+        .prepare(
+          `SELECT * FROM parsed_event_reconciliation_jobs
+           WHERE status IN ('PENDING','RETRY_WAIT') AND next_attempt_at_utc <= ?
+             AND window_expires_at_utc <= ?
+             AND NOT EXISTS (SELECT 1 FROM parsed_event_reconciliation_transactions x WHERE x.job_id=parsed_event_reconciliation_jobs.id AND x.status='PENDING')
+           ORDER BY priority ASC, created_at_utc ASC LIMIT 1`,
+        )
+        .get(now, now) as SqlRow | undefined;
+      if (!row) {
+        this.#db.exec("COMMIT");
+        return null;
+      }
+      this.#db
+        .prepare(
+          `UPDATE parsed_event_reconciliation_jobs SET status='PROCESSING', attempts=attempts+1, updated_at_utc=? WHERE id=?`,
+        )
+        .run(now, String(row["id"]));
+      this.#db.exec("COMMIT");
+      return mapParsedJob({
+        ...row,
+        status: "PROCESSING",
+        attempts: Number(row["attempts"] ?? 0) + 1,
+      });
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listPendingParsedReconciliationTransactions(limit = 128): Array<{
+    mint: string;
+    signature: string;
+    slot: number;
+    blockTime: number | null;
+    windowStartedAtUtc: string;
+    windowExpiresAtUtc: string;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT j.mint,x.signature,x.slot,x.block_time,j.window_started_at_utc,j.window_expires_at_utc
+       FROM parsed_event_reconciliation_transactions x JOIN parsed_event_reconciliation_jobs j ON j.id=x.job_id
+       WHERE x.status='PENDING' AND x.next_attempt_at_utc <= ? ORDER BY j.priority,x.created_at_utc LIMIT ?`,
+      )
+      .all(utcNow(), Math.max(1, Math.min(512, Math.trunc(limit)))) as SqlRow[];
+    return rows.map((row) => ({
+      mint: String(row["mint"]),
+      signature: String(row["signature"]),
+      slot: Number(row["slot"]),
+      blockTime: row["block_time"] === null ? null : Number(row["block_time"]),
+      windowStartedAtUtc: String(row["window_started_at_utc"]),
+      windowExpiresAtUtc: String(row["window_expires_at_utc"]),
+    }));
+  }
+
+  deferParsedReconciliationJob(
+    id: string,
+    reasonCode: string,
+    retryAfterMs: number,
+  ): void {
+    const now = Date.now();
+    const job = this.#db
+      .prepare(
+        `SELECT attempts,mint,window_started_at_utc,window_expires_at_utc FROM parsed_event_reconciliation_jobs WHERE id=?`,
+      )
+      .get(id) as SqlRow | undefined;
+    const exhausted = Number(job?.["attempts"] ?? 0) >= 5;
+    const nowUtc = new Date(now).toISOString();
+    const scanBudgetBlocked =
+      reasonCode === "PARSED_SCAN_CREDIT_BUDGET_EXHAUSTED";
+    const nextAttempt = scanBudgetBlocked
+      ? new Date(
+          Date.UTC(
+            new Date(now).getUTCFullYear(),
+            new Date(now).getUTCMonth(),
+            new Date(now).getUTCDate() + 1,
+          ),
+        ).toISOString()
+      : new Date(
+          now + Math.max(1000, Math.min(300000, retryAfterMs)),
+        ).toISOString();
+    this.#db
+      .prepare(
+        `UPDATE parsed_event_reconciliation_jobs SET status=?,reason_code=?,next_attempt_at_utc=?,updated_at_utc=? WHERE id=? AND status='PROCESSING'`,
+      )
+      .run(
+        exhausted && !scanBudgetBlocked ? "PARTIAL" : "RETRY_WAIT",
+        exhausted && !scanBudgetBlocked
+          ? `RETRIES_EXHAUSTED:${reasonCode}`
+          : reasonCode,
+        nextAttempt,
+        nowUtc,
+        id,
+      );
+    if (scanBudgetBlocked)
+      this.#db
+        .prepare(
+          `UPDATE parsed_event_reconciliation_jobs SET attempts=0 WHERE id=?`,
+        )
+        .run(id);
+    if (exhausted && !scanBudgetBlocked && job)
+      this.recordTradeObservationCoverage({
+        mint: String(job["mint"]),
+        source: "helius_parsed_events_scan",
+        status: "PARTIAL",
+        windowStartedAtUtc: String(job["window_started_at_utc"]),
+        windowExpiresAtUtc: String(job["window_expires_at_utc"]),
+        lastEventAtUtc: null,
+        reconnectCount: 0,
+        reasonCode: `RETRIES_EXHAUSTED:${reasonCode}`,
+        updatedAtUtc: nowUtc,
+      });
+  }
+
+  failParsedReconciliationJob(id: string, reasonCode: string): void {
+    const now = utcNow();
+    const job = this.#db
+      .prepare(
+        `SELECT mint,window_started_at_utc,window_expires_at_utc FROM parsed_event_reconciliation_jobs WHERE id=?`,
+      )
+      .get(id) as SqlRow | undefined;
+    if (!job) return;
+    this.#db
+      .prepare(
+        `UPDATE parsed_event_reconciliation_jobs SET status='PARTIAL',reason_code=?,updated_at_utc=? WHERE id=?`,
+      )
+      .run(reasonCode, now, id);
+    this.recordTradeObservationCoverage({
+      mint: String(job["mint"]),
+      source: "helius_parsed_events_scan",
+      status: "PARTIAL",
+      windowStartedAtUtc: String(job["window_started_at_utc"]),
+      windowExpiresAtUtc: String(job["window_expires_at_utc"]),
+      lastEventAtUtc: null,
+      reconnectCount: 0,
+      reasonCode,
+      updatedAtUtc: now,
+    });
+  }
+
+  saveParsedReconciliationPage(input: {
+    jobId: string;
+    mint: string;
+    items: Array<{
+      signature: string;
+      slot: number;
+      blockTime: number | null;
+      parsedProtocol?: string | null;
+      parsedKind?: string | null;
+      parsedMint?: string | null;
+      instructionNames?: string[];
+    }>;
+    paginationToken: string | null;
+    stoppedOn: string;
+    scannedThrough: { slot: number; blockTime: number | null } | null;
+    creditsCharged: number;
+    maxPages: number;
+  }): void {
+    const now = utcNow();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const item of input.items) {
+        this.#db
+          .prepare(
+            `INSERT OR IGNORE INTO parsed_event_reconciliation_transactions
+           (job_id,signature,slot,block_time,status,parsed_protocol,parsed_kind,parsed_mint,instruction_names_json,provenance,created_at_utc,updated_at_utc)
+           VALUES (?,?,?,?,'PENDING',?,?,?,?, 'HELIUS_PARSED_EVENTS_SCAN',?,?)`,
+          )
+          .run(
+            input.jobId,
+            item.signature,
+            item.slot,
+            item.blockTime,
+            item.parsedProtocol ?? null,
+            item.parsedKind ?? null,
+            item.parsedMint ?? null,
+            JSON.stringify(item.instructionNames ?? []),
+            now,
+            now,
+          );
+      }
+      const row = this.#db
+        .prepare(
+          `SELECT pages_scanned FROM parsed_event_reconciliation_jobs WHERE id=?`,
+        )
+        .get(input.jobId) as SqlRow | undefined;
+      const pages = Number(row?.["pages_scanned"] ?? 0) + 1;
+      const exhausted =
+        pages >= input.maxPages && input.paginationToken !== null;
+      this.#db
+        .prepare(
+          `UPDATE parsed_event_reconciliation_jobs SET pagination_token=?, stopped_on=?,
+         scanned_through_slot=?, scanned_through_block_time=?, pages_scanned=?,
+         credits_charged=credits_charged+?, status=?, reason_code=?, next_attempt_at_utc=?, updated_at_utc=? WHERE id=?`,
+        )
+        .run(
+          input.paginationToken,
+          input.stoppedOn,
+          input.scannedThrough?.slot ?? null,
+          input.scannedThrough?.blockTime ?? null,
+          pages,
+          input.creditsCharged,
+          exhausted
+            ? "PARTIAL"
+            : input.stoppedOn === "windowEnd" && !input.paginationToken
+              ? "PROCESSING"
+              : "RETRY_WAIT",
+          exhausted
+            ? "RECONCILIATION_PAGE_LIMIT"
+            : input.stoppedOn === "windowEnd"
+              ? "AWAITING_TRANSACTION_VERIFICATION"
+              : "SCAN_CONTINUATION_PENDING",
+          now,
+          now,
+          input.jobId,
+        );
+      this.recordTradeObservationCoverage({
+        mint: input.mint,
+        source: "helius_parsed_events_scan",
+        status: exhausted ? "PARTIAL" : "RECONCILING",
+        windowStartedAtUtc: String(
+          this.#db
+            .prepare(
+              "SELECT window_started_at_utc FROM parsed_event_reconciliation_jobs WHERE id=?",
+            )
+            .get(input.jobId)?.["window_started_at_utc"],
+        ),
+        windowExpiresAtUtc: String(
+          this.#db
+            .prepare(
+              "SELECT window_expires_at_utc FROM parsed_event_reconciliation_jobs WHERE id=?",
+            )
+            .get(input.jobId)?.["window_expires_at_utc"],
+        ),
+        lastEventAtUtc: null,
+        reconnectCount: 0,
+        reasonCode: exhausted
+          ? "RECONCILIATION_PAGE_LIMIT"
+          : input.stoppedOn === "windowEnd" && !input.paginationToken
+            ? "AWAITING_TRANSACTION_VERIFICATION"
+            : "SCAN_CONTINUATION_PENDING",
+        updatedAtUtc: now,
+      });
+      this.#db.exec("COMMIT");
+      this.finalizeParsedReconciliationJobs();
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  setParsedReconciliationTransactionStatus(input: {
+    mint: string;
+    signature: string;
+    status: "VERIFIED" | "IRRELEVANT" | "UNSUPPORTED" | "FAILED";
+    reasonCode: string | null;
+  }): void {
+    this.#db
+      .prepare(
+        `UPDATE parsed_event_reconciliation_transactions SET status=?, reason_code=?, updated_at_utc=?
+       WHERE signature=? AND job_id IN (SELECT id FROM parsed_event_reconciliation_jobs WHERE mint=?)`,
+      )
+      .run(
+        input.status,
+        input.reasonCode,
+        utcNow(),
+        input.signature,
+        input.mint,
+      );
+    this.finalizeParsedReconciliationJobs();
+  }
+
+  retryParsedReconciliationTransaction(input: {
+    mint: string;
+    signature: string;
+    reasonCode: string;
+    retryAfterMs: number;
+    maxAttempts?: number;
+  }): void {
+    const now = Date.now();
+    const row = this.#db
+      .prepare(
+        `SELECT x.attempts,x.job_id FROM parsed_event_reconciliation_transactions x
+       JOIN parsed_event_reconciliation_jobs j ON j.id=x.job_id WHERE j.mint=? AND x.signature=? LIMIT 1`,
+      )
+      .get(input.mint, input.signature) as SqlRow | undefined;
+    if (!row) return;
+    const attempts = Number(row["attempts"] ?? 0) + 1;
+    const status = attempts >= (input.maxAttempts ?? 5) ? "FAILED" : "PENDING";
+    this.#db
+      .prepare(
+        `UPDATE parsed_event_reconciliation_transactions SET status=?,attempts=?,reason_code=?,next_attempt_at_utc=?,updated_at_utc=? WHERE job_id=? AND signature=?`,
+      )
+      .run(
+        status,
+        attempts,
+        input.reasonCode,
+        new Date(now + input.retryAfterMs).toISOString(),
+        new Date(now).toISOString(),
+        String(row["job_id"]),
+        input.signature,
+      );
+    if (status === "FAILED") this.finalizeParsedReconciliationJobs();
+  }
+
+  finalizeParsedReconciliationJobs(): number {
+    const now = utcNow();
+    const jobs = this.#db
+      .prepare(
+        `SELECT j.* FROM parsed_event_reconciliation_jobs j WHERE j.status='PROCESSING' AND j.stopped_on='windowEnd' AND j.pagination_token IS NULL`,
+      )
+      .all() as SqlRow[];
+    let finalized = 0;
+    for (const job of jobs) {
+      const counts = this.#db
+        .prepare(
+          `SELECT status,COUNT(*) AS count FROM parsed_event_reconciliation_transactions WHERE job_id=? GROUP BY status`,
+        )
+        .all(String(job["id"])) as SqlRow[];
+      const byStatus = Object.fromEntries(
+        counts.map((row) => [String(row["status"]), Number(row["count"])]),
+      );
+      if ((byStatus["PENDING"] ?? 0) > 0) continue;
+      const partial =
+        (byStatus["FAILED"] ?? 0) + (byStatus["UNSUPPORTED"] ?? 0) > 0;
+      const status = partial ? "PARTIAL" : "COMPLETE";
+      const reason = partial
+        ? "UNRESOLVED_OR_UNSUPPORTED_TRANSACTION"
+        : "FINALIZED_SCAN_WINDOW_COMPLETE";
+      this.#db
+        .prepare(
+          `UPDATE parsed_event_reconciliation_jobs SET status=?,reason_code=?,completed_at_utc=?,updated_at_utc=? WHERE id=?`,
+        )
+        .run(status, reason, now, now, String(job["id"]));
+      this.recordTradeObservationCoverage({
+        mint: String(job["mint"]),
+        source: "helius_parsed_events_scan",
+        status,
+        windowStartedAtUtc: String(job["window_started_at_utc"]),
+        windowExpiresAtUtc: String(job["window_expires_at_utc"]),
+        lastEventAtUtc: null,
+        reconnectCount: 0,
+        reasonCode: reason,
+        updatedAtUtc: now,
+      });
+      finalized += 1;
+    }
+    return finalized;
+  }
+
+  parsedEventsScanBudget(maxCreditsPerUtcDay: number): {
+    used: number;
+    reserved: number;
+    remaining: number;
+    requests: number;
+  } {
+    const today = utcNow().slice(0, 10);
+    const row = this.#db
+      .prepare(`SELECT * FROM parsed_event_scan_budget WHERE utc_day=?`)
+      .get(today) as SqlRow | undefined;
+    const used = Number(row?.["credits_charged"] ?? 0);
+    const reserved = Number(row?.["credits_reserved"] ?? 0);
+    return {
+      used,
+      reserved,
+      remaining: Math.max(0, maxCreditsPerUtcDay - used - reserved),
+      requests: Number(row?.["requests"] ?? 0),
+    };
+  }
+
+  getParsedReconciliationStatus(mint: string): {
+    status: string;
+    pagesScanned: number;
+    creditsCharged: number;
+    pendingTransactions: number;
+    unsupportedTransactions: number;
+    reasonCode: string | null;
+    updatedAtUtc: string;
+  } | null {
+    const row = this.#db
+      .prepare(
+        `SELECT j.*,SUM(CASE WHEN x.status='PENDING' THEN 1 ELSE 0 END) AS pending_count,
+       SUM(CASE WHEN x.status IN ('UNSUPPORTED','FAILED') THEN 1 ELSE 0 END) AS unsupported_count
+       FROM parsed_event_reconciliation_jobs j LEFT JOIN parsed_event_reconciliation_transactions x ON x.job_id=j.id
+       WHERE j.mint=? GROUP BY j.id ORDER BY j.window_started_at_utc DESC LIMIT 1`,
+      )
+      .get(mint) as SqlRow | undefined;
+    if (!row) return null;
+    return {
+      status: String(row["status"]),
+      pagesScanned: Number(row["pages_scanned"] ?? 0),
+      creditsCharged: Number(row["credits_charged"] ?? 0),
+      pendingTransactions: Number(row["pending_count"] ?? 0),
+      unsupportedTransactions: Number(row["unsupported_count"] ?? 0),
+      reasonCode:
+        row["reason_code"] === null ? null : String(row["reason_code"]),
+      updatedAtUtc: String(row["updated_at_utc"]),
+    };
+  }
+
+  reserveParsedEventsScanCredits(
+    maxCreditsPerUtcDay: number,
+    amount: number,
+  ): string | null {
+    const day = utcNow().slice(0, 10);
+    const now = utcNow();
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO parsed_event_scan_budget(utc_day,updated_at_utc) VALUES (?,?)`,
+      )
+      .run(day, now);
+    const result = this.#db
+      .prepare(
+        `UPDATE parsed_event_scan_budget SET credits_reserved=credits_reserved+?,requests=requests+1,updated_at_utc=?
+       WHERE utc_day=? AND credits_charged+credits_reserved+?<=?`,
+      )
+      .run(amount, now, day, amount, maxCreditsPerUtcDay);
+    return Number(result.changes) === 1 ? day : null;
+  }
+
+  settleParsedEventsScanCredits(
+    day: string,
+    reserved: number,
+    charged: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE parsed_event_scan_budget SET credits_reserved=MAX(0,credits_reserved-?),credits_charged=credits_charged+?,updated_at_utc=? WHERE utc_day=?`,
+      )
+      .run(reserved, charged, utcNow(), day);
   }
 
   finishEnrichmentJob(
@@ -1968,9 +2496,10 @@ export class SentinelStore {
     const rows = this.#db
       .prepare(
         `SELECT * FROM launch_trade_observations WHERE mint = ?
-        AND received_at_utc >= ? AND received_at_utc <= ?
+        AND validation_status = 'VERIFIED'
+        AND COALESCE(block_time_utc, event_time_utc) >= ? AND COALESCE(block_time_utc, event_time_utc) <= ?
         AND (? IS NULL OR slot IS NULL OR slot <= ?)
-        ORDER BY received_at_utc, slot LIMIT ?`,
+        ORDER BY COALESCE(block_time_utc, event_time_utc), slot LIMIT ?`,
       )
       .all(
         mint,
@@ -2030,6 +2559,9 @@ export class SentinelStore {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status = CASE
+            WHEN trade_observation_coverage.status = 'COMPLETE'
+              AND excluded.status <> 'COMPLETE'
+            THEN trade_observation_coverage.status
             WHEN trade_observation_coverage.status IN ('GAP_DETECTED', 'PARTIAL')
               AND excluded.status = 'UNVERIFIED'
             THEN trade_observation_coverage.status
@@ -2039,6 +2571,9 @@ export class SentinelStore {
           last_event_at_utc = COALESCE(excluded.last_event_at_utc, trade_observation_coverage.last_event_at_utc),
           reconnect_count = MAX(trade_observation_coverage.reconnect_count, excluded.reconnect_count),
           reason_code = CASE
+            WHEN trade_observation_coverage.status = 'COMPLETE'
+              AND excluded.status <> 'COMPLETE'
+            THEN trade_observation_coverage.reason_code
             WHEN trade_observation_coverage.status IN ('GAP_DETECTED', 'PARTIAL')
               AND excluded.status = 'UNVERIFIED'
             THEN trade_observation_coverage.reason_code
@@ -2074,7 +2609,7 @@ export class SentinelStore {
     const row = this.#db
       .prepare(
         `SELECT * FROM trade_observation_coverage WHERE mint = ?
-        ORDER BY updated_at_utc DESC, window_started_at_utc DESC LIMIT 1`,
+        ORDER BY window_started_at_utc DESC, (status='COMPLETE') DESC, updated_at_utc DESC, id DESC LIMIT 1`,
       )
       .get(mint) as SqlRow | undefined;
     if (!row) return null;
@@ -3849,6 +4384,21 @@ function applyMigration(db: DatabaseSync, migration: string): void {
     }
     db.exec(`${statement};`);
   }
+}
+
+function mapParsedJob(row: SqlRow): ParsedReconciliationJob {
+  return {
+    id: String(row["id"]),
+    mint: String(row["mint"]),
+    windowStartedAtUtc: String(row["window_started_at_utc"]),
+    windowExpiresAtUtc: String(row["window_expires_at_utc"]),
+    status: String(row["status"]) as ParsedReconciliationJob["status"],
+    paginationToken:
+      row["pagination_token"] === null ? null : String(row["pagination_token"]),
+    stoppedOn: row["stopped_on"] === null ? null : String(row["stopped_on"]),
+    pagesScanned: Number(row["pages_scanned"] ?? 0),
+    attempts: Number(row["attempts"] ?? 0),
+  };
 }
 
 function mapToken(row: SqlRow): StoredToken {

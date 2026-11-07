@@ -508,7 +508,12 @@ export class TokenAnalysisScheduler {
       effectiveEndUtc,
       evidence.asOfSlot,
     );
-    if (observations.length === 0) return null;
+    const coverage = this.#store.getLatestTradeObservationCoverage(mint);
+    const complete =
+      coverage?.status === "COMPLETE" &&
+      Date.parse(coverage.windowExpiresAtUtc) <= nowMs &&
+      Date.parse(coverage.windowStartedAtUtc) === Date.parse(firstSeenAtUtc);
+    if (observations.length === 0 && !complete) return null;
 
     const verifiedCreators = evidence.verifiedCreateEvents
       .filter((item) => item.mint === mint)
@@ -528,10 +533,10 @@ export class TokenAnalysisScheduler {
       observedAtUtc,
       windowSeconds,
       throughSlot: evidence.asOfSlot,
-      // Stored trades do not prove uninterrupted subscription coverage. Keep
-      // the snapshot incomplete until a provider coverage record exists.
-      complete: false,
-      gapReason: "TRADE_STREAM_COMPLETENESS_UNVERIFIED",
+      complete,
+      gapReason: complete
+        ? null
+        : (coverage?.reasonCode ?? "TRADE_STREAM_COMPLETENESS_UNVERIFIED"),
       minIndependentBuyers: this.#config.analysis.min_independent_buyers,
       metadataLikelyTest,
     });

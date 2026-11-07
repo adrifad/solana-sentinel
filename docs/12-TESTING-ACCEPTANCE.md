@@ -66,4 +66,10 @@
 
 Required: format, lint, strict typecheck, unit, integration, fixture-replay, dependency/license/secret scan, migration rollback test, build artifact. Keep offline fixture tests independent of external API uptime.
 
+## Parsed Events Scan reconciliation
+
+- Test provider request shape against the official Helius contract, schema rejection, pagination cursors, empty pages, `stoppedOn`, timeout/cancellation, rate limits, and credit reservations independently of live credentials.
+- Test durable migration/checkpoint recovery, duplicate signatures, unresolved verification, unsupported program instructions, bounded page exhaustion, and SQLite integrity in temporary databases.
+- A synthetic API response or recorded provider fixture does not prove account entitlement, mainnet decoder compatibility, or complete live coverage. Mark those gates BLOCKED/UNVERIFIED until validated with actual finalized mainnet transactions.
+
 ---

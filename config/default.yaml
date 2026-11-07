@@ -15,6 +15,11 @@ providers:
     max_trade_events_per_day: 5000
     trade_verification_concurrency: 2
     max_pending_trade_verifications: 128
+    parsed_events_scan_enabled: false
+    parsed_events_scan_max_credits_per_utc_day: 0
+    parsed_events_scan_max_pages_per_job: 4
+    parsed_events_scan_max_scanned_transactions: 1000
+    parsed_events_scan_concurrency: 1
   pumpportal:
     enable_new_tokens: true
     enable_migrations: true

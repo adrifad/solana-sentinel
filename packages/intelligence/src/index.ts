@@ -76,8 +76,8 @@ export function analyzeLaunchBehavior(input: {
       item.mint === input.mint &&
       at >= startMs &&
       at <= endMs &&
-      receivedAt <= endMs &&
-      ingestedAt <= endMs &&
+      receivedAt <= Date.parse(input.observedAtUtc) &&
+      ingestedAt <= Date.parse(input.observedAtUtc) &&
       (input.throughSlot === null ||
         item.slot === null ||
         item.slot <= input.throughSlot)

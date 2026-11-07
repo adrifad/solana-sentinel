@@ -37,6 +37,31 @@ export const AppConfigSchema = z
             max_trade_events_per_day: positiveInt,
             trade_verification_concurrency: z.number().int().min(1).max(16),
             max_pending_trade_verifications: z.number().int().min(1).max(10000),
+            parsed_events_scan_enabled: z.boolean().default(false),
+            parsed_events_scan_max_credits_per_utc_day: z
+              .number()
+              .int()
+              .nonnegative()
+              .max(100000)
+              .default(0),
+            parsed_events_scan_max_pages_per_job: z
+              .number()
+              .int()
+              .min(1)
+              .max(100)
+              .default(4),
+            parsed_events_scan_max_scanned_transactions: z
+              .number()
+              .int()
+              .min(1)
+              .max(10000)
+              .default(1000),
+            parsed_events_scan_concurrency: z
+              .number()
+              .int()
+              .min(1)
+              .max(4)
+              .default(1),
           })
           .strict(),
         pumpportal: z

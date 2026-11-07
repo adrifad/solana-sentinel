@@ -49,6 +49,15 @@ export type Candidate = {
     reasonCode: string | null;
     updatedAtUtc: string;
   } | null;
+  tradeReconciliation: {
+    status: string;
+    pagesScanned: number;
+    creditsCharged: number;
+    pendingTransactions: number;
+    unsupportedTransactions: number;
+    reasonCode: string | null;
+    updatedAtUtc: string;
+  } | null;
   launchBehavior: {
     complete: boolean;
     classification: string;

@@ -367,17 +367,26 @@ export class HeliusRpcClient {
     }));
   }
 
-  async getTransaction(signature: string): Promise<WalletTransaction | null> {
+  async getTransaction(
+    signature: string,
+    priority: HeliusRequestPriority = "BACKGROUND",
+    subjectMint: string | null = null,
+  ): Promise<WalletTransaction | null> {
     if (!SignatureSchema.safeParse(signature).success)
       throw new ProviderFailure("INVALID_SIGNATURE");
-    const result = await this.#rpc("getTransaction", [
-      signature,
-      {
-        commitment: "finalized",
-        encoding: "jsonParsed",
-        maxSupportedTransactionVersion: 0,
-      },
-    ]);
+    const result = await this.#rpc(
+      "getTransaction",
+      [
+        signature,
+        {
+          commitment: "finalized",
+          encoding: "jsonParsed",
+          maxSupportedTransactionVersion: 0,
+        },
+      ],
+      priority,
+      subjectMint,
+    );
     if (result === null) return null;
     const parsed = TransactionResult.safeParse(result);
     if (!parsed.success) throw new ProviderFailure("MALFORMED_RESPONSE");

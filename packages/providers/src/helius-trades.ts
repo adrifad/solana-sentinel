@@ -29,6 +29,7 @@ export type HeliusLogTradeInput = {
   mint: string;
   signature: string;
   slot: number;
+  providerBlockTime?: number | null;
   logs: string[];
   observedAtUtc: string;
   payloadRef: string;

@@ -10,10 +10,17 @@ const server = createApiServer({
   mode: config.config.mode,
   staleFeedSeconds: config.config.observability.health_stale_feed_seconds,
   tradeStreamEnabled: config.config.providers.helius.enable_trade_stream,
+  parsedScanEnabled:
+    config.config.providers.helius.parsed_events_scan_enabled &&
+    config.config.providers.helius.parsed_events_scan_max_credits_per_utc_day >
+      0 &&
+    Boolean(config.heliusApiKey),
   heliusMaxRequestsPerUtcDay:
     config.config.providers.helius.max_requests_per_utc_day,
   heliusExitReservedRequestsPerUtcDay:
     config.config.providers.helius.exit_reserved_requests_per_utc_day,
+  parsedScanCreditsPerUtcDay:
+    config.config.providers.helius.parsed_events_scan_max_credits_per_utc_day,
   automaticEntriesEnabled: config.config.paper.automatic_entries_enabled,
   paperWalletId: config.config.paper.wallet_id,
   ...(config.paperOperatorToken
