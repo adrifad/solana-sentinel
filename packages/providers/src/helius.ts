@@ -185,14 +185,22 @@ export type HeliusRequestContext = {
   purpose: string;
   subjectMint: string | null;
 };
+export type HeliusBudgetAdmission = {
+  allowed: boolean;
+  retryAfterMs: number;
+  reasonCode: string | null;
+};
 
 export type HeliusOptions = {
   apiKey: string;
   requestTimeoutMs: number;
   maxRequestsPerSecond?: number;
+  maxPendingRequests?: number;
   fetchImpl?: typeof fetch;
   now?: () => number;
-  consumeRequestBudget?: (request: HeliusRequestContext) => boolean;
+  consumeRequestBudget?: (
+    request: HeliusRequestContext,
+  ) => boolean | HeliusBudgetAdmission;
   recordRequestOutcome?: (
     request: HeliusRequestContext & {
       attempt: number;
@@ -220,7 +228,13 @@ export class HeliusRpcClient {
   #failureCount = 0;
   #circuitOpenedAt = 0;
   #lastRequestAt = 0;
-  #requestGate: Promise<void> = Promise.resolve();
+  #requestQueue: Array<{
+    priority: HeliusRequestPriority;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }> = [];
+  #requestTimer: ReturnType<typeof setTimeout> | undefined;
+  #requestScheduled = false;
 
   constructor(options: HeliusOptions) {
     if (!options.apiKey.trim()) throw new Error("HELIUS_API_KEY is required");
@@ -492,7 +506,7 @@ export class HeliusRpcClient {
       "PROVIDER_UNAVAILABLE",
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      await this.#pace();
+      await this.#pace(priority);
       const request = {
         method,
         priority,
@@ -518,17 +532,25 @@ export class HeliusRpcClient {
         )[priority],
         subjectMint,
       };
-      if (
-        this.#opts.consumeRequestBudget &&
-        !this.#opts.consumeRequestBudget(request)
-      ) {
+      const admission = this.#opts.consumeRequestBudget?.(request);
+      const allowed =
+        admission === undefined ||
+        (typeof admission === "boolean" ? admission : admission.allowed);
+      if (!allowed) {
+        const reasonCode =
+          typeof admission === "boolean"
+            ? "REQUEST_BUDGET_EXHAUSTED"
+            : (admission.reasonCode ?? "REQUEST_BUDGET_EXHAUSTED");
         this.#recordRequestOutcome({
           ...request,
           attempt: attempt + 1,
           outcome: "BUDGET_BLOCKED",
-          errorCode: "REQUEST_BUDGET_EXHAUSTED",
+          errorCode: reasonCode,
         });
-        throw new ProviderFailure("REQUEST_BUDGET_EXHAUSTED");
+        throw new ProviderFailure(
+          reasonCode,
+          typeof admission === "boolean" ? 0 : admission.retryAfterMs,
+        );
       }
       const controller = new AbortController();
       const timeout = setTimeout(
@@ -578,7 +600,7 @@ export class HeliusRpcClient {
         if (
           lastFailure.code === "RPC_REJECTED" ||
           lastFailure.code === "MALFORMED_RESPONSE" ||
-          lastFailure.code === "REQUEST_BUDGET_EXHAUSTED"
+          lastFailure.code.startsWith("REQUEST_")
         )
           break;
         if (attempt < 2)
@@ -589,8 +611,10 @@ export class HeliusRpcClient {
         clearTimeout(timeout);
       }
     }
-    this.#failureCount += 1;
-    if (this.#failureCount >= 5) this.#circuitOpenedAt = now();
+    if (!lastFailure.code.startsWith("REQUEST_")) {
+      this.#failureCount += 1;
+      if (this.#failureCount >= 5) this.#circuitOpenedAt = now();
+    }
     throw lastFailure;
   }
 
@@ -608,33 +632,54 @@ export class HeliusRpcClient {
     }
   }
 
-  async #pace(): Promise<void> {
-    let release = (): void => undefined;
-    const previous = this.#requestGate;
-    this.#requestGate = new Promise<void>((resolve) => {
-      release = resolve;
+  #pace(priority: HeliusRequestPriority): Promise<void> {
+    const maxPending = this.#opts.maxPendingRequests ?? 256;
+    if (this.#requestQueue.length >= maxPending)
+      return Promise.reject(new ProviderFailure("REQUEST_QUEUE_FULL", 250));
+    const promise = new Promise<void>((resolve, reject) => {
+      this.#requestQueue.push({ priority, resolve, reject });
     });
-    await previous;
-    try {
-      const intervalMs = 1000 / (this.#opts.maxRequestsPerSecond ?? 5);
-      const waitMs = Math.max(
-        0,
-        intervalMs - (Date.now() - this.#lastRequestAt),
-      );
-      if (waitMs > 0)
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-      this.#lastRequestAt = Date.now();
-    } finally {
-      release();
-    }
+    this.#scheduleNextRequest();
+    return promise;
+  }
+
+  #scheduleNextRequest(): void {
+    if (this.#requestScheduled || this.#requestQueue.length === 0) return;
+    this.#requestScheduled = true;
+    const priorityOrder: Record<HeliusRequestPriority, number> = {
+      EXIT: 0,
+      RISK: 1,
+      CANDIDATE: 2,
+      SECURITY: 3,
+      CREATOR: 4,
+      BACKGROUND: 5,
+    };
+    this.#requestQueue.sort(
+      (left, right) =>
+        priorityOrder[left.priority] - priorityOrder[right.priority],
+    );
+    const intervalMs = 1000 / (this.#opts.maxRequestsPerSecond ?? 5);
+    const waitMs = Math.max(0, intervalMs - (Date.now() - this.#lastRequestAt));
+    this.#requestTimer = setTimeout(() => {
+      this.#requestScheduled = false;
+      this.#requestTimer = undefined;
+      const next = this.#requestQueue.shift();
+      if (next) {
+        this.#lastRequestAt = Date.now();
+        next.resolve();
+      }
+      this.#scheduleNextRequest();
+    }, waitMs);
   }
 }
 
 export class ProviderFailure extends Error {
   readonly code: string;
-  constructor(code: string) {
+  readonly retryAfterMs: number;
+  constructor(code: string, retryAfterMs = 0) {
     super(code);
     this.name = "ProviderFailure";
     this.code = code;
+    this.retryAfterMs = Math.max(0, retryAfterMs);
   }
 }

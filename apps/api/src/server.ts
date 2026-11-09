@@ -13,8 +13,11 @@ export type ApiOptions = {
   tradeStreamEnabled: boolean;
   parsedScanEnabled?: boolean;
   automaticEntriesEnabled: boolean;
+  experimentalEntriesEnabled?: boolean;
   heliusMaxRequestsPerUtcDay?: number;
   heliusExitReservedRequestsPerUtcDay?: number;
+  heliusMaxRequestsPerWindow?: number;
+  heliusRequestWindowSeconds?: number;
   parsedScanCreditsPerUtcDay?: number;
   paperWalletId: string;
   operatorToken?: string;
@@ -554,8 +557,20 @@ export function getOperationalReadiness(options: ApiOptions) {
       ? options.store.getHeliusRequestBudget(
           options.heliusMaxRequestsPerUtcDay,
           options.heliusExitReservedRequestsPerUtcDay,
+          {
+            maxRequestsPerWindow: options.heliusMaxRequestsPerWindow ?? 100,
+            requestWindowSeconds: options.heliusRequestWindowSeconds ?? 300,
+          },
         )
       : null;
+  const heliusBudgetLimited = Boolean(
+    helius?.errorCode?.startsWith("REQUEST_"),
+  );
+  const heliusRpcStatus = !helius
+    ? "DISABLED"
+    : heliusBudgetLimited
+      ? "BUDGET_LIMITED"
+      : helius.state;
   const tokens = options.store.listTokens(200);
   const monitoredTokens = tokens.filter((token) => token.monitoringEligible);
   const analysisStats = options.store.getAnalysisPipelineStats?.() ?? {
@@ -599,11 +614,14 @@ export function getOperationalReadiness(options: ApiOptions) {
     analysisStats.migrationRecovery["PROCESSING"] ?? 0;
   const analysisFailures = analysisStats.failureReasons.length > 0;
   const budgetBlocked =
-    budgetDeferred > 0 || heliusRequestBudget?.remaining === 0;
+    budgetDeferred > 0 ||
+    heliusRequestBudget?.remaining === 0 ||
+    heliusRequestBudget?.rollingRemaining === 0;
   const analysisSchedulerDegraded =
     analysisScheduler?.state === "DEGRADED" ||
     enrichmentScheduler?.state === "DEGRADED";
-  const heliusRpcDegraded = helius?.state === "DEGRADED";
+  const heliusRpcDegraded =
+    helius?.state === "DEGRADED" && !heliusBudgetLimited;
   const analysisReady =
     analysisStats.eligibleTokens > 0 &&
     helius?.state === "HEALTHY" &&
@@ -670,7 +688,11 @@ export function getOperationalReadiness(options: ApiOptions) {
   if (analysisStats.eligibleTokens === 0)
     analysisBlockers.push("NO_MONITORING_ELIGIBLE_TOKENS");
   if (helius?.state !== "HEALTHY")
-    analysisBlockers.push("HELIUS_RPC_NOT_HEALTHY");
+    analysisBlockers.push(
+      heliusBudgetLimited
+        ? "HELIUS_RPC_CHECK_DEFERRED_BY_LOCAL_BUDGET"
+        : "HELIUS_RPC_NOT_HEALTHY",
+    );
   if (!recentlyChecked(analysisScheduler))
     analysisBlockers.push("ANALYSIS_SCHEDULER_NOT_HEALTHY");
   else if (analysisScheduler?.state === "DEGRADED")
@@ -685,7 +707,12 @@ export function getOperationalReadiness(options: ApiOptions) {
     analysisBlockers.push("ENRICHMENT_JOBS_PENDING");
   if (migrationPending > 0 || migrationProcessing > 0)
     analysisBlockers.push("MIGRATION_RECOVERY_PENDING");
-  if (budgetBlocked) analysisBlockers.push("HELIUS_REQUEST_BUDGET_EXHAUSTED");
+  if (budgetBlocked)
+    analysisBlockers.push(
+      heliusRequestBudget?.remaining === 0 || budgetDeferred > 0
+        ? "HELIUS_REQUEST_BUDGET_EXHAUSTED"
+        : "HELIUS_REQUEST_WINDOW_BUDGET_EXHAUSTED",
+    );
   if (analysisFailures) analysisBlockers.push("ANALYSIS_PROVIDER_FAILURES");
   if (
     analysisStats.eligibleTokens > 0 &&
@@ -736,6 +763,26 @@ export function getOperationalReadiness(options: ApiOptions) {
             maximumMonitorIntervalMs,
         )
       : Number.POSITIVE_INFINITY;
+  const requiredWindowExitRequests =
+    maximumMonitorIntervalMs > 0 && heliusRequestBudget
+      ? Math.ceil(
+          (projectedPositions *
+            estimatedRpcRequestsPerPosition *
+            heliusRequestBudget.rollingWindowSeconds *
+            1000) /
+            maximumMonitorIntervalMs,
+        )
+      : Number.POSITIVE_INFINITY;
+  const availableExitRequests = heliusRequestBudget
+    ? Math.min(
+        heliusRequestBudget.remaining,
+        Math.max(
+          0,
+          heliusRequestBudget.reservedForExits -
+            heliusRequestBudget.exitRequestsUsed,
+        ),
+      )
+    : 0;
   const positionMonitorBudgetReason =
     options.mode !== "PAPER"
       ? null
@@ -745,10 +792,15 @@ export function getOperationalReadiness(options: ApiOptions) {
         ? "EXIT_MONITOR_BUDGET_UNKNOWN"
         : requiredDailyExitRequests > heliusRequestBudget.reservedForExits
           ? "EXIT_MONITOR_BUDGET_INSUFFICIENT"
-          : heliusRequestBudget.remaining <
+          : availableExitRequests <
               estimatedRpcRequestsPerPosition * projectedPositions
             ? "EXIT_MONITOR_BUDGET_EXHAUSTED"
-            : null;
+            : heliusRequestBudget.rollingRemaining <
+                  estimatedRpcRequestsPerPosition * projectedPositions ||
+                requiredWindowExitRequests >
+                  heliusRequestBudget.reservedForExitsWindow
+              ? "EXIT_MONITOR_WINDOW_BUDGET_INSUFFICIENT"
+              : null;
   const positionMonitorBudgetReady = positionMonitorBudgetReason === null;
   const paperExecutionReady =
     options.mode === "PAPER" &&
@@ -768,7 +820,10 @@ export function getOperationalReadiness(options: ApiOptions) {
   const operatorAuthReady = Boolean(options.operatorToken);
   const quoteInfrastructureReady =
     helius?.state === "HEALTHY" &&
-    (heliusRequestBudget === null || heliusRequestBudget.remaining > 0);
+    (heliusRequestBudget === null ||
+      (heliusRequestBudget.remaining > 0 &&
+        (heliusRequestBudget.rollingRemaining === undefined ||
+          heliusRequestBudget.rollingRemaining > 0)));
   const manualCandidateAvailable = tokens.some((token) => {
     const decision = options.store.listRiskDecisions(token.mint, 1)[0];
     const security = options.store.getLatestTokenRiskReport?.(token.mint);
@@ -980,6 +1035,35 @@ export function getOperationalReadiness(options: ApiOptions) {
     positionMonitorBudgetReason
   )
     automaticEntryBlockers.push(positionMonitorBudgetReason);
+  const paperExperimentalEntryBlockers: string[] = [];
+  if (options.mode !== "PAPER")
+    paperExperimentalEntryBlockers.push("MODE_IS_NOT_PAPER");
+  if (!options.experimentalEntriesEnabled)
+    paperExperimentalEntryBlockers.push("EXPERIMENTAL_POLICY_DISABLED");
+  if (!options.automaticEntriesEnabled)
+    paperExperimentalEntryBlockers.push("AUTOMATIC_ENTRIES_DISABLED");
+  if (!walletReady)
+    paperExperimentalEntryBlockers.push("PAPER_WALLET_NOT_READY");
+  if (!runtimeHealthFresh)
+    paperExperimentalEntryBlockers.push("PAPER_WORKER_NOT_HEALTHY");
+  if (!quoteInfrastructureReady)
+    paperExperimentalEntryBlockers.push("QUOTE_PROVIDER_NOT_HEALTHY");
+  if (positionMonitorBudgetReason)
+    paperExperimentalEntryBlockers.push(positionMonitorBudgetReason);
+  if (!manualCandidateAvailable)
+    paperExperimentalEntryBlockers.push(
+      "NO_VERIFIED_PARTIAL_EVIDENCE_CANDIDATE",
+    );
+  const paperExperimentalEntryReady =
+    paperExperimentalEntryBlockers.length === 0;
+  const paperExperimentalEntryStatus =
+    !options.experimentalEntriesEnabled || !options.automaticEntriesEnabled
+      ? "DISABLED"
+      : paperExperimentalEntryReady
+        ? "RUNNING"
+        : budgetBlocked || heliusRpcDegraded
+          ? "DEGRADED"
+          : "BLOCKED";
   return {
     mode: options.mode,
     processHealth: true,
@@ -995,6 +1079,8 @@ export function getOperationalReadiness(options: ApiOptions) {
     },
     dataCompleteness: completeness,
     heliusRequestBudget,
+    heliusRpcStatus,
+    heliusProviderErrorCode: helius?.errorCode ?? null,
     analysisReadiness: analysisReady,
     analysisStatus,
     analysisDiagnostics: {
@@ -1053,6 +1139,11 @@ export function getOperationalReadiness(options: ApiOptions) {
       paperExecutionReady && (paperAccountInit ? initialBalanceMatches : false),
     paperAutomaticEntryReady:
       paperExecutionReady && (paperAccountInit ? initialBalanceMatches : false),
+    paperExperimentalEntryReady,
+    paperExperimentalEntryStatus,
+    paperExperimentalEntryBlockers: [
+      ...new Set(paperExperimentalEntryBlockers),
+    ],
     automaticEntriesEnabled: options.automaticEntriesEnabled,
     automaticEntryStatus,
     automaticEntryBlockers,
@@ -1076,12 +1167,20 @@ export function getOperationalReadiness(options: ApiOptions) {
             monitorStates: positionMonitorCounts,
             exitRequestsUsed: heliusRequestBudget?.exitRequestsUsed ?? null,
             exitRequestsRemaining:
-              heliusRequestBudget === null
-                ? null
-                : Math.max(0, heliusRequestBudget.remaining),
+              heliusRequestBudget === null ? null : availableExitRequests,
             reservedExitRequests: heliusRequestBudget?.reservedForExits ?? null,
+            rollingRequestsUsed: heliusRequestBudget?.rollingUsed ?? null,
+            rollingRequestsRemaining:
+              heliusRequestBudget?.rollingRemaining ?? null,
+            reservedExitRequestsWindow:
+              heliusRequestBudget?.reservedForExitsWindow ?? null,
             projectedPositions,
             estimatedRpcRequestsPerPosition,
+            requiredWindowExitRequests: Number.isFinite(
+              requiredWindowExitRequests,
+            )
+              ? requiredWindowExitRequests
+              : null,
             requiredDailyExitRequests: Number.isFinite(
               requiredDailyExitRequests,
             )

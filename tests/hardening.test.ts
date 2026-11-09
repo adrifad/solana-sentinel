@@ -68,10 +68,141 @@ test("Helius daily budget reserves capacity for exit quotes and reports method u
     const budget = store.getHeliusRequestBudget(10, 2);
     assert.equal(budget.used, 10);
     assert.equal(budget.remaining, 0);
-    assert.equal(budget.exitRequestsUsed, 1);
+    assert.equal(budget.exitRequestsUsed, 2);
     assert.deepEqual(budget.byMethod, [
-      { method: "getMultipleAccounts", requests: 1, failures: 0 },
+      { method: "UNKNOWN", requests: 10, failures: 0 },
     ]);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Helius rolling limits are atomic across store instances and reserve exit capacity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-helius-rolling-"));
+  const path = join(directory, "sentinel.db");
+  const first = new SentinelStore(path);
+  const second = new SentinelStore(path);
+  await first.open();
+  await second.open();
+  const nowMs = Date.now();
+  const consume = (store: SentinelStore, priority: "EXIT" | "CANDIDATE") =>
+    store.consumeHeliusRequest({
+      maxRequestsPerUtcDay: 10,
+      exitReservedRequestsPerUtcDay: 2,
+      maxRequestsPerWindow: 4,
+      requestWindowSeconds: 300,
+      maxRequestsPerSecond: 10,
+      priority,
+      method: "getAccountInfo",
+      nowMs,
+    });
+  try {
+    const candidates = Array.from({ length: 8 }, (_, index) =>
+      consume(index % 2 === 0 ? first : second, "CANDIDATE"),
+    );
+    assert.equal(candidates.filter((item) => item.allowed).length, 3);
+    assert.equal(candidates[3]?.reasonCode, "REQUEST_WINDOW_BUDGET_EXHAUSTED");
+    assert.equal(consume(first, "EXIT").allowed, true);
+    assert.equal(
+      consume(second, "EXIT").reasonCode,
+      "REQUEST_WINDOW_BUDGET_EXHAUSTED",
+    );
+    const budget = first.getHeliusRequestBudget(10, 2, {
+      maxRequestsPerWindow: 4,
+      requestWindowSeconds: 300,
+    });
+    assert.equal(budget.rollingUsed, 4);
+    assert.equal(budget.rollingRemaining, 0);
+    assert.equal(budget.reservedForExitsWindow, 1);
+    assert.equal(budget.exitRequestsUsed, 1);
+  } finally {
+    second.close();
+    first.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Helius rolling request reservations persist across store restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-helius-restart-"));
+  const path = join(directory, "sentinel.db");
+  const policy = {
+    maxRequestsPerUtcDay: 10,
+    exitReservedRequestsPerUtcDay: 0,
+    maxRequestsPerWindow: 2,
+    requestWindowSeconds: 300,
+    maxRequestsPerSecond: 10,
+    priority: "CANDIDATE" as const,
+    nowMs: Date.now(),
+  };
+  const first = new SentinelStore(path);
+  await first.open();
+  try {
+    assert.equal(first.consumeHeliusRequest(policy).allowed, true);
+  } finally {
+    first.close();
+  }
+  const restarted = new SentinelStore(path);
+  await restarted.open();
+  try {
+    assert.equal(restarted.consumeHeliusRequest(policy).allowed, true);
+    assert.equal(
+      restarted.consumeHeliusRequest(policy).reasonCode,
+      "REQUEST_WINDOW_BUDGET_EXHAUSTED",
+    );
+    assert.equal(
+      restarted.getHeliusRequestBudget(10, 0, {
+        maxRequestsPerWindow: 2,
+        requestWindowSeconds: 300,
+      }).rollingUsed,
+      2,
+    );
+  } finally {
+    restarted.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Helius counts every failed outbound retry against persisted rolling and daily budgets", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sentinel-helius-retries-"));
+  const store = new SentinelStore(join(directory, "sentinel.db"));
+  await store.open();
+  let attempts = 0;
+  const config = {
+    maxRequestsPerUtcDay: 10,
+    exitReservedRequestsPerUtcDay: 2,
+    maxRequestsPerWindow: 10,
+    requestWindowSeconds: 300,
+    maxRequestsPerSecond: 100,
+  };
+  const client = new HeliusRpcClient({
+    apiKey: "test",
+    requestTimeoutMs: 1000,
+    maxRequestsPerSecond: 100,
+    consumeRequestBudget: (request) =>
+      store.consumeHeliusRequest({ ...config, ...request }),
+    recordRequestOutcome: (request) =>
+      store.recordHeliusRequestOutcome(request),
+    fetchImpl: async () => {
+      attempts += 1;
+      return new Response("", { status: 503 });
+    },
+  });
+  try {
+    await assert.rejects(
+      () =>
+        client.getAccountInfo("So11111111111111111111111111111111111111112"),
+      /PROVIDER_UNAVAILABLE/,
+    );
+    assert.equal(attempts, 3);
+    const budget = store.getHeliusRequestBudget(10, 2, {
+      maxRequestsPerWindow: 10,
+      requestWindowSeconds: 300,
+    });
+    assert.equal(budget.used, 3);
+    assert.equal(budget.rollingUsed, 3);
+    assert.equal(budget.byMethod[0]?.requests, 3);
+    assert.equal(budget.byMethod[0]?.failures, 3);
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });

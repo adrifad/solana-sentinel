@@ -7,8 +7,11 @@ providers:
   helius:
     request_timeout_ms: 3000
     max_requests_per_second: 5
+    max_requests_per_window: 100
+    request_window_seconds: 300
     max_requests_per_utc_day: 1000
     exit_reserved_requests_per_utc_day: 200
+    max_pending_requests: 256
     max_concurrent_enrichments: 4
     enable_trade_stream: false
     max_active_trade_subscriptions: 20
@@ -102,6 +105,9 @@ paper:
   reject_when_sell_quote_missing: true
   wallet_id: sentinel-paper-default
   automatic_entries_enabled: false
+  experimental_entries_enabled: false
+  experimental_min_verified_observations: 3
+  experimental_min_independent_buyers: 3
   manual_entry_request_expiry_ms: 5000
   manual_exit_request_expiry_ms: 300000
   order_size_sol: '0.01'

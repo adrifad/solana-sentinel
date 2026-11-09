@@ -15,6 +15,11 @@ test("loads safe DRY_RUN defaults without wallet credentials", async () => {
     DB_PATH: ":memory:",
   });
   assert.equal(loaded.config.mode, "DRY_RUN");
+  assert.equal(loaded.config.providers.helius.max_requests_per_window, 100);
+  assert.equal(loaded.config.providers.helius.request_window_seconds, 300);
+  assert.equal(loaded.config.providers.helius.max_pending_requests, 256);
+  assert.equal(loaded.config.paper.experimental_entries_enabled, false);
+  assert.equal(loaded.config.paper.experimental_min_verified_observations, 3);
   assert.equal(loaded.config.paper.position_monitor_interval_ms, 15_000);
   assert.equal(loaded.config.paper.position_monitor_max_interval_ms, 900_000);
   assert.equal(loaded.config.paper.position_monitor_estimated_rpc_requests, 2);

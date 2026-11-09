@@ -82,12 +82,21 @@ async function main(): Promise<void> {
       requestTimeoutMs: loaded.config.providers.helius.request_timeout_ms,
       maxRequestsPerSecond:
         loaded.config.providers.helius.max_requests_per_second,
-      consumeRequestBudget: ({ priority }) =>
-        store.tryConsumeHeliusRequest(
-          loaded.config.providers.helius.max_requests_per_utc_day,
-          loaded.config.providers.helius.exit_reserved_requests_per_utc_day,
-          priority,
-        ),
+      maxPendingRequests: loaded.config.providers.helius.max_pending_requests,
+      consumeRequestBudget: (request) =>
+        store.consumeHeliusRequest({
+          ...request,
+          maxRequestsPerUtcDay:
+            loaded.config.providers.helius.max_requests_per_utc_day,
+          exitReservedRequestsPerUtcDay:
+            loaded.config.providers.helius.exit_reserved_requests_per_utc_day,
+          maxRequestsPerWindow:
+            loaded.config.providers.helius.max_requests_per_window,
+          requestWindowSeconds:
+            loaded.config.providers.helius.request_window_seconds,
+          maxRequestsPerSecond:
+            loaded.config.providers.helius.max_requests_per_second,
+        }),
       recordRequestOutcome: (request) =>
         store.recordHeliusRequestOutcome(request),
     });
@@ -97,6 +106,12 @@ async function main(): Promise<void> {
     const budget = store.getHeliusRequestBudget(
       loaded.config.providers.helius.max_requests_per_utc_day,
       loaded.config.providers.helius.exit_reserved_requests_per_utc_day,
+      {
+        maxRequestsPerWindow:
+          loaded.config.providers.helius.max_requests_per_window,
+        requestWindowSeconds:
+          loaded.config.providers.helius.request_window_seconds,
+      },
     );
     log(health.ok ? "info" : "warn", "provider.helius.health", {
       ok: health.ok,

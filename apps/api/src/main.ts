@@ -19,9 +19,14 @@ const server = createApiServer({
     config.config.providers.helius.max_requests_per_utc_day,
   heliusExitReservedRequestsPerUtcDay:
     config.config.providers.helius.exit_reserved_requests_per_utc_day,
+  heliusMaxRequestsPerWindow:
+    config.config.providers.helius.max_requests_per_window,
+  heliusRequestWindowSeconds:
+    config.config.providers.helius.request_window_seconds,
   parsedScanCreditsPerUtcDay:
     config.config.providers.helius.parsed_events_scan_max_credits_per_utc_day,
   automaticEntriesEnabled: config.config.paper.automatic_entries_enabled,
+  experimentalEntriesEnabled: config.config.paper.experimental_entries_enabled,
   paperWalletId: config.config.paper.wallet_id,
   ...(config.paperOperatorToken
     ? { operatorToken: config.paperOperatorToken }

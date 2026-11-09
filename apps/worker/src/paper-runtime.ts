@@ -397,6 +397,12 @@ export class PaperRuntime {
     return this.#store.getHeliusRequestBudget(
       this.#config.providers.helius.max_requests_per_utc_day,
       this.#config.providers.helius.exit_reserved_requests_per_utc_day,
+      {
+        maxRequestsPerWindow:
+          this.#config.providers.helius.max_requests_per_window,
+        requestWindowSeconds:
+          this.#config.providers.helius.request_window_seconds,
+      },
     ).exitRequestsUsed;
   }
 
@@ -408,6 +414,12 @@ export class PaperRuntime {
     const currentBudget = this.#store.getHeliusRequestBudget(
       this.#config.providers.helius.max_requests_per_utc_day,
       this.#config.providers.helius.exit_reserved_requests_per_utc_day,
+      {
+        maxRequestsPerWindow:
+          this.#config.providers.helius.max_requests_per_window,
+        requestWindowSeconds:
+          this.#config.providers.helius.request_window_seconds,
+      },
     );
     const requestsPerPosition = Math.max(
       this.#config.paper.position_monitor_estimated_rpc_requests,
@@ -418,20 +430,46 @@ export class PaperRuntime {
       (projectedPositions * requestsPerPosition * 86_400_000) /
         this.#config.paper.position_monitor_max_interval_ms,
     );
+    const requiredWindowRequests = Math.ceil(
+      (projectedPositions *
+        requestsPerPosition *
+        currentBudget.rollingWindowSeconds *
+        1000) /
+        this.#config.paper.position_monitor_max_interval_ms,
+    );
+    const availableExitRequests = Math.min(
+      currentBudget.remaining,
+      Math.max(
+        0,
+        currentBudget.reservedForExits - currentBudget.exitRequestsUsed,
+      ),
+    );
     const evidence = {
       openPositions: portfolio.positions.length,
       projectedPositions,
       estimatedRpcRequestsPerPosition: requestsPerPosition,
       requiredDailyExitRequests: requiredDailyRequests,
       reservedExitRequestsPerDay: currentBudget.reservedForExits,
-      remainingHeliusRequests: currentBudget.remaining,
+      availableExitRequestsPerDay: availableExitRequests,
+      rollingRequestsRemaining: currentBudget.rollingRemaining,
+      reservedExitRequestsPerWindow: currentBudget.reservedForExitsWindow,
+      requiredWindowExitRequests: requiredWindowRequests,
       maximumMonitorIntervalMs:
         this.#config.paper.position_monitor_max_interval_ms,
     };
     if (requiredDailyRequests > currentBudget.reservedForExits)
       return { reasonCode: "EXIT_MONITOR_BUDGET_INSUFFICIENT", evidence };
-    if (currentBudget.remaining < requestsPerPosition * projectedPositions)
+    if (availableExitRequests < requestsPerPosition * projectedPositions)
       return { reasonCode: "EXIT_MONITOR_BUDGET_EXHAUSTED", evidence };
+    if (
+      currentBudget.rollingRemaining <
+        requestsPerPosition * projectedPositions ||
+      requiredWindowRequests > currentBudget.reservedForExitsWindow
+    )
+      return {
+        reasonCode: "EXIT_MONITOR_WINDOW_BUDGET_INSUFFICIENT",
+        evidence,
+      };
     return null;
   }
 
@@ -444,6 +482,12 @@ export class PaperRuntime {
     const budget = this.#store.getHeliusRequestBudget(
       this.#config.providers.helius.max_requests_per_utc_day,
       this.#config.providers.helius.exit_reserved_requests_per_utc_day,
+      {
+        maxRequestsPerWindow:
+          this.#config.providers.helius.max_requests_per_window,
+        requestWindowSeconds:
+          this.#config.providers.helius.request_window_seconds,
+      },
     );
     const now = new Date();
     const nextUtcDay = Date.UTC(
@@ -461,7 +505,11 @@ export class PaperRuntime {
       maxIntervalMs: max,
       openPositions,
       estimatedRpcRequestsPerPosition: requestsPerPosition,
-      remainingRpcRequests: budget.remaining,
+      remainingRpcRequests: Math.min(
+        budget.remaining,
+        Math.max(0, budget.reservedForExits - budget.exitRequestsUsed),
+        budget.rollingRemaining,
+      ),
       untilBudgetResetMs,
     });
   }
@@ -506,15 +554,6 @@ export class PaperRuntime {
       return;
     }
     for (const token of tokens) {
-      if (!token.monitoringEligible) {
-        this.#recordEntryEvaluation(
-          token.mint,
-          this.#store.listRiskDecisions(token.mint, 1)[0] ?? null,
-          "SKIPPED",
-          "MONITORING_LEASE_INACTIVE",
-        );
-        continue;
-      }
       const decision = this.#store.listRiskDecisions(token.mint, 1)[0];
       if (!decision) {
         this.#recordEntryEvaluation(
@@ -522,18 +561,130 @@ export class PaperRuntime {
           null,
           "SKIPPED",
           "RISK_DECISION_NOT_FOUND",
+          {
+            discoveryMonitoring: token.monitoringEligible
+              ? "ACTIVE"
+              : "LEASE_EXPIRED",
+            evidenceCollection: "NO_DECISION_YET",
+            entryEligibility: "BLOCKED",
+          },
         );
         continue;
       }
+      let entryPolicy: "STRICT_VALIDATED" | "PAPER_EXPERIMENTAL" =
+        "STRICT_VALIDATED";
+      let experimentalEvidence: Record<string, unknown> | null = null;
       if (decision.status !== "BUY_ELIGIBLE") {
-        this.#recordEntryEvaluation(
-          token.mint,
-          decision,
-          "SKIPPED",
-          `DECISION_${decision.status}`,
-          { decisionReasonCodes: decision.reasonCodes },
+        if (
+          !this.#config.paper.experimental_entries_enabled ||
+          decision.status !== "QUARANTINE"
+        ) {
+          this.#recordEntryEvaluation(
+            token.mint,
+            decision,
+            "SKIPPED",
+            `DECISION_${decision.status}`,
+            { decisionReasonCodes: decision.reasonCodes },
+          );
+          continue;
+        }
+        const coverageAtEvaluation =
+          this.#store.getLatestTradeObservationCoverage(token.mint);
+        const evaluatedAtUtc = decision.decidedAtUtc;
+        const sizeLamports = solToLamports(this.#config.paper.order_size_sol);
+        const eligibility = this.#manualEntryEligibility({
+          id: `experimental:${decision.id}`,
+          idempotencyKey: `experimental:${decision.id}`,
+          requestType: "ENTRY",
+          walletId: this.#walletId,
+          mint: token.mint,
+          positionId: null,
+          requestedAmountRaw: sizeLamports,
+          requestedSizeSol: this.#config.paper.order_size_sol,
+          entrySource: "MANUAL",
+          status: "PENDING",
+          reasonCode: null,
+          originalCoverageStatus: coverageAtEvaluation?.status ?? "UNVERIFIED",
+          coverageExceptionReason: null,
+          evidence: {},
+          executionOrderId: null,
+          attempts: 0,
+          createdAtUtc: evaluatedAtUtc,
+          expiresAtUtc: new Date(
+            Date.parse(evaluatedAtUtc) +
+              this.#config.strategy.max_signal_age_ms,
+          ).toISOString(),
+          updatedAtUtc: evaluatedAtUtc,
+          completedAtUtc: null,
+        });
+        if (
+          !eligibility.allowed ||
+          !eligibility.coverageExceptionReason ||
+          !coverageAtEvaluation ||
+          Date.parse(coverageAtEvaluation.windowExpiresAtUtc) >
+            Date.parse(decision.decidedAtUtc)
+        ) {
+          this.#recordEntryEvaluation(
+            token.mint,
+            decision,
+            "SKIPPED",
+            eligibility.allowed
+              ? "EXPERIMENTAL_OBSERVATION_WINDOW_NOT_CLOSED"
+              : `EXPERIMENTAL_${eligibility.reasonCode}`,
+            {
+              entryPolicy: "PAPER_EXPERIMENTAL",
+              originalDecisionStatus: decision.status,
+              originalReasonCodes: decision.reasonCodes,
+              coverageStatus: coverageAtEvaluation?.status ?? "UNVERIFIED",
+              coverageExceptionReason: eligibility.coverageExceptionReason,
+              eligibilityEvidence: eligibility.evidence,
+            },
+          );
+          continue;
+        }
+        const verifiedObservationIds = Array.isArray(
+          eligibility.evidence["verifiedObservationIds"],
+        )
+          ? (eligibility.evidence["verifiedObservationIds"] as string[])
+          : [];
+        const independentBuyerEstimate = Number(
+          eligibility.evidence["independentBuyerEstimate"] ?? 0,
         );
-        continue;
+        if (
+          verifiedObservationIds.length <
+            this.#config.paper.experimental_min_verified_observations ||
+          independentBuyerEstimate <
+            this.#config.paper.experimental_min_independent_buyers
+        ) {
+          this.#recordEntryEvaluation(
+            token.mint,
+            decision,
+            "SKIPPED",
+            "EXPERIMENTAL_MINIMUM_EVIDENCE_NOT_MET",
+            {
+              entryPolicy: "PAPER_EXPERIMENTAL",
+              verifiedObservationCount: verifiedObservationIds.length,
+              minimumVerifiedObservations:
+                this.#config.paper.experimental_min_verified_observations,
+              independentBuyerEstimate,
+              minimumIndependentBuyers:
+                this.#config.paper.experimental_min_independent_buyers,
+              originalReasonCodes: decision.reasonCodes,
+              eligibilityEvidence: eligibility.evidence,
+            },
+          );
+          continue;
+        }
+        entryPolicy = "PAPER_EXPERIMENTAL";
+        experimentalEvidence = {
+          originalDecisionStatus: decision.status,
+          originalDecisionReasonCodes: decision.reasonCodes,
+          coverageStatus: coverageAtEvaluation.status,
+          coverageExceptionReason: eligibility.coverageExceptionReason,
+          verifiedObservationCount: verifiedObservationIds.length,
+          independentBuyerEstimate,
+          evidence: eligibility.evidence,
+        };
       }
       if (decision.configVersion !== this.#configVersion) {
         this.#recordEntryEvaluation(
@@ -553,7 +704,10 @@ export class PaperRuntime {
         1,
       )[0];
       const security = this.#store.getLatestTokenRiskReport(token.mint);
-      if (coverage?.status !== "COMPLETE") {
+      if (
+        entryPolicy === "STRICT_VALIDATED" &&
+        coverage?.status !== "COMPLETE"
+      ) {
         this.#recordEntryEvaluation(
           token.mint,
           decision,
@@ -564,7 +718,8 @@ export class PaperRuntime {
         continue;
       }
       if (
-        behavior?.complete !== true ||
+        (entryPolicy === "STRICT_VALIDATED" && behavior?.complete !== true) ||
+        !behavior ||
         behavior.mint !== token.mint ||
         Date.parse(behavior.observedAtUtc) >
           Date.parse(decision.decidedAtUtc) ||
@@ -597,15 +752,16 @@ export class PaperRuntime {
         continue;
       }
       if (
-        Date.parse(coverage.windowExpiresAtUtc) >
-        Date.parse(decision.decidedAtUtc)
+        entryPolicy === "STRICT_VALIDATED" &&
+        Date.parse(coverage?.windowExpiresAtUtc ?? "") >
+          Date.parse(decision.decidedAtUtc)
       ) {
         this.#recordEntryEvaluation(
           token.mint,
           decision,
           "SKIPPED",
           "BEHAVIOR_WINDOW_NOT_CLOSED_AT_DECISION",
-          { windowExpiresAtUtc: coverage.windowExpiresAtUtc },
+          { windowExpiresAtUtc: coverage?.windowExpiresAtUtc ?? null },
         );
         continue;
       }
@@ -613,12 +769,22 @@ export class PaperRuntime {
         Date.now() - Date.parse(decision.decidedAtUtc) >
         this.#config.strategy.max_signal_age_ms
       ) {
+        const refreshQueued = this.#store.requeueLatestAnalysisForMint(
+          token.mint,
+          `paper-entry-expired-decision:${decision.id}`,
+        );
         this.#recordEntryEvaluation(
           token.mint,
           decision,
           "SKIPPED",
-          "RISK_DECISION_EXPIRED",
-          { maxSignalAgeMs: this.#config.strategy.max_signal_age_ms },
+          refreshQueued
+            ? "RISK_DECISION_EXPIRED_FRESH_ANALYSIS_QUEUED"
+            : "RISK_DECISION_EXPIRED",
+          {
+            maxSignalAgeMs: this.#config.strategy.max_signal_age_ms,
+            refreshedDecisionRequired: refreshQueued,
+            priorDecisionId: decision.id,
+          },
         );
         continue;
       }
@@ -649,20 +815,37 @@ export class PaperRuntime {
         );
         continue;
       }
-      const key = `paper-entry:${decision.id}`;
+      const key =
+        entryPolicy === "PAPER_EXPERIMENTAL"
+          ? `paper-entry:experimental:${decision.id}`
+          : `paper-entry:${decision.id}`;
       const orderId = hash(key);
+      const entryReasonCodes =
+        entryPolicy === "PAPER_EXPERIMENTAL"
+          ? [
+              ...decision.reasonCodes,
+              "PAPER_EXPERIMENTAL_POLICY",
+              "OBSERVATION_COVERAGE_PARTIAL",
+            ]
+          : decision.reasonCodes;
       this.#store.recordPaperEntryEvaluation({
         mint: token.mint,
         decisionId: decision.id,
         decisionStatus: decision.status,
         status: "EVALUATING",
         reasonCode: null,
-        reasonCodes: decision.reasonCodes,
+        reasonCodes: entryReasonCodes,
         evaluatedAtUtc: utcNow(),
         executionOrderId: orderId,
         orderStatus: "PENDING",
         orderAttempted: true,
-        evidence: { trigger: "AUTOMATIC_ENTRY_EVALUATION" },
+        evidence: {
+          trigger: "AUTOMATIC_ENTRY_EVALUATION",
+          monitoringLeaseExpired: !token.monitoringEligible,
+          decisionFreshnessLimitMs: this.#config.strategy.max_signal_age_ms,
+          entryPolicy,
+          ...(experimentalEvidence ? { experimentalEvidence } : {}),
+        },
       });
       const result = await this.#engine.execute({
         id: orderId,
@@ -673,7 +856,7 @@ export class PaperRuntime {
         side: "BUY",
         exactInputAmountRaw: amount,
         decisionId: decision.id,
-        reasonCodes: decision.reasonCodes,
+        reasonCodes: entryReasonCodes,
         createdAtUtc: decision.decidedAtUtc,
         signalQuoteId: null,
       });
@@ -696,13 +879,15 @@ export class PaperRuntime {
         decisionStatus: decision.status,
         status: evaluationStatus,
         reasonCode: result.reasonCode ?? result.order.reasonCode,
-        reasonCodes: decision.reasonCodes,
+        reasonCodes: entryReasonCodes,
         evaluatedAtUtc: utcNow(),
         executionOrderId: result.order.id,
         orderStatus: result.order.status,
         evidence: {
           fillId: result.fill?.["orderId"] ?? null,
           quoteId: result.fill?.["quoteId"] ?? null,
+          entryPolicy,
+          ...(experimentalEvidence ? { experimentalEvidence } : {}),
         },
       });
     }

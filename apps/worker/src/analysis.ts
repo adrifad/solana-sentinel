@@ -66,6 +66,7 @@ type AnalysisEvidence = {
   asOfSlot: number | null;
   evidenceRefs: Set<string>;
   errors: Set<string>;
+  retryAfterMs: number;
 };
 
 export class TokenAnalysisScheduler {
@@ -157,7 +158,9 @@ export class TokenAnalysisScheduler {
         const retryDelayMs =
           errorCode === "REQUEST_BUDGET_EXHAUSTED"
             ? millisecondsUntilUtcDayReset()
-            : Math.min(60_000, 1_000 * 2 ** Math.min(job.attempts - 1, 6));
+            : error instanceof ProviderFailure && error.retryAfterMs > 0
+              ? error.retryAfterMs
+              : Math.min(60_000, 1_000 * 2 ** Math.min(job.attempts - 1, 6));
         log("error", "analysis.job_failed", {
           mint: job.mint,
           eventId: job.eventId,
@@ -207,6 +210,7 @@ export class TokenAnalysisScheduler {
           : event.slot,
       evidenceRefs: new Set([`market_event:${job.eventId}`]),
       errors: new Set(),
+      retryAfterMs: 0,
     };
 
     const creatorStartedAt = this.#now();
@@ -416,10 +420,12 @@ export class TokenAnalysisScheduler {
       (evidence.walletProfiles.some((profile) => !profile.historyComplete) ||
         security.status === "MISSING");
     const budgetError = [...evidence.errors, ...security.reasonCodes].find(
-      (code) => code.includes("REQUEST_BUDGET_EXHAUSTED"),
+      (code) => code.startsWith("REQUEST_"),
     );
     const retryDelayMs = budgetError
-      ? millisecondsUntilUtcDayReset()
+      ? budgetError === "REQUEST_BUDGET_EXHAUSTED"
+        ? millisecondsUntilUtcDayReset()
+        : Math.max(1_000, evidence.retryAfterMs)
       : refreshNeeded
         ? Math.min(3_600_000, 30_000 * 2 ** Math.min(job.attempts - 1, 7))
         : 0;
@@ -556,6 +562,10 @@ export class TokenAnalysisScheduler {
       const loaded = await this.#pumpSwapState.load(mint, "CANDIDATE");
       if (loaded.status !== "SUPPORTED") {
         evidence.errors.add(loaded.reasonCode);
+        evidence.retryAfterMs = Math.max(
+          evidence.retryAfterMs,
+          loaded.retryAfterMs ?? 0,
+        );
         log("warn", "analysis.pumpswap_state_unavailable", {
           mint,
           errorCode: loaded.reasonCode,
@@ -596,6 +606,10 @@ export class TokenAnalysisScheduler {
       const loaded = await this.#pumpCurveState.load(mint, "CANDIDATE");
       if (loaded.status !== "SUPPORTED") {
         evidence.errors.add(loaded.reasonCode);
+        evidence.retryAfterMs = Math.max(
+          evidence.retryAfterMs,
+          loaded.retryAfterMs ?? 0,
+        );
         log("warn", "analysis.pump_curve_state_unavailable", {
           mint,
           errorCode: loaded.reasonCode,
@@ -659,6 +673,7 @@ export class TokenAnalysisScheduler {
     } catch (error) {
       const errorCode = providerError(error);
       evidence.errors.add(errorCode);
+      noteProviderRetry(evidence, error);
       log("warn", "analysis.quote_failed", {
         mint,
         errorCode,
@@ -764,6 +779,7 @@ export class TokenAnalysisScheduler {
         }
       } catch (error) {
         evidence.errors.add(providerError(error));
+        noteProviderRetry(evidence, error);
       }
     } else {
       evidence.errors.add("LAUNCH_SIGNATURE_MISSING");
@@ -887,6 +903,7 @@ export class TokenAnalysisScheduler {
       } catch (error) {
         refreshError = providerError(error);
         evidence.errors.add(refreshError);
+        noteProviderRetry(evidence, error);
         break;
       }
       if (signatures.length === 0) {
@@ -910,6 +927,7 @@ export class TokenAnalysisScheduler {
               transaction = await this.#helius!.getTransaction(item.signature);
             } catch (error) {
               refreshError = providerError(error);
+              noteProviderRetry(evidence, error);
               pageFailed = true;
               break;
             }
@@ -1229,6 +1247,8 @@ export class TokenAnalysisScheduler {
       accountResult = await this.#helius.getAccountInfo(mint);
     } catch (error) {
       reasons.add(`MINT_ACCOUNT_${providerError(error)}`);
+      evidence.errors.add(providerError(error));
+      noteProviderRetry(evidence, error);
       const missing = decodeMintAccount(null, null);
       return this.#makeSecurityReport(
         id,
@@ -1293,9 +1313,17 @@ export class TokenAnalysisScheduler {
       this.#helius.getTokenLargestAccounts(mint),
     ]);
     if (supplyResult.status === "fulfilled") supply = supplyResult.value;
-    else reasons.add(`TOKEN_SUPPLY_${providerError(supplyResult.reason)}`);
+    else {
+      reasons.add(`TOKEN_SUPPLY_${providerError(supplyResult.reason)}`);
+      evidence.errors.add(providerError(supplyResult.reason));
+      noteProviderRetry(evidence, supplyResult.reason);
+    }
     if (largestResult.status === "fulfilled") largest = largestResult.value;
-    else reasons.add(`LARGEST_ACCOUNTS_${providerError(largestResult.reason)}`);
+    else {
+      reasons.add(`LARGEST_ACCOUNTS_${providerError(largestResult.reason)}`);
+      evidence.errors.add(providerError(largestResult.reason));
+      noteProviderRetry(evidence, largestResult.reason);
+    }
 
     let topHolderConcentrationBps: number | null = null;
     let creatorConcentrationRaw: string | null = null;
@@ -1327,6 +1355,8 @@ export class TokenAnalysisScheduler {
               .getMultipleAccounts(accounts.map((account) => account.address))
               .catch((error: unknown) => {
                 reasons.add(`HOLDER_ACCOUNTS_${providerError(error)}`);
+                evidence.errors.add(providerError(error));
+                noteProviderRetry(evidence, error);
                 return null;
               })
           : null;
@@ -1507,6 +1537,11 @@ function providerError(error: unknown): HeliusErrorCode {
     : error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
       ? error.message
       : "PROVIDER_UNAVAILABLE";
+}
+
+function noteProviderRetry(evidence: AnalysisEvidence, error: unknown): void {
+  if (error instanceof ProviderFailure)
+    evidence.retryAfterMs = Math.max(evidence.retryAfterMs, error.retryAfterMs);
 }
 
 function millisecondsUntilUtcDayReset(): number {

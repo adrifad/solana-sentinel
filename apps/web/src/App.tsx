@@ -554,6 +554,13 @@ export default function App() {
                         : false,
                     )}
                   />
+                  <ReadinessRow
+                    label="Experimental PAPER"
+                    value={readinessStatus(
+                      readiness["paperExperimentalEntryStatus"],
+                      readiness["paperExperimentalEntryReady"],
+                    )}
+                  />
                 </div>
                 <div className="mt-auto border-t border-line/80 px-5 py-3.5 sm:px-6">
                   <p className="mb-2 text-[9px] font-bold uppercase tracking-[0.15em] text-[#6e7489]">
@@ -1360,6 +1367,11 @@ function AnalysisDiagnostics({
   const automaticBlockers = Array.isArray(readiness["automaticEntryBlockers"])
     ? (readiness["automaticEntryBlockers"] as string[])
     : [];
+  const experimentalBlockers = Array.isArray(
+    readiness["paperExperimentalEntryBlockers"],
+  )
+    ? (readiness["paperExperimentalEntryBlockers"] as string[])
+    : [];
   const coverageStatuses =
     tradeData["byStatus"] && typeof tradeData["byStatus"] === "object"
       ? Object.entries(tradeData["byStatus"] as Record<string, number>)
@@ -1384,8 +1396,51 @@ function AnalysisDiagnostics({
       </div>
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-[9px] text-[#8c93a8]">
         <span>
+          Helius provider: {String(readiness["heliusRpcStatus"] ?? "UNKNOWN")} ·{" "}
+          {String(readiness["heliusProviderErrorCode"] ?? "no provider error")}
+        </span>
+        <span>
           Helius RPC: {number(budgetData["used"] as number | undefined)} used ·{" "}
           {number(budgetData["remaining"] as number | undefined)} remaining
+        </span>
+        <span>
+          Rolling {number(budgetData["rollingUsed"] as number | undefined)} /{" "}
+          {number(budgetData["rollingLimit"] as number | undefined)} in{" "}
+          {number(budgetData["rollingWindowSeconds"] as number | undefined)}s ·{" "}
+          {number(budgetData["rollingRemaining"] as number | undefined)}{" "}
+          remaining (
+          {number(
+            budgetData["rollingCandidateRemaining"] as number | undefined,
+          )}{" "}
+          candidate capacity)
+        </span>
+        <span>
+          Daily candidate capacity:{" "}
+          {number(budgetData["dailyCandidateRemaining"] as number | undefined)}
+        </span>
+        <span>
+          Deferred: {number(budgetData["deferred"] as number | undefined)} RPC
+          requests
+        </span>
+        <span>
+          RPC outcomes: {number(budgetData["completed"] as number | undefined)}{" "}
+          completed · {number(budgetData["failed"] as number | undefined)}{" "}
+          failed · {number(budgetData["retries"] as number | undefined)} retries
+        </span>
+        <span>
+          RPC priority counts:{" "}
+          {Object.entries(
+            (
+              budgetData["byPriority"] as
+                Array<Record<string, unknown>> | undefined
+            )?.reduce<Record<string, number>>((counts, item) => {
+              const priority = String(item["priority"] ?? "UNKNOWN");
+              counts[priority] = Number(item["attempts"] ?? 0);
+              return counts;
+            }, {}) ?? {},
+          )
+            .map(([priority, count]) => `${priority} ${number(count)}`)
+            .join(" · ") || "No RPC attempts"}
         </span>
         <span>
           Trade coverage:{" "}
@@ -1445,6 +1500,14 @@ function AnalysisDiagnostics({
             .join(" · ")}
         </p>
       )}
+      {experimentalBlockers.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[9px] font-semibold uppercase tracking-wide text-[#8c93a8]">
+            Experimental entry blockers
+          </p>
+          <ReasonList reasons={experimentalBlockers} emptyLabel="No blockers" />
+        </div>
+      )}
       <p className="text-[9px] leading-relaxed text-[#8c93a8]">
         Exit monitor: {String(monitorData["status"] ?? "Unavailable")} ·{" "}
         {number(monitorData["openPositions"] as number | undefined)} open ·
@@ -1460,6 +1523,12 @@ function AnalysisDiagnostics({
         daily need{" "}
         {number(monitorData["requiredDailyExitRequests"] as number | undefined)}{" "}
         / {number(monitorData["reservedExitRequests"] as number | undefined)}{" "}
+        reserved daily · rolling{" "}
+        {number(monitorData["rollingRequestsRemaining"] as number | undefined)}{" "}
+        remaining /{" "}
+        {number(
+          monitorData["reservedExitRequestsWindow"] as number | undefined,
+        )}{" "}
         reserved
       </p>
       {rpcErrors.length > 0 && (

@@ -59,7 +59,7 @@ test("reconciliation checkpoint survives restart and empty finalized window is e
       store.getLatestTradeObservationCoverage(event.mint)?.reasonCode,
       "FINALIZED_SCAN_WINDOW_COMPLETE",
     );
-    assert.equal(store.listAppliedMigrations().at(-1)?.version, 18);
+    assert.equal(store.listAppliedMigrations().at(-1)?.version, 19);
     const integrityDb = new DatabaseSync(path, { readOnly: true });
     try {
       const integrity = integrityDb.prepare("PRAGMA integrity_check").get() as {

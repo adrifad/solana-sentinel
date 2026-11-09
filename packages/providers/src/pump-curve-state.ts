@@ -39,7 +39,12 @@ export type PumpCurveStateResult =
         | "STATE_UNSAFE"
         | "MALFORMED_PROVIDER_DATA"
         | "PROVIDER_BUDGET_EXHAUSTED"
+        | "REQUEST_BUDGET_EXHAUSTED"
+        | "REQUEST_WINDOW_BUDGET_EXHAUSTED"
+        | "REQUEST_RATE_LIMITED"
+        | "REQUEST_QUEUE_FULL"
         | "PROVIDER_UNAVAILABLE";
+      retryAfterMs?: number;
     };
 
 export type PumpCurveStateLoaderOptions = {
@@ -221,6 +226,19 @@ export class PumpCurveStateLoader {
         error && typeof error === "object" && "code" in error
           ? String(error.code)
           : "";
+      if (code.startsWith("REQUEST_"))
+        return {
+          status: "MISSING",
+          reasonCode: code as
+            | "REQUEST_BUDGET_EXHAUSTED"
+            | "REQUEST_WINDOW_BUDGET_EXHAUSTED"
+            | "REQUEST_RATE_LIMITED"
+            | "REQUEST_QUEUE_FULL",
+          retryAfterMs:
+            error && typeof error === "object" && "retryAfterMs" in error
+              ? Number(error.retryAfterMs)
+              : 0,
+        };
       return {
         status: "UNSAFE",
         reasonCode:

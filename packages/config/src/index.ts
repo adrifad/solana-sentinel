@@ -29,6 +29,19 @@ export const AppConfigSchema = z
           .object({
             request_timeout_ms: z.number().int().min(100).max(30000),
             max_requests_per_second: z.number().int().min(1).max(1000),
+            max_requests_per_window: positiveInt.default(100),
+            request_window_seconds: z
+              .number()
+              .int()
+              .min(1)
+              .max(86400)
+              .default(300),
+            max_pending_requests: z
+              .number()
+              .int()
+              .min(1)
+              .max(10000)
+              .default(256),
             max_requests_per_utc_day: positiveInt,
             exit_reserved_requests_per_utc_day: z.number().int().nonnegative(),
             max_concurrent_enrichments: z.number().int().min(1).max(32),
@@ -170,6 +183,19 @@ export const AppConfigSchema = z
         reject_when_sell_quote_missing: z.boolean(),
         wallet_id: z.string().min(1).max(80),
         automatic_entries_enabled: z.boolean(),
+        experimental_entries_enabled: z.boolean().default(false),
+        experimental_min_verified_observations: z
+          .number()
+          .int()
+          .min(1)
+          .max(1000)
+          .default(3),
+        experimental_min_independent_buyers: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(3),
         manual_entry_request_expiry_ms: z.number().int().min(1000).max(600000),
         manual_exit_request_expiry_ms: z.number().int().min(1000).max(3600000),
         order_size_sol: z.string().regex(/^\d+(\.\d+)?$/),

@@ -195,10 +195,10 @@ export class EnrichmentScheduler {
           : deterministicFailure && error instanceof Error
             ? error.message
             : "PROVIDER_UNAVAILABLE";
-      const budgetExhausted = errorCode === "REQUEST_BUDGET_EXHAUSTED";
+      const budgetDeferred = errorCode.startsWith("REQUEST_");
       const terminal =
         deterministicFailure ||
-        (!budgetExhausted && job.attempts >= 3) ||
+        (!budgetDeferred && job.attempts >= 3) ||
         errorCode === "INVALID_SIGNATURE";
       const untilUtcDay = new Date();
       untilUtcDay.setUTCHours(24, 0, 0, 0);
@@ -206,13 +206,17 @@ export class EnrichmentScheduler {
         job.eventId,
         terminal ? "FAILED" : "PENDING",
         errorCode,
-        budgetExhausted
-          ? Math.max(1000, untilUtcDay.getTime() - Date.now())
+        budgetDeferred
+          ? errorCode === "REQUEST_BUDGET_EXHAUSTED"
+            ? Math.max(1000, untilUtcDay.getTime() - Date.now())
+            : error instanceof ProviderFailure && error.retryAfterMs > 0
+              ? error.retryAfterMs
+              : 1000
           : terminal
             ? 0
             : 500 * 2 ** (job.attempts - 1),
       );
-      if (error instanceof ProviderFailure && !budgetExhausted)
+      if (error instanceof ProviderFailure && !budgetDeferred)
         this.#store.setProviderHealth({
           provider: "helius",
           state: "DEGRADED",
@@ -298,21 +302,25 @@ export class EnrichmentScheduler {
     } catch (error) {
       const errorCode =
         error instanceof ProviderFailure ? error.code : "PROVIDER_UNAVAILABLE";
-      const budgetExhausted = errorCode === "REQUEST_BUDGET_EXHAUSTED";
-      const terminal = !budgetExhausted && job.attempts >= 3;
+      const budgetDeferred = errorCode.startsWith("REQUEST_");
+      const terminal = !budgetDeferred && job.attempts >= 3;
       const untilUtcDay = new Date();
       untilUtcDay.setUTCHours(24, 0, 0, 0);
       this.#store.finishEnrichmentJob(
         job.eventId,
-        budgetExhausted ? "DEFERRED_BUDGET" : terminal ? "FAILED" : "PENDING",
+        budgetDeferred ? "DEFERRED_BUDGET" : terminal ? "FAILED" : "PENDING",
         errorCode,
-        budgetExhausted
-          ? Math.max(1000, untilUtcDay.getTime() - Date.now())
+        budgetDeferred
+          ? errorCode === "REQUEST_BUDGET_EXHAUSTED"
+            ? Math.max(1000, untilUtcDay.getTime() - Date.now())
+            : error instanceof ProviderFailure && error.retryAfterMs > 0
+              ? error.retryAfterMs
+              : 1000
           : terminal
             ? 0
             : 500 * 2 ** (job.attempts - 1),
       );
-      if (!budgetExhausted)
+      if (!budgetDeferred)
         this.#store.setProviderHealth({
           provider: "helius",
           state: "DEGRADED",

@@ -39,6 +39,16 @@ type SqlRow = Record<
 type JobChainTimeStatus =
   "UNKNOWN" | "RESOLVED" | "UNAVAILABLE" | "PROVIDER_ERROR";
 
+function millisecondsUntilUtcDayReset(nowMs: number): number {
+  const now = new Date(nowMs);
+  const nextDay = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+  );
+  return Math.max(1, nextDay - nowMs);
+}
+
 export type ParsedReconciliationJob = {
   id: string;
   mint: string;
@@ -172,6 +182,7 @@ export class SentinelStore {
       "016-analysis-diagnostics.sql",
       "017-parsed-events-reconciliation.sql",
       "018-reconciliation-finality-analysis-rerun.sql",
+      "019-helius-rolling-request-budget.sql",
     ];
     for (const [index, filename] of migrations.entries()) {
       const version = index + 1;
@@ -597,18 +608,55 @@ export class SentinelStore {
       | "CREATOR"
       | "BACKGROUND" = "BACKGROUND",
   ): boolean {
-    const utcDay = utcNow().slice(0, 10);
+    return this.consumeHeliusRequest({
+      maxRequestsPerUtcDay,
+      exitReservedRequestsPerUtcDay,
+      maxRequestsPerWindow: maxRequestsPerUtcDay,
+      requestWindowSeconds: 86_400,
+      maxRequestsPerSecond: maxRequestsPerUtcDay,
+      priority,
+    }).allowed;
+  }
+
+  consumeHeliusRequest(input: {
+    maxRequestsPerUtcDay: number;
+    exitReservedRequestsPerUtcDay: number;
+    maxRequestsPerWindow: number;
+    requestWindowSeconds: number;
+    maxRequestsPerSecond: number;
+    priority:
+      "EXIT" | "RISK" | "CANDIDATE" | "SECURITY" | "CREATOR" | "BACKGROUND";
+    method?: string;
+    component?: string;
+    purpose?: string;
+    subjectMint?: string | null;
+    nowMs?: number;
+  }): { allowed: boolean; retryAfterMs: number; reasonCode: string | null } {
+    const {
+      maxRequestsPerUtcDay,
+      exitReservedRequestsPerUtcDay,
+      maxRequestsPerWindow,
+      requestWindowSeconds,
+      maxRequestsPerSecond,
+      priority,
+    } = input;
+    const nowMs = input.nowMs ?? Date.now();
+    const observedAtUtc = new Date(nowMs).toISOString();
+    const utcDay = observedAtUtc.slice(0, 10);
     if (
       !Number.isSafeInteger(maxRequestsPerUtcDay) ||
+      !Number.isSafeInteger(maxRequestsPerWindow) ||
+      !Number.isSafeInteger(requestWindowSeconds) ||
+      !Number.isSafeInteger(maxRequestsPerSecond) ||
       !Number.isSafeInteger(exitReservedRequestsPerUtcDay) ||
+      maxRequestsPerUtcDay < 1 ||
+      maxRequestsPerWindow < 1 ||
+      requestWindowSeconds < 1 ||
+      maxRequestsPerSecond < 1 ||
       exitReservedRequestsPerUtcDay < 0 ||
       exitReservedRequestsPerUtcDay > maxRequestsPerUtcDay
     )
       throw new Error("HELIUS_REQUEST_BUDGET_CONFIG_INVALID");
-    const admissionLimit =
-      priority === "EXIT" || priority === "RISK"
-        ? maxRequestsPerUtcDay
-        : maxRequestsPerUtcDay - exitReservedRequestsPerUtcDay;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db
@@ -616,12 +664,105 @@ export class SentinelStore {
           "INSERT OR IGNORE INTO helius_request_budget(utc_day, requests_used) VALUES (?, 0)",
         )
         .run(utcDay);
-      const result = this.#db
+      const daily = this.#db
+        .prepare(
+          "SELECT requests_used FROM helius_request_budget WHERE utc_day = ?",
+        )
+        .get(utcDay) as SqlRow;
+      const usedToday = Number(daily["requests_used"] ?? 0);
+      const exitPriority = priority === "EXIT";
+      const dailyLimit = exitPriority
+        ? maxRequestsPerUtcDay
+        : maxRequestsPerUtcDay - exitReservedRequestsPerUtcDay;
+      if (usedToday >= dailyLimit) {
+        this.#db.exec("COMMIT");
+        return {
+          allowed: false,
+          retryAfterMs: millisecondsUntilUtcDayReset(nowMs),
+          reasonCode: "REQUEST_BUDGET_EXHAUSTED",
+        };
+      }
+
+      const windowMs = requestWindowSeconds * 1000;
+      const windowStart = nowMs - windowMs;
+      const windowRows = this.#db
+        .prepare(
+          `SELECT observed_at_ms, priority FROM helius_rpc_attempts
+           WHERE observed_at_ms > ? ORDER BY observed_at_ms`,
+        )
+        .all(windowStart) as SqlRow[];
+      const windowUsed = windowRows.length;
+      const reservedWindow = Math.min(
+        maxRequestsPerWindow,
+        Math.ceil(
+          (maxRequestsPerWindow * exitReservedRequestsPerUtcDay) /
+            maxRequestsPerUtcDay,
+        ),
+      );
+      const windowLimit = exitPriority
+        ? maxRequestsPerWindow
+        : maxRequestsPerWindow - reservedWindow;
+      if (windowUsed >= windowLimit) {
+        const availableReservation = exitPriority
+          ? windowRows[0]
+          : windowRows.find((row) => row["priority"] !== "EXIT");
+        const retryAfterMs = Math.max(
+          1,
+          Number(availableReservation?.["observed_at_ms"] ?? nowMs) +
+            windowMs -
+            nowMs,
+        );
+        this.#db.exec("COMMIT");
+        return {
+          allowed: false,
+          retryAfterMs,
+          reasonCode: "REQUEST_WINDOW_BUDGET_EXHAUSTED",
+        };
+      }
+
+      const secondRows = this.#db
+        .prepare(
+          `SELECT observed_at_ms FROM helius_rpc_attempts
+           WHERE observed_at_ms > ? ORDER BY observed_at_ms`,
+        )
+        .all(nowMs - 1000) as SqlRow[];
+      if (secondRows.length >= maxRequestsPerSecond) {
+        const retryAfterMs = Math.max(
+          1,
+          Number(secondRows[0]?.["observed_at_ms"] ?? nowMs) + 1000 - nowMs,
+        );
+        this.#db.exec("COMMIT");
+        return {
+          allowed: false,
+          retryAfterMs,
+          reasonCode: "REQUEST_RATE_LIMITED",
+        };
+      }
+
+      this.#db
         .prepare(
           `UPDATE helius_request_budget SET requests_used = requests_used + 1
-          WHERE utc_day = ? AND requests_used < ?`,
+           WHERE utc_day = ?`,
         )
-        .run(utcDay, admissionLimit);
+        .run(utcDay);
+      this.#db
+        .prepare(
+          `INSERT INTO helius_rpc_attempts
+           (observed_at_ms, utc_day, method, priority, component, purpose, subject_mint)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          nowMs,
+          utcDay,
+          input.method ?? "UNKNOWN",
+          priority,
+          input.component ?? "helius_rpc",
+          input.purpose ?? "unspecified",
+          input.subjectMint ?? null,
+        );
+      this.#db
+        .prepare("DELETE FROM helius_rpc_attempts WHERE observed_at_ms <= ?")
+        .run(nowMs - 86_400_000);
       this.#db.exec("COMMIT");
       if (this.#telegramEnabled) {
         const used = this.getHeliusRequestBudget(
@@ -641,7 +782,7 @@ export class SentinelStore {
             `helius-budget:${utcDay}:${threshold}`,
           );
       }
-      return Number(result.changes) === 1;
+      return { allowed: true, retryAfterMs: 0, reasonCode: null };
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
@@ -682,16 +823,32 @@ export class SentinelStore {
   getHeliusRequestBudget(
     maxRequestsPerUtcDay: number,
     exitReservedRequestsPerUtcDay: number,
+    rolling = { maxRequestsPerWindow: 100, requestWindowSeconds: 300 },
   ): {
     utcDay: string;
     used: number;
     remaining: number;
     reservedForExits: number;
     exitRequestsUsed: number;
+    rollingUsed: number;
+    rollingLimit: number;
+    rollingRemaining: number;
+    rollingCandidateRemaining: number;
+    dailyCandidateRemaining: number;
+    rollingWindowSeconds: number;
+    rollingResetAfterMs: number;
+    rollingCandidateResetAfterMs: number;
+    reservedForExitsWindow: number;
+    byPriority: Array<{ priority: string; attempts: number }>;
+    deferred: number;
+    completed: number;
+    failed: number;
+    retries: number;
     byMethod: Array<{ method: string; requests: number; failures: number }>;
     byErrorCode: Array<{ errorCode: string; count: number }>;
   } {
     const utcDay = utcNow().slice(0, 10);
+    const nowMs = Date.now();
     const aggregate = this.#db
       .prepare(
         "SELECT requests_used FROM helius_request_budget WHERE utc_day = ?",
@@ -699,16 +856,20 @@ export class SentinelStore {
       .get(utcDay) as SqlRow | undefined;
     const methods = this.#db
       .prepare(
-        `SELECT method,
-          SUM(CASE WHEN outcome != 'BUDGET_BLOCKED' THEN 1 ELSE 0 END) AS requests,
-          SUM(CASE WHEN outcome = 'FAILED' OR outcome = 'BUDGET_BLOCKED' THEN 1 ELSE 0 END) AS failures
-        FROM helius_rpc_request_history WHERE utc_day = ?
-        GROUP BY method ORDER BY requests DESC, method`,
+        `SELECT method, COUNT(*) AS requests FROM helius_rpc_attempts
+         WHERE utc_day = ? GROUP BY method ORDER BY requests DESC, method`,
+      )
+      .all(utcDay) as SqlRow[];
+    const failuresByMethod = this.#db
+      .prepare(
+        `SELECT method, SUM(CASE WHEN outcome = 'FAILED' THEN 1 ELSE 0 END) AS failures
+         FROM helius_rpc_request_history WHERE utc_day = ?
+         GROUP BY method`,
       )
       .all(utcDay) as SqlRow[];
     const exitUsage = this.#db
       .prepare(
-        "SELECT COUNT(*) AS count FROM helius_rpc_request_history WHERE utc_day = ? AND priority = 'EXIT' AND outcome != 'BUDGET_BLOCKED'",
+        "SELECT COUNT(*) AS count FROM helius_rpc_attempts WHERE utc_day = ? AND priority = 'EXIT'",
       )
       .get(utcDay) as SqlRow;
     const errors = this.#db
@@ -718,17 +879,110 @@ export class SentinelStore {
          GROUP BY error_code ORDER BY count DESC, errorCode LIMIT 10`,
       )
       .all(utcDay) as SqlRow[];
+    const rollingStartMs = nowMs - rolling.requestWindowSeconds * 1000;
+    const rollingRows = this.#db
+      .prepare(
+        `SELECT observed_at_ms, priority FROM helius_rpc_attempts
+         WHERE observed_at_ms > ? ORDER BY observed_at_ms`,
+      )
+      .all(rollingStartMs) as SqlRow[];
+    const byPriorityRows = this.#db
+      .prepare(
+        `SELECT priority, COUNT(*) AS attempts FROM helius_rpc_attempts
+         WHERE utc_day = ?
+         GROUP BY priority ORDER BY priority`,
+      )
+      .all(utcDay) as SqlRow[];
+    const deferredRow = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM helius_rpc_request_history
+         WHERE utc_day = ? AND outcome = 'BUDGET_BLOCKED'`,
+      )
+      .get(utcDay) as SqlRow;
+    const outcomeCounts = this.#db
+      .prepare(
+        `SELECT
+          SUM(CASE WHEN outcome = 'SUCCEEDED' THEN 1 ELSE 0 END) AS completed,
+          SUM(CASE WHEN outcome = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+          SUM(CASE WHEN attempt > 1 AND outcome != 'BUDGET_BLOCKED' THEN 1 ELSE 0 END) AS retries
+         FROM helius_rpc_request_history WHERE utc_day = ?`,
+      )
+      .get(utcDay) as SqlRow;
+    const rollingReserve = Math.min(
+      rolling.maxRequestsPerWindow,
+      Math.ceil(
+        (rolling.maxRequestsPerWindow * exitReservedRequestsPerUtcDay) /
+          maxRequestsPerUtcDay,
+      ),
+    );
     const used = Number(aggregate?.["requests_used"] ?? 0);
+    const rollingUsed = rollingRows.length;
+    const rollingCandidateLimit = Math.max(
+      0,
+      rolling.maxRequestsPerWindow - rollingReserve,
+    );
+    const rollingCandidateUsed = rollingRows.filter(
+      (row) => row["priority"] !== "EXIT",
+    ).length;
     return {
       utcDay,
       used,
       remaining: Math.max(0, maxRequestsPerUtcDay - used),
+      dailyCandidateRemaining: Math.max(
+        0,
+        maxRequestsPerUtcDay -
+          exitReservedRequestsPerUtcDay -
+          (used - Number(exitUsage["count"] ?? 0)),
+      ),
       reservedForExits: exitReservedRequestsPerUtcDay,
       exitRequestsUsed: Number(exitUsage["count"] ?? 0),
+      rollingUsed,
+      rollingLimit: rolling.maxRequestsPerWindow,
+      rollingRemaining: Math.max(0, rolling.maxRequestsPerWindow - rollingUsed),
+      rollingCandidateRemaining: Math.max(
+        0,
+        rollingCandidateLimit - rollingCandidateUsed,
+      ),
+      rollingWindowSeconds: rolling.requestWindowSeconds,
+      reservedForExitsWindow: rollingReserve,
+      rollingResetAfterMs:
+        rollingRows.length >= rolling.maxRequestsPerWindow
+          ? Math.max(
+              0,
+              Number(rollingRows[0]?.["observed_at_ms"] ?? nowMs) +
+                rolling.requestWindowSeconds * 1000 -
+                nowMs,
+            )
+          : 0,
+      rollingCandidateResetAfterMs:
+        rollingCandidateUsed >= rollingCandidateLimit
+          ? Math.max(
+              0,
+              Number(
+                rollingRows.find((row) => row["priority"] !== "EXIT")?.[
+                  "observed_at_ms"
+                ] ?? nowMs,
+              ) +
+                rolling.requestWindowSeconds * 1000 -
+                nowMs,
+            )
+          : 0,
+      byPriority: byPriorityRows.map((row) => ({
+        priority: String(row["priority"]),
+        attempts: Number(row["attempts"] ?? 0),
+      })),
+      deferred: Number(deferredRow["count"] ?? 0),
+      completed: Number(outcomeCounts["completed"] ?? 0),
+      failed: Number(outcomeCounts["failed"] ?? 0),
+      retries: Number(outcomeCounts["retries"] ?? 0),
       byMethod: methods.map((row) => ({
         method: String(row["method"]),
         requests: Number(row["requests"]),
-        failures: Number(row["failures"] ?? 0),
+        failures: Number(
+          failuresByMethod.find(
+            (failure) => failure["method"] === row["method"],
+          )?.["failures"] ?? 0,
+        ),
       })),
       byErrorCode: errors.map((row) => ({
         errorCode: String(row["errorCode"]),
